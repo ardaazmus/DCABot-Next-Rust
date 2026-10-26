@@ -553,6 +553,43 @@ Botlar artık aynı ana sıkışmıyor: bot-kimliğinden türetilen 0–1200 ms 
 
 **Sıra ve güvenlik:** 13A-POLL önce (davranış-koruyucu refactor, tek risk noktası dispatch), 13B sonra (muhasebe genişlemesi, kilidi amaca hizmetle açma). Her adım kendi kabul turuyla kapanır; süreç boyunca LIVE hedge kilidi 13B kabulüne dek sürer.
 
+### 13A-POLL icra-detalı (bir sonraki oturumda mekanik uygulama için)
+
+**Ön güvenlik:** git deposu kuruldu ve tam çalışan durum ilk commit'e alındı (`9148955`) — refactor sırasında `git checkout -- .` ile her an geri dönülebilir.
+
+**Veri tipleri (`state.rs`):**
+```rust
+pub enum LiveIntent {
+    Place { req: OrderRequest, id: String, side: Side, kind: OrderKind,
+            price: Option<Fraction>, qty: Fraction, role: String, is_close: bool },
+    Cancel { links: Vec<String> },   // wildcard '*' execute'ta open_orders ile çözülür
+}
+pub struct GateCtx {   // pre_order_gate'in rt'siz karşılığı — intent kuruluşunda (kilit altı, ucuza) doldurulur
+    pub pos_mode_blocked: bool, pub last_close: Option<Fraction>,
+    pub leverage: Fraction, pub is_spot: bool, pub quote: String,
+    pub min_notional: Fraction, pub kind_is_futures: bool,
+}
+// BotRuntime: pending_live_intents: Vec<LiveIntent>
+```
+
+**dispatch_action LIVE dalları** yalnız intent iter (ağ yok): PlaceLimit/PlaceMarket → GateCtx kur + `LiveIntent::Place` push; CancelResting → `LiveIntent::Cancel{links}` push. PAPER dalları aynen senkron kalır.
+
+**`pre_order_gate` imzası:** `(gate: &GateCtx, others: Fraction, adapter, creds, price, qty)` — wallet çağrısı execute fazında (kilitsiz); `venue_live_load` ayrı kilit olduğundan okunabilir.
+
+**poll_inner kuyruğu:** mevcut gövde sonunda (sweep sonrası) `drop(rt); drop(rts);` ile borçlar bitirilir (NLL güvenli — sonrası yalnız `Ok(processed)`), ardından:
+```rust
+run_intent_cascade(app, bot_id, sse).await?;   // ≤8 tur:
+// tur: [kısa kilit] intents=take + (venue,creds) kopyala → [kilitsiz] execute_live_intents
+//       (gate→place→market 3×query) → [kısa kilit] apply_intent_outcomes
+//       (upsert/tracking/bump/ingest/on_fill→yeni intent'ler)
+```
+**apply kaskadı:** Placed-limit → PENDING upsert + tracking + bump(+); MarketFilled → `ingest_external_fill_with_fee` + persist + on_fill + **yeni Action'lar dispatch_action'a** (intent olarak bir sonraki tura); GateBlocked → WARN + `rollback_pending_phase_after_gate_reject`; PlaceFailed/CancelFailed → WARN (mevcut davranış).
+**Kapsam notu:** `live_fill_sweep` bu fazda kilit altında kalır (bölüm 2 — kendi execute/apply ayrışması küçük ve benzer); ilk turda place/cancel = en ağır ve kullanıcıya en görünür gecikme kaynağı kilit dışına çıkar.
+
+**Kabul (13A-POLL):** (1) Demo LIVE bot (cert_acknowledged ile) emri YENİ intent yolundan verir, execution sweep dolumu işler; (2) sahte-yavaş adapter testi: poll süresince `list_bots` < 5 ms (cache zaten kilitsiz — doğrudan kanıt); (3) TP-fill→kapanış cascade'i tek poll'da tamamlanır (tur sayacı olaylarda görünür).
+
+**13B uygulama sırası (aynı raporun yukarısındaki 7 adım) değişmez; 13A-POLL kabulünden sonra başlar.**
+
 ---
 
 ## 5. AÇIK BULGULAR (güncel kaynakla doğrulanmış)
