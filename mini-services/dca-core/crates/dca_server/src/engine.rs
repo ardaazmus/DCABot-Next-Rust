@@ -508,6 +508,329 @@ async fn check_liquidation(
     Ok(())
 }
 
+/// Faz 13A-POLL: intent'leri KİLİTSİZ çalıştırır (gate wallet + place + market
+/// 3× dolum sorgusu + cancel) ve sonuçları döndürür. Uygulama (muhasebe +
+/// cascade) apply_intent_outcomes'ta kısa kilit altında yapılır.
+async fn execute_live_intents(
+    app: &Arc<AppState>,
+    creds: Option<&dca_exchange::VenueCreds>,
+    intents: Vec<crate::state::LiveIntent>,
+) -> Vec<crate::state::IntentOutcome> {
+    let mut out = Vec::new();
+    let Some(creds) = creds else {
+        for i in &intents {
+            if let crate::state::LiveIntent::Place { id, .. } = i {
+                out.push(crate::state::IntentOutcome::PlaceFailed { id: id.clone(), err: "live mode requires vault credentials".into() });
+            }
+        }
+        return out;
+    };
+    for intent in intents {
+        match intent {
+            crate::state::LiveIntent::Place { req, id, side, kind, price, qty, role, is_close, gate } => {
+                let Some(adapter) = app.adapter(&gate.venue) else {
+                    out.push(crate::state::IntentOutcome::PlaceFailed { id, err: format!("no adapter for {}", gate.venue) });
+                    continue;
+                };
+                // C-6/M-14 kapı — reduce (kapanış) muaftır; wallet ağı kilitsiz.
+                if !is_close && kind != OrderKind::Reduce {
+                    if let Err(e) = pre_order_gate_ctx(app, &gate, adapter, creds, price.as_ref(), &qty).await {
+                        out.push(crate::state::IntentOutcome::GateBlocked { id, reason: e });
+                        continue;
+                    }
+                }
+                match adapter.place_order(creds, &req).await {
+                    Ok(_) => {
+                        if req.is_market {
+                            // market dolum yakalama (Task 20 L3) — 3 deneme, kilitsiz
+                            let mut outcome_done = false;
+                            for attempt in 0..3u32 {
+                                match adapter.query_order(creds, &req.category, &req.symbol, &id).await {
+                                    Ok(Some(st)) => {
+                                        if !st.cum_exec_qty.is_zero() {
+                                            if let Some(px) = &st.price {
+                                                let filled = if st.cum_exec_qty < qty { st.cum_exec_qty.clone() } else { qty.clone() };
+                                                out.push(crate::state::IntentOutcome::MarketFilled {
+                                                    id: id.clone(), side, kind, role: role.clone(),
+                                                    qty_filled: filled, price: px.clone(),
+                                                    fee: st.cum_exec_fee.clone(),
+                                                });
+                                                outcome_done = true;
+                                            }
+                                            break;
+                                        }
+                                        if matches!(st.status.as_str(), "New" | "PartiallyFilled" | "Created") {
+                                            out.push(crate::state::IntentOutcome::MarketOpen {
+                                                id: id.clone(), side, kind, role: role.clone(),
+                                                price: st.price.clone().unwrap_or_else(Fraction::zero),
+                                                qty,
+                                            });
+                                            outcome_done = true;
+                                        }
+                                        break;
+                                    }
+                                    Ok(None) => break, // bulunamadı — dürüst: görünmez
+                                    Err(e) => {
+                                        if attempt == 2 {
+                                            out.push(crate::state::IntentOutcome::MarketQueryFailed { id: id.clone(), err: e });
+                                        } else {
+                                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                        }
+                                    }
+                                }
+                            }
+                            if !outcome_done {
+                                out.push(crate::state::IntentOutcome::MarketNoTrace { id });
+                            }
+                        } else {
+                            out.push(crate::state::IntentOutcome::Placed { id, side, kind, price, qty, role });
+                        }
+                    }
+                    Err(e) => out.push(crate::state::IntentOutcome::PlaceFailed { id, err: e }),
+                }
+            }
+            crate::state::LiveIntent::Cancel { links, venue, category, symbol } => {
+                let mut cancelled = Vec::new();
+                let mut failed = Vec::new();
+                let Some(adapter) = app.adapter(&venue) else {
+                    out.push(crate::state::IntentOutcome::Cancelled { cancelled, failed: links });
+                    continue;
+                };
+                for link in links {
+                    let resolved: Vec<String> = if link.ends_with('*') {
+                        match adapter.open_orders(creds, &category, &symbol).await {
+                            Ok(list) => list
+                                .into_iter()
+                                .map(|o| o.order_link_id)
+                                .filter(|l| l.starts_with(link.trim_end_matches('*')))
+                                .collect(),
+                            Err(_) => Vec::new(),
+                        }
+                    } else {
+                        vec![link.clone()]
+                    };
+                    for r in resolved {
+                        match adapter.cancel_order(creds, &category, &symbol, &r).await {
+                            Ok(()) => cancelled.push(r),
+                            // 110001 "already gone" — idempotent başarı (mevcut sözleşme)
+                            Err(e) if e.contains("110001") || e.to_lowercase().contains("order not exists") => cancelled.push(r),
+                            Err(_) => failed.push(r),
+                        }
+                    }
+                }
+                out.push(crate::state::IntentOutcome::Cancelled { cancelled, failed });
+            }
+        }
+    }
+    out
+}
+
+/// Faz 13A-POLL: sonuçları kilit altında uygular — muhasebe + cascade.
+async fn apply_intent_outcomes(
+    app: &Arc<AppState>,
+    rt: &mut BotRuntime,
+    outcomes: Vec<crate::state::IntentOutcome>,
+    sse: &broadcast::Sender<SseEvent>,
+) -> Result<(), String> {
+    for o in outcomes {
+        match o {
+            crate::state::IntentOutcome::Placed { id, side, kind, price, qty, role } => {
+                // Faz 4.5 (C-6): resting emir yükü deftere (+) — poll-refresh arası pencere kapalı.
+                if let (Some(px), Some(q)) = (price.clone(), Some(&qty)) {
+                    let n = q.mul(&px).unwrap_or_else(|_| Fraction::zero());
+                    let cost = if !rt.stepper.cfg.is_spot {
+                        let lev = if rt.stepper.cfg.leverage.is_zero() { Fraction::one() } else { rt.stepper.cfg.leverage.clone() };
+                        n.div(&lev).unwrap_or(n)
+                    } else {
+                        n
+                    };
+                    crate::state::bump_venue_live_load(app, &rt.venue, &cost, true).await;
+                }
+                crate::state::upsert_live_order(
+                    app,
+                    &rt.bot_id,
+                    &id,
+                    if side == dca_math::Side::Sell { "Sell" } else { "Buy" },
+                    if kind == OrderKind::Reduce { "Reduce" } else { "Add" },
+                    &price.clone().unwrap_or_else(Fraction::zero).to_string(),
+                    &qty.to_string(),
+                    &role,
+                    "PENDING",
+                );
+                rt.live_open_orders.push(crate::state::LiveTrackedOrder {
+                    id,
+                    side,
+                    kind,
+                    price: price.unwrap_or_else(Fraction::zero),
+                    qty,
+                    role,
+                });
+            }
+            crate::state::IntentOutcome::MarketFilled { id, side, kind, role, qty_filled, price, fee } => {
+                let ts2 = crate::state::now_ms();
+                let fk = format!("{}-{}", id, ts2);
+                if fill_exists(app, &rt.bot_id, &fk).await.unwrap_or(false) {
+                    continue;
+                }
+                if let Ok(Some(f)) = rt.stepper.ingest_external_fill_with_fee(
+                    &id,
+                    &role,
+                    side,
+                    kind,
+                    &qty_filled,
+                    &price,
+                    dca_kernel::FeeRole::Taker,
+                    FillRealism::MarketableTaker,
+                    ts2,
+                    fee.as_ref(),
+                ) {
+                    let _ = persist_fill(app, &rt.bot_id, &f).await;
+                    let acts = rt.engine_kind.on_fill(&f);
+                    let _ = sse.send(SseEvent {
+                        event: "FILL".into(),
+                        data: json!({
+                            "botId": rt.bot_id, "fillKey": f.fill_key, "orderId": f.order_id,
+                            "role": f.role, "side": format!("{:?}", f.side), "kind": format!("{:?}", f.kind),
+                            "price": f.price.to_string(), "qty": f.qty.to_string(), "fee": f.fee.to_string(),
+                            "feeRole": format!("{}", f.fee_role), "fillModel": format!("{:?}", f.realism), "ts": f.ts,
+                        })
+                        .to_string(),
+                    });
+                    crate::state::remove_live_order(app, &rt.bot_id, &id);
+                    rt.live_open_orders.retain(|o| o.id != id);
+                    for a in acts {
+                        Box::pin(dispatch_action(app, rt, a, ts2, sse)).await?;
+                    }
+                }
+            }
+            crate::state::IntentOutcome::MarketOpen { id, side, kind, role, price, qty } => {
+                // Faz 4.5: resting partial — deftere (+) (kilit-dışı düzeltme: eski kod
+                // market place'te bump(+) yapmıyordu; poll-refresh zaten düzeltiyordu).
+                {
+                    let n = qty.mul(&price).unwrap_or_else(|_| Fraction::zero());
+                    let cost = if !rt.stepper.cfg.is_spot {
+                        let lev = if rt.stepper.cfg.leverage.is_zero() { Fraction::one() } else { rt.stepper.cfg.leverage.clone() };
+                        n.div(&lev).unwrap_or(n)
+                    } else {
+                        n
+                    };
+                    crate::state::bump_venue_live_load(app, &rt.venue, &cost, true).await;
+                }
+                crate::state::upsert_live_order(
+                    app,
+                    &rt.bot_id,
+                    &id,
+                    if side == dca_math::Side::Sell { "Sell" } else { "Buy" },
+                    if kind == OrderKind::Reduce { "Reduce" } else { "Add" },
+                    &price.to_string(),
+                    &qty.to_string(),
+                    &role,
+                    "PARTIAL",
+                );
+                if !rt.live_open_orders.iter().any(|o| o.id == id) {
+                    rt.live_open_orders.push(crate::state::LiveTrackedOrder { id, side, kind, price, qty, role });
+                }
+            }
+            crate::state::IntentOutcome::MarketNoTrace { id } => {
+                let _ = sse.send(SseEvent {
+                    event: "ORDER".into(),
+                    data: json!({"botId": rt.bot_id, "id": id, "result": {"placed": true, "trace": "none"}}).to_string(),
+                });
+            }
+            crate::state::IntentOutcome::MarketQueryFailed { id, err } => {
+                let msg = format!("LIVE market fill sorgusu başarısız ({id}): {err} — dolum sweep'te order-history ile doğrulanmalı");
+                crate::state::persist_event(app, &rt.bot_id, "WARN", "ORDER", &msg).await;
+                let _ = sse.send(SseEvent { event: "LOG".into(), data: json!({"botId": rt.bot_id, "level": "WARN", "message": msg, "ts": crate::state::now_ms()}).to_string() });
+            }
+            crate::state::IntentOutcome::GateBlocked { id, reason } => {
+                let msg = format!("LIVE emir gönderilmedi ({id}): {reason} — faz geri alındı, koşul düzelince yeniden denenecek");
+                crate::state::persist_event(app, &rt.bot_id, "WARN", "ORDER_GATE", &msg).await;
+                rollback_pending_phase_after_gate_reject(app, rt);
+            }
+            crate::state::IntentOutcome::PlaceFailed { id, err } => {
+                let msg = format!("LIVE emir yerleştirilemedi ({id}): {err}");
+                crate::state::persist_event(app, &rt.bot_id, "WARN", "ORDER", &msg).await;
+            }
+            crate::state::IntentOutcome::Cancelled { cancelled, failed } => {
+                for link in failed {
+                    let msg = format!("LIVE cancel başarısız ({link})");
+                    crate::state::persist_event(app, &rt.bot_id, "WARN", "CANCEL", &msg).await;
+                }
+                for link in cancelled {
+                    // defterden düşülecek yük — retain'den ÖNCE okunur
+                    let cost = rt
+                        .live_open_orders
+                        .iter()
+                        .find(|o| o.id == link)
+                        .map(|o| {
+                            let n = o.qty.mul(&o.price).unwrap_or_else(|_| Fraction::zero());
+                            if o.kind == OrderKind::Add && !rt.stepper.cfg.is_spot {
+                                let lev = if rt.stepper.cfg.leverage.is_zero() { Fraction::one() } else { rt.stepper.cfg.leverage.clone() };
+                                n.div(&lev).unwrap_or(n)
+                            } else {
+                                n
+                            }
+                        });
+                    rt.live_open_orders.retain(|o| o.id != link);
+                    crate::state::remove_live_order(app, &rt.bot_id, &link);
+                    if let Some(cost) = cost {
+                        crate::state::bump_venue_live_load(app, &rt.venue, &cost, false).await;
+                    }
+                    crate::state::persist_event(app, &rt.bot_id, "INFO", "CANCEL", &format!("LIVE emir iptal edildi: {link}")).await;
+                    let _ = sse.send(SseEvent { event: "ORDER".into(), data: json!({"botId": rt.bot_id, "id": link, "result": {"cancelled": true}}).to_string() });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Faz 13A-POLL: kilit-dışı cascade — ≤8 tur (patolojik zincire sınır).
+/// Her tur: [kısa kilit] intent'leri al → [kilitsiz] execute → [kısa kilit] apply.
+async fn run_intent_cascade(
+    app: &Arc<AppState>,
+    bot_id: &str,
+    sse: &broadcast::Sender<SseEvent>,
+) -> Result<(), String> {
+    let mut rounds = 0u8;
+    loop {
+        let (intents, creds) = {
+            let mut rts = app.runtimes.lock().await;
+            let Some(rt) = rts.get_mut(bot_id) else { return Ok(()) };
+            let intents = std::mem::take(&mut rt.pending_live_intents);
+            (intents, rt.credentials.clone())
+        };
+        if intents.is_empty() {
+            break;
+        }
+        if rounds >= 8 {
+            crate::state::persist_event(app, bot_id, "CRITICAL", "CASCADE", "intent cascade 8 turu aştı — kalan niyetler sonraki poll'a ertelendi").await;
+            let mut rts = app.runtimes.lock().await;
+            if let Some(rt) = rts.get_mut(bot_id) {
+                rt.pending_live_intents.extend(intents);
+            }
+            break;
+        }
+        rounds += 1;
+        let outcomes = execute_live_intents(app, creds.as_ref(), intents).await;
+        {
+            let mut rts = app.runtimes.lock().await;
+            let Some(rt) = rts.get_mut(bot_id) else { return Ok(()) };
+            apply_intent_outcomes(app, rt, outcomes, sse).await?;
+        }
+    }
+    // Kaskad muhasebeyi değiştirdiyse kalıcı snapshot + UI cache tazele.
+    if rounds > 0 {
+        let mut rts = app.runtimes.lock().await;
+        if let Some(rt) = rts.get_mut(bot_id) {
+            crate::state::save_runtime_state(app, bot_id, rt);
+            let snap_v = rt.snapshot_json();
+            app.ui_cache.lock().await.insert(bot_id.to_string(), snap_v);
+        }
+    }
+    Ok(())
+}
+
 /// M-14: emir-kapisi (ORDER_GATE) reddi KALICI bir yetersizliktir — strateji
 /// fazını "emir verildi" varsayımından geri alıp yeni karara izin ver.
 /// Dca: BasePending→Idle (yeni deal denenebilir); Grid: bootstrap geri alınır
@@ -536,9 +859,9 @@ pub fn rollback_pending_phase_after_gate_reject(app: &AppState, rt: &mut BotRunt
 /// aynı venue'daki diğer LIVE botların açık-emir yükü) kontrol edilir. Başarısız
 /// durumda emir GÖNDERİLMEZ; WARN ile görünür kalır ve motor akışı sürer
 /// (fail-closed + fail-safe). Ölçüm: wallet.available (venue gerçekliği).
-async fn pre_order_gate(
+async fn pre_order_gate_ctx(
     app: &AppState,
-    rt: &BotRuntime,
+    gate: &crate::state::GateCtx,
     adapter: &dyn VenueAdapter,
     creds: &dca_exchange::VenueCreds,
     price: Option<&Fraction>,
@@ -546,32 +869,31 @@ async fn pre_order_gate(
 ) -> Result<(), String> {
     // Faz 4.5 (C-5): hesap pozisyon-modu uyuşmazsa venue zaten reddeder —
     // emri hiç göndermeyip görünür kalmak fail-closed olanıdır.
-    if rt.pos_mode_blocked {
+    if gate.pos_mode_blocked {
         return Err("hesap pozisyon modu uyuşmuyor (hedge-mode'da DCA one-way emri) — Bybit'te tek-yönlü moda geçin".into());
     }
     let px = price
         .cloned()
-        .or_else(|| rt.stepper.last_close.as_deref().and_then(|s| Fraction::from_any_str(s).ok()))
+        .or_else(|| gate.last_close.clone())
         .ok_or_else(|| "fiyat referansı yok (son kapanış beklenmeli)".to_string())?;
     let notional = qty.mul(&px).map_err(|e| e.to_string())?;
-    let inst = &rt.stepper.instrument;
-    if notional < inst.min_notional {
+    if notional < gate.min_notional {
         return Err(format!(
             "minNotional: emir değeri {} < borsa minimumu {}",
             notional.to_half_even_display(2),
-            inst.min_notional.to_half_even_display(2)
+            gate.min_notional.to_half_even_display(2)
         ));
     }
-    let lev = if rt.stepper.cfg.leverage.is_zero() { Fraction::one() } else { rt.stepper.cfg.leverage.clone() };
-    let need = if rt.stepper.cfg.is_spot { notional } else { notional.div(&lev).map_err(|e| e.to_string())? };
+    let lev = if gate.leverage.is_zero() { Fraction::one() } else { gate.leverage.clone() };
+    let need = if gate.is_spot { notional } else { notional.div(&lev).map_err(|e| e.to_string())? };
     let others = app
         .venue_live_load
         .lock()
         .await
-        .get(&rt.venue)
+        .get(&gate.venue)
         .cloned()
         .unwrap_or_else(Fraction::zero);
-    let wallet = adapter.wallet(creds, &inst.quote).await.map_err(|e| format!("wallet okunamadı: {e}"))?;
+    let wallet = adapter.wallet(creds, &gate.quote).await.map_err(|e| format!("wallet okunamadı: {e}"))?;
     let total_need = need.add(&others).map_err(|e| e.to_string())?;
     if total_need > wallet.available {
         return Err(format!(
@@ -612,84 +934,42 @@ pub async fn dispatch_action(
                     .map_err(|e| e.to_string())?;
                 }
                 _ => {
-                    // LIVE: real venue order via adapter (requires vault creds)
-                    if let (Some(creds), Some(adapter)) = (&rt.credentials, &app.adapter(&rt.venue)) {
-                        // Faz 4 (C-6) + M-14: gerçek-emir kapısı — geçilemezse emir
-                        // gönderilmez VE strateji fazı geri alınır (bot kilitlenmez;
-                        // kapı geçilebilir olunca yeni karardan yeniden denenebilir).
-                        // Reduce (kapanış) emirleri muaftır: pozisyon kapatmak
-                        // bakiye gerektirmez, TP/SL engellenmez.
-                        if !is_close {
-                            if let Err(e) = pre_order_gate(app, rt, *adapter, creds, Some(&price), &qty).await {
-                                crate::state::persist_event(app, &rt.bot_id, "WARN", "ORDER_GATE", &format!("LIVE limit emir gönderilmedi ({}): {e} — faz geri alındı, koşul düzelince yeniden denenecek", id)).await;
-                                rollback_pending_phase_after_gate_reject(app, rt);
-                                return Ok(());
-                            }
-                        }
-                        let req = dca_exchange::OrderRequest {
-                            category: if rt.cfg.kind.is_futures() { "linear".into() } else { "spot".into() },
-                            symbol: rt.cfg.symbol.clone(),
-                            side,
-                            is_market: false,
-                            qty: qty.clone(),
-                            price: Some(price.clone()),
-                            reduce_only: is_close,
-                            order_link_id: id.clone(),
-                            // Faz 5 (C-5): hedge modda yön eşlemesi (Buy→1/Sell→2)
-                            position_idx: if rt.cfg.kind.is_futures() && rt.pos_mode_hedge {
-                                if side == dca_math::Side::Buy { 1 } else { 2 }
-                            } else { 0 },
-                        };
-                        let res = adapter.place_order(creds, &req).await;
-                        match &res {
-                            Ok(_) => {
-                                // Faz 4.5 (C-6): sürekli defter — place anında
-                                // marj yükü eklenir (poll-refresh arası pencere kapalı).
-                                {
-                                    let n = qty.mul(&price).unwrap_or_else(|_| Fraction::zero());
-                                    let cost = if !rt.stepper.cfg.is_spot {
-                                        let lev = if rt.stepper.cfg.leverage.is_zero() { Fraction::one() } else { rt.stepper.cfg.leverage.clone() };
-                                        n.div(&lev).unwrap_or(n)
-                                    } else { n };
-                                    crate::state::bump_venue_live_load(app, &rt.venue, &cost, true).await;
-                                }
-                                // Track the resting venue order for fill
-                                // reconciliation (M16 sweep in poll loop).
-                                // Faz 3 (H-3): kalıcı iz — place anında PENDING.
-                                crate::state::upsert_live_order(
-                                    app,
-                                    &rt.bot_id,
-                                    &id,
-                                    if side == dca_math::Side::Sell { "Sell" } else { "Buy" },
-                                    if is_close { "Reduce" } else { "Add" },
-                                    &price.to_string(),
-                                    &qty.to_string(),
-                                    role,
-                                    "PENDING",
-                                );
-                                rt.live_open_orders.push(crate::state::LiveTrackedOrder {
-                                    id: id.clone(),
-                                    side,
-                                    kind: if is_close { OrderKind::Reduce } else { OrderKind::Add },
-                                    price,
-                                    qty,
-                                    role: role.to_string(),
-                                });
-                            }
-                            // Task 20: sessiz yutma yok — place hatası WARN event'e
-                            // düşer (görünür emir yerleştirilemedi; motor karar verir).
-                            Err(e) => {
-                                let msg = format!("LIVE limit emir yerleştirilemedi ({id}): {e}");
-                                crate::state::persist_event(app, &rt.bot_id, "WARN", "ORDER", &msg).await;
-                            }
-                        }
-                        let _ = sse.send(SseEvent {
-                            event: "ORDER".into(),
-                            data: json!({"botId": rt.bot_id, "id": id, "result": res.map_err(|e| e)}).to_string(),
-                        });
-                    } else {
-                        return Err("live mode requires vault credentials".into());
-                    }
+                    // Faz 13A-POLL: LIVE ağ çağrısı yok — intent kuyruğa alınır;
+                    // gate (wallet ağı) + place, poll sonrası kilit-dışı cascade'de.
+                    let gate = crate::state::GateCtx {
+                        pos_mode_blocked: rt.pos_mode_blocked,
+                        last_close: rt.stepper.last_close.as_deref().and_then(|s| Fraction::from_any_str(s).ok()),
+                        leverage: rt.stepper.cfg.leverage.clone(),
+                        is_spot: rt.stepper.cfg.is_spot,
+                        quote: rt.stepper.instrument.quote.clone(),
+                        min_notional: rt.stepper.instrument.min_notional.clone(),
+                        venue: rt.venue.clone(),
+                    };
+                    let req = dca_exchange::OrderRequest {
+                        category: if rt.cfg.kind.is_futures() { "linear".into() } else { "spot".into() },
+                        symbol: rt.cfg.symbol.clone(),
+                        side,
+                        is_market: false,
+                        qty: qty.clone(),
+                        price: Some(price.clone()),
+                        reduce_only: is_close,
+                        order_link_id: id.clone(),
+                        // Faz 5 (C-5): hedge modda yön eşlemesi (Buy→1/Sell→2)
+                        position_idx: if rt.cfg.kind.is_futures() && rt.pos_mode_hedge {
+                            if side == dca_math::Side::Buy { 1 } else { 2 }
+                        } else { 0 },
+                    };
+                    rt.pending_live_intents.push(crate::state::LiveIntent::Place {
+                        req,
+                        id: id.clone(),
+                        side,
+                        kind: if is_close { OrderKind::Reduce } else { OrderKind::Add },
+                        price: Some(price.clone()),
+                        qty: qty.clone(),
+                        role: role.to_string(),
+                        is_close,
+                        gate,
+                    });
                 }
             }
         }
@@ -714,170 +994,44 @@ pub async fn dispatch_action(
                         .map_err(|e| e.to_string())?;
                 }
                 _ => {
-                    if let (Some(creds), Some(adapter)) = (&rt.credentials, &app.adapter(&rt.venue)) {
-                        // Faz 4 (C-6) + M-14: gerçek-emir kapısı (market — fiyat ref:
-                        // son kapanış). Reduce (TP/SL/CLOSE/MANUAL) emirleri muaftır —
-                        // pozisyon kapatma bakiye kapısına takılmaz.
-                        if kind != OrderKind::Reduce {
-                            if let Err(e) = pre_order_gate(app, rt, *adapter, creds, None, &qty).await {
-                                crate::state::persist_event(app, &rt.bot_id, "WARN", "ORDER_GATE", &format!("LIVE market emir gönderilmedi ({}): {e} — faz geri alındı, koşul düzelince yeniden denenecek", id)).await;
-                                rollback_pending_phase_after_gate_reject(app, rt);
-                                return Ok(());
-                            }
-                        }
-                        let req = dca_exchange::OrderRequest {
-                            category: if rt.cfg.kind.is_futures() { "linear".into() } else { "spot".into() },
-                            symbol: rt.cfg.symbol.clone(),
-                            side,
-                            is_market: true,
-                            qty: qty.clone(),
-                            price: None,
-                            reduce_only: kind == OrderKind::Reduce,
-                            order_link_id: id.clone(),
-                            // Faz 5 (C-5): hedge modda yön eşlemesi (Buy→1/Sell→2)
-                            position_idx: if rt.cfg.kind.is_futures() && rt.pos_mode_hedge {
-                                if side == dca_math::Side::Buy { 1 } else { 2 }
-                            } else { 0 },
-                        };
-                        let res = adapter.place_order(creds, &req).await;
-                        let mut fill_ingested = false;
-                        if let Ok(_) = &res {
-                            // Faz 3 (H-3): market emir de kalıcı izle — place anında
-                            // PENDING; anlık dolumda hemen aşağıda düşürülür.
-                            crate::state::upsert_live_order(
-                                app,
-                                &rt.bot_id,
-                                &id,
-                                if side == dca_math::Side::Sell { "Sell" } else { "Buy" },
-                                if kind == OrderKind::Reduce { "Reduce" } else { "Add" },
-                                &qty.to_string(),
-                                &qty.to_string(),
-                                role,
-                                "PENDING",
-                            );
-                            // Task 20 L3 — market dolum yakalama: market emirler
-                            // open_orders'a DÜŞMEZ; eski kod dolumu hiç öğrenmezdi
-                            // (kernel aynası kördü). Place sonrası hemen sorgu:
-                            // cumExecQty > 0 → kernel'e taker dolumu ingest edilir.
-                            let category = if rt.cfg.kind.is_futures() { "linear" } else { "spot" };
-                            for attempt in 0..3u32 {
-                                match adapter
-                                    .query_order(creds, category, &rt.cfg.symbol, &id)
-                                    .await
-                                {
-                                    Ok(Some(st)) => {
-                                        if !st.cum_exec_qty.is_zero() {
-                                            if let Some(px) = &st.price {
-                                                let ts2 = crate::state::now_ms();
-                                                let filled_qty = if st.cum_exec_qty < qty { st.cum_exec_qty.clone() } else { qty.clone() };
-                                                // BOT-02: idempotency — aynı fill_key'li dolum
-                                                // kernel'e tekrar uygulanmaz.
-                                                let fk = format!("{}-{}", id, ts2);
-                                                if fill_exists(app, &rt.bot_id, &fk).await.unwrap_or(false) {
-                                                    break;
-                                                }
-                                                // EX-05: market dolumu Taker ücretiyle,
-                                                // MarketableTaker realism ile işlenir.
-                                                let fee_role = dca_kernel::FeeRole::Taker;
-                                                let realism = FillRealism::MarketableTaker;
-                                                if let Ok(Some(f)) = rt.stepper.ingest_external_fill_with_fee(
-                                                    &id,
-                                                    &role,
-                                                    side,
-                                                    kind,
-                                                    &filled_qty,
-                                                    px,
-                                                    fee_role,
-                                                    realism,
-                                                    ts2,
-                                                    st.cum_exec_fee.as_ref(),
-                                                ) {
-                                                    let _ = persist_fill(app, &rt.bot_id, &f).await;
-                                                    let acts = rt.engine_kind.on_fill(&f);
-                                                    let _ = sse.send(SseEvent {
-                                                        event: "FILL".into(),
-                                                        data: json!({
-                                                            "botId": rt.bot_id,
-                                                            "fillKey": f.fill_key,
-                                                            "orderId": f.order_id,
-                                                            "role": f.role,
-                                                            "side": format!("{:?}", f.side),
-                                                            "kind": format!("{:?}", f.kind),
-                                                            "price": f.price.to_string(),
-                                                            "qty": f.qty.to_string(),
-                                                            "fee": f.fee.to_string(),
-                                                            "feeRole": format!("{}", f.fee_role),
-                                                            "fillModel": format!("{:?}", f.realism),
-                                                            "ts": f.ts,
-                                                        })
-                                                        .to_string(),
-                                                    });
-                                                    for a in acts {
-                                                        Box::pin(dispatch_action(app, rt, a, ts2, sse)).await?;
-                                                    }
-                                                    fill_ingested = true;
-                                                    // Faz 3 (H-3): anlık tam dolum — kalıcı iz kapandı.
-                                                    crate::state::remove_live_order(app, &rt.bot_id, &id);
-                                                    // Faz 4.5 (C-6): dolan market emrin yükü defterden düşer.
-                                                    {
-                                                        let n = filled_qty.mul(px).unwrap_or_else(|_| Fraction::zero());
-                                                        let cost = if !rt.stepper.cfg.is_spot {
-                                                            let lev = if rt.stepper.cfg.leverage.is_zero() { Fraction::one() } else { rt.stepper.cfg.leverage.clone() };
-                                                            n.div(&lev).unwrap_or(n)
-                                                        } else { n };
-                                                        crate::state::bump_venue_live_load(app, &rt.venue, &cost, false).await;
-                                                    }
-                                                }
-                                            }
-                                            break;
-                                        }
-                                        // henüz dolmadı ve açık → sweep takibine bırak
-                                        if matches!(st.status.as_str(), "New" | "PartiallyFilled" | "Created") {
-                                            // Faz 3 (H-3): kısmi/açık — kalıcı iz PARTIAL'a güncellenir;
-                                            // execution sweep artımlı dolumları işler.
-                                            crate::state::upsert_live_order(
-                                                app,
-                                                &rt.bot_id,
-                                                &id,
-                                                if side == dca_math::Side::Sell { "Sell" } else { "Buy" },
-                                                if kind == OrderKind::Reduce { "Reduce" } else { "Add" },
-                                                &st.price.clone().unwrap_or_else(Fraction::zero).to_string(),
-                                                &qty.to_string(),
-                                                role,
-                                                "PARTIAL",
-                                            );
-                                            rt.live_open_orders.push(crate::state::LiveTrackedOrder {
-                                                id: id.clone(),
-                                                side,
-                                                kind,
-                                                price: st.price.clone().unwrap_or_else(Fraction::zero),
-                                                qty: qty.clone(),
-                                                role: role.to_string(),
-                                            });
-                                        }
-                                        break;
-                                    }
-                                    Ok(None) => break, // bulunamadı — dürüst: görünmez
-                                    Err(e) => {
-                                        if attempt == 2 {
-                                            let msg = format!("LIVE market fill sorgusu başarısız ({id}): {e} — dolum sweep'te order-history ile doğrulanmalı");
-                                            crate::state::persist_event(app, &rt.bot_id, "WARN", "ORDER", &msg).await;
-                                        } else {
-                                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if !fill_ingested {
-                            let _ = sse.send(SseEvent {
-                                event: "ORDER".into(),
-                                data: json!({"botId": rt.bot_id, "id": id, "result": res}).to_string(),
-                            });
-                        }
-                    } else {
-                        return Err("live mode requires vault credentials".into());
-                    }
+                    // Faz 13A-POLL: LIVE market — intent kuyruğa; gate + place +
+                    // 3× dolum sorgusu kilit-dışı cascade'de, ingest apply'da.
+                    let kind_m = kind.clone();
+                    let gate = crate::state::GateCtx {
+                        pos_mode_blocked: rt.pos_mode_blocked,
+                        last_close: rt.stepper.last_close.as_deref().and_then(|s| Fraction::from_any_str(s).ok()),
+                        leverage: rt.stepper.cfg.leverage.clone(),
+                        is_spot: rt.stepper.cfg.is_spot,
+                        quote: rt.stepper.instrument.quote.clone(),
+                        min_notional: rt.stepper.instrument.min_notional.clone(),
+                        venue: rt.venue.clone(),
+                    };
+                    let req = dca_exchange::OrderRequest {
+                        category: if rt.cfg.kind.is_futures() { "linear".into() } else { "spot".into() },
+                        symbol: rt.cfg.symbol.clone(),
+                        side,
+                        is_market: true,
+                        qty: qty.clone(),
+                        price: None,
+                        reduce_only: kind_m == OrderKind::Reduce,
+                        order_link_id: id.clone(),
+                        // Faz 5 (C-5): hedge modda yön eşlemesi (Buy→1/Sell→2)
+                        position_idx: if rt.cfg.kind.is_futures() && rt.pos_mode_hedge {
+                            if side == dca_math::Side::Buy { 1 } else { 2 }
+                        } else { 0 },
+                    };
+                    let is_close_m = kind_m == OrderKind::Reduce;
+                    rt.pending_live_intents.push(crate::state::LiveIntent::Place {
+                        req,
+                        id: id.clone(),
+                        side,
+                        kind: kind_m,
+                        price: None,
+                        qty: qty.clone(),
+                        role: role.to_string(),
+                        is_close: is_close_m,
+                        gate,
+                    });
                 }
             }
         }
@@ -888,71 +1042,15 @@ pub async fn dispatch_action(
             } else {
                 rt.stepper.pending.retain(|o| o.id != id);
             }
-            // LIVE: mirror the cancel to the venue. A resting SAFETY limit that
-            // stays on the book fills later, and its sweep fill would be ingested
-            // into an already-closed deal as a phantom Add fill (real money).
+            // Faz 13A-POLL: LIVE cancel — ağ (wildcard çözümü + cancel) kilit
+            // dışı cascade'de; yerel pending listesi yukarıda senkron temizlendi.
             if rt.mode == "LIVE" {
-                if let (Some(creds), Some(adapter)) = (&rt.credentials, &app.adapter(&rt.venue)) {
-                    let category = if rt.cfg.kind.is_futures() { "linear" } else { "spot" };
-                    let targets: Vec<String> = if id.ends_with('*') {
-                        // Wildcard: resolve the actual resting link ids from the venue.
-                        match adapter.open_orders(creds, &category, &rt.cfg.symbol).await {
-                            Ok(list) => list
-                                .into_iter()
-                                .map(|o| o.order_link_id)
-                                .filter(|l| l.starts_with(id.trim_end_matches('*')))
-                                .collect(),
-                            Err(e) => {
-                                let msg = format!("LIVE cancel sweep: open_orders failed: {e}");
-                                crate::state::persist_event(app, &rt.bot_id, "WARN", "CANCEL", &msg).await;
-                                let _ = sse.send(SseEvent { event: "LOG".into(), data: json!({"botId": rt.bot_id, "level": "WARN", "message": msg, "ts": ts}).to_string() });
-                                Vec::new()
-                            }
-                        }
-                    } else {
-                        vec![id.clone()]
-                    };
-                    for link in targets {
-                        // Faz 4.5 (C-6): iptal halinde defterden düşülecek yük —
-                        // retain'den ÖNCE bu emrin takip kaydından okunur.
-                        let cancelled_cost = rt
-                            .live_open_orders
-                            .iter()
-                            .find(|o| o.id == link)
-                            .map(|o| {
-                                let n = o.qty.mul(&o.price).unwrap_or_else(|_| Fraction::zero());
-                                if o.kind == OrderKind::Add && !rt.stepper.cfg.is_spot {
-                                    let lev = if rt.stepper.cfg.leverage.is_zero() { Fraction::one() } else { rt.stepper.cfg.leverage.clone() };
-                                    n.div(&lev).unwrap_or(n)
-                                } else {
-                                    n
-                                }
-                            });
-                        match adapter.cancel_order(creds, category, &rt.cfg.symbol, &link).await {
-                            Ok(()) => {
-                                if let Some(cost) = cancelled_cost {
-                                    crate::state::bump_venue_live_load(app, &rt.venue, &cost, false).await;
-                                }
-                                // Task 20 L2 — iptal edilen emir takipten ÇIKARILIR:
-                                // aksi halde sweep onu "doldu" sanır ve iptal edilmiş
-                                // emir için phantom fill üretir (aksan kusuru).
-                                // Faz 3 (H-3): kalıcı iz de düşer.
-                                rt.live_open_orders.retain(|o| o.id != link);
-                                crate::state::remove_live_order(app, &rt.bot_id, &link);
-                                crate::state::persist_event(app, &rt.bot_id, "INFO", "CANCEL", &format!("LIVE emir iptal edildi: {link}")).await;
-                                let _ = sse.send(SseEvent { event: "ORDER".into(), data: json!({"botId": rt.bot_id, "id": link, "result": {"cancelled": true}}).to_string() });
-                            }
-                            // Already gone venue-side (filled/cancelled) — the
-                            // adapter treats 110001 as idempotent success; any
-                            // other error is logged and does not kill the engine.
-                            Err(e) => {
-                                let msg = format!("LIVE cancel başarısız ({link}): {e}");
-                                crate::state::persist_event(app, &rt.bot_id, "WARN", "CANCEL", &msg).await;
-                                let _ = sse.send(SseEvent { event: "LOG".into(), data: json!({"botId": rt.bot_id, "level": "WARN", "message": msg, "ts": ts}).to_string() });
-                            }
-                        }
-                    }
-                }
+                rt.pending_live_intents.push(crate::state::LiveIntent::Cancel {
+                    links: vec![id.clone()],
+                    venue: rt.venue.clone(),
+                    category: if rt.cfg.kind.is_futures() { "linear".to_string() } else { "spot".to_string() },
+                    symbol: rt.cfg.symbol.clone(),
+                });
             }
         }
         Action::Log { level, message } => {
@@ -1509,6 +1607,10 @@ async fn poll_inner(
             }
         }
     }
+    // Faz 13A-POLL: borçları bitir — LIVE intent cascade'i KİLİTSİZ koşar.
+    drop(rt);
+    drop(rts);
+    run_intent_cascade(app, bot_id, sse).await?;
     Ok(processed)
 }
 

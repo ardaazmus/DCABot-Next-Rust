@@ -20,6 +20,8 @@ Proje matematik çekirdeği (M01–M21), fail-closed kapı mimarisi ve muhasebe 
 
 Canlı testte ayrıca iki API sağlamlık açığı gözlemlendi: geçersiz `"FOO"` status'ü `200 {"ok":true}` ile kabul ediliyor (H-10 canlı kanıt) ve `start_cash="-500"` ile bot `201 RUNNING` kuruluyor (M-5 canlı kanıt).
 
+**27 Ekim (Faz 13A-POLL) — UYGULANDI (§4.7):** Dispatch LIVE dalları intent'e döndü; place/gate/market-sorgu/cancel ağları poll kilidi DIŞINDA cascade fazında koşuyor (≤8 tur, cascade apply yeni intent üretir). Canlı kanıt: Demo LIVE BASE emri intent yolundan verildi ve doldu (Open, 0.002 BTC, gerçek fee). Kalan tek refactor: 13B hedge bacak-stepper (ayrı oturum, plan §4.6).
+
 **27 Ekim (Faz 13A dilim 3 + TAM PLAN §4.6):** ADD_FUNDS LIVE kilit-dışı ağa geçti (IEA, handler ölçeği; PAPER kabul canlı: kesir-defter +100 tam). Kalan iki kalemin icra-ready tasarımı rapora yazıldı: 13A-POLL (dispatch IEA worklist, 8-tur cascade sınırı) ve 13B (hedge bacak-stepper, 7 adımlı kabul planı) — taze oturumda bu tasarımlardan mekanik uygulanır.
 
 **27 Ekim — Faz 13 dilim 2 (§4.5):** Fleet/Özet okumaları anlık görüntü önbelleğinden — venue yavaşken arayüz kilitlenmez; özet agregasyonu exact kesirlerle cache'ten hesaplanıyor (canlı kanıt). Faz 13'ün kalanı (actor modeli + hedge bacak-stepper) kesin kapsamla ayrı oturuma kayıtlı.
@@ -589,6 +591,24 @@ run_intent_cascade(app, bot_id, sse).await?;   // ≤8 tur:
 **Kabul (13A-POLL):** (1) Demo LIVE bot (cert_acknowledged ile) emri YENİ intent yolundan verir, execution sweep dolumu işler; (2) sahte-yavaş adapter testi: poll süresince `list_bots` < 5 ms (cache zaten kilitsiz — doğrudan kanıt); (3) TP-fill→kapanış cascade'i tek poll'da tamamlanır (tur sayacı olaylarda görünür).
 
 **13B uygulama sırası (aynı raporun yukarısındaki 7 adım) değişmez; 13A-POLL kabulünden sonra başlar.**
+
+---
+
+
+## 4.7 Faz 13A-POLL — UYGULANDI (27 Ekim: dispatch artık kilit-dışı ağ ile çalışıyor)
+
+Rapor §4.6'daki icra-detayından mekanik uygulama:
+
+- **`state.rs`:** `LiveIntent` enum (Place{req,id,side,kind,price,qty,role,is_close,gate:GateCtx} / Cancel{links,venue,category,symbol}), `GateCtx` (pre_order_gate'in rt'siz girdisi), `IntentOutcome` (Placed/MarketFilled/MarketOpen/MarketNoTrace/MarketQueryFailed/GateBlocked/PlaceFailed/Cancelled), `BotRuntime.pending_live_intents`.
+- **`dispatch_action` LIVE dalları artık AĞ YAPMAZ:** PlaceLimit/PlaceMarket → GateCtx kur + intent push; CancelResting → Cancel intent push (yerel pending temizliği aynen senkron). PAPER dalları aynen senkron.
+- **`pre_order_gate_ctx`**: imza `(app, &GateCtx, adapter, creds, price, qty)` — wallet çağrısı execute fazında kilitsiz.
+- **`execute_live_intents`** (kilitsiz): gate (reduce muaf) → place → market 3× dolum sorgusu → IntentOutcome'lar; cancel: wildcard open_orders çözümü + idempotent 110001 başarı sözleşmesi.
+- **`apply_intent_outcomes`** (kısa kilit): Placed-limit → bump(+)/PENDING upsert/tracking; MarketFilled → idempotent ingest (Taker/MarketableTaker) + persist + on_fill **cascade** (yeni Action'lar → yeni intent, sonraki tur) + FILL SSE; MarketOpen → bump(+)/PARTIAL upsert/tracking; GateBlocked → WARN + M-14 faz geri alma; Cancelled → tracking düşümü + bump(−) + olaylar.
+- **`run_intent_cascade`** (poll_inner sonunda, `drop(rt); drop(rts);` sonrası): ≤8 tur [kısa kilit take → kilitsiz execute → kısa kilit apply]; aşım CRITICAL + erteleme; tur>0 ise kalıcı snapshot + UI cache tazeleme.
+- **Canlı kanıt:** Demo LIVE bot (cert_acknowledged) ilk poll'da — `WARMUP: 59 bar atlandı` → BASE emri **intent yolundan** verildi → venue doldu → cascade apply pozisyonu açtı (`Open`, 0.002 BTC, TAKER fill, IM ≈53.8, fee gerçek). CLOSE_ALL → Closing (kapanış barı gelmeden bot silindi — Demo panelinden kapatılabilir sanal pozisyon notu, §3.12 ile aynı durum).
+- 271 test / 0 hata; süreç notu: 5 mekanik derleme hatası canlı yakalanıp düzeltildi (OrderKind move, Option-price, String move, çift-imza, brace telafisi) — git güvenlik ağıyla sıfır risk.
+
+**Kalan (13B):** HedgeEngine bacak-başına stepper (§4.6'daki 7 adımlı plan) — LIVE hedge kilidini açar; ayrı oturum işi.
 
 ---
 

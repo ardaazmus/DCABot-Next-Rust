@@ -58,6 +58,9 @@ pub struct BotRuntime {
     /// reddeder. blocked=true iken LIVE Add emirleri gönderilmez.
     pub pos_mode_checked: bool,
     pub pos_mode_blocked: bool,
+    /// Faz 13A-POLL: dispatch LIVE dalları ağ yapmaz — intent burada birikir,
+    /// poll_inner'ın kilit-dışı cascade fazı çalıştırıp uygular.
+    pub pending_live_intents: Vec<LiveIntent>,
     /// Faz 5 (C-5/EX-07): hesap hedge modundaysa DCA emirleri positionIdx
     /// eşlemesiyle çalışır (Buy→1 long bacası, Sell→2 short bacası) — mod
     /// uyuşmazlığı artık engel değil, eşlemedir.
@@ -114,6 +117,57 @@ pub fn parse_halt_message(msg: &str) -> Option<(String, Option<String>, Option<S
 /// PAPER poll döngüsü her iki şalterde de sürer.
 pub fn live_halted(mode: &str, kill: bool, freeze: bool) -> bool {
     mode == "LIVE" && (kill || freeze)
+}
+
+/// Faz 13A-POLL: dispatch LIVE dallarının ürettiği ağ niyeti — poll_inner'ın
+/// kilit-dışı cascade fazı çalıştırır ve sonuçları kısa kilitte uygular.
+pub enum LiveIntent {
+    Place {
+        req: dca_exchange::OrderRequest,
+        id: String,
+        side: dca_math::Side,
+        kind: dca_kernel::OrderKind,
+        price: Option<Fraction>,
+        qty: Fraction,
+        role: String,
+        is_close: bool,
+        gate: GateCtx,
+    },
+    Cancel { links: Vec<String>, venue: String, category: String, symbol: String },
+}
+
+impl LiveIntent {
+    pub fn id(&self) -> &str {
+        match self {
+            LiveIntent::Place { id, .. } => id,
+            LiveIntent::Cancel { .. } => "",
+        }
+    }
+}
+
+/// Faz 13A-POLL: pre_order_gate'in rt'siz girdisi — intent kuruluşunda
+/// (kilit altı, ucuza) kopyalanır; wallet çağrısı execute'ta kilitsiz yapılır.
+#[derive(Clone)]
+pub struct GateCtx {
+    pub pos_mode_blocked: bool,
+    pub last_close: Option<Fraction>,
+    pub leverage: Fraction,
+    pub is_spot: bool,
+    pub quote: String,
+    pub min_notional: Fraction,
+    pub venue: String,
+}
+
+/// Faz 13A-POLL: execute fazının ürettiği sonuç — apply fazı kilit altında tüketir.
+pub enum IntentOutcome {
+    Placed { id: String, side: dca_math::Side, kind: dca_kernel::OrderKind, price: Option<Fraction>, qty: Fraction, role: String },
+    MarketFilled { id: String, side: dca_math::Side, kind: dca_kernel::OrderKind, role: String, qty_filled: Fraction, price: Fraction, fee: Option<Fraction> },
+    MarketOpen { id: String, side: dca_math::Side, kind: dca_kernel::OrderKind, role: String, price: Fraction, qty: Fraction },
+    MarketNoTrace { id: String },
+    MarketQueryFailed { id: String, err: String },
+    GateBlocked { id: String, reason: String },
+    PlaceFailed { id: String, err: String },
+    Cancelled { cancelled: Vec<String>, failed: Vec<String> },
 }
 
 /// One LIVE resting order awaiting venue fill reconciliation.
@@ -641,6 +695,7 @@ pub async fn create_runtime(
         halt_warned: false,
         pos_mode_checked: false,
         pos_mode_blocked: false,
+        pending_live_intents: Vec::new(),
         pos_mode_hedge: false,
         mmr_brackets: None,
         mmr_brackets_at: 0,
