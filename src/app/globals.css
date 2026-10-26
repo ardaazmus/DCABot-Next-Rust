@@ -1,0 +1,173 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-inter);
+  --font-mono: var(--font-jetbrains-mono);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+/* DCABOT dark financial terminal palette (always dark — no light mode) */
+:root {
+  --radius: 0.55rem;
+  --background: #0b0e14;
+  --foreground: #e6eaf2;
+  --card: #151a24;
+  --card-foreground: #e6eaf2;
+  --popover: #151a24;
+  --popover-foreground: #e6eaf2;
+  --primary: #10b981;
+  --primary-foreground: #04150e;
+  --secondary: #1d2433;
+  --secondary-foreground: #cbd5e1;
+  --muted: #1d2433;
+  --muted-foreground: #7c8aa0;
+  --accent: #1d2433;
+  --accent-foreground: #e6eaf2;
+  --destructive: #f43f5e;
+  --border: #1f2637;
+  --input: #2a3347;
+  --ring: #10b981;
+  --chart-1: #10b981;
+  --chart-2: #06b6d4;
+  --chart-3: #f59e0b;
+  --chart-4: #f43f5e;
+  --chart-5: #64748b;
+  --sidebar: #10141d;
+  --sidebar-foreground: #cbd5e1;
+  --sidebar-primary: #10b981;
+  --sidebar-primary-foreground: #04150e;
+  --sidebar-accent: #1d2433;
+  --sidebar-accent-foreground: #e6eaf2;
+  --sidebar-border: #1f2637;
+  --sidebar-ring: #10b981;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+    background-color: #0b0e14;
+  }
+  ::selection {
+    background: rgba(16, 185, 129, 0.28);
+  }
+}
+
+/* Custom thin scrollbar for dense terminal panels */
+.thin-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #2a3347 transparent;
+}
+.thin-scroll::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.thin-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.thin-scroll::-webkit-scrollbar-thumb {
+  background: #2a3347;
+  border-radius: 999px;
+}
+.thin-scroll::-webkit-scrollbar-thumb:hover {
+  background: #3a4661;
+}
+
+/* Tabular numerals for all mono numeric displays */
+.num {
+  font-family: var(--font-jetbrains-mono), ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+/* Status dot ping */
+@keyframes dca-ping {
+  0% {
+    transform: scale(1);
+    opacity: 0.7;
+  }
+  75%,
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+.dot-ping::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 9999px;
+  background-color: currentColor;
+  animation: dca-ping 1.6s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+
+/* P2 — semantik terminal token'ları (ham hex yerine: bg-surface, bg-base,
+   border-border-strong). Değerler mevcut paletle birebir; consolidation
+   P2 codemod ile (bg-[#10141d]→surface, bg-[#0B0E14]→base vb.). */
+@theme {
+  --color-base: #0b0e14;
+  --color-surface: #10141d;
+  --color-surface-2: #141a26;
+  --color-border-strong: #2a3347;
+}
+
+/* P6 — reduced motion: ping/spin/skeleton + tw-animate son durum */
+@media (prefers-reduced-motion: reduce) {
+  .dot-ping::after {
+    animation: none;
+    opacity: 0.35;
+    transform: scale(1);
+  }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Terminal glow accents */
+.glow-emerald {
+  box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.25), 0 0 24px rgba(16, 185, 129, 0.07);
+}
+.glow-rose {
+  box-shadow: 0 0 0 1px rgba(244, 63, 94, 0.3), 0 0 24px rgba(244, 63, 94, 0.08);
+}

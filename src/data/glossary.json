@@ -1,0 +1,196 @@
+[
+  {
+    "code": "-1003",
+    "exchange": "BINANCE",
+    "title": "TOO_MANY_REQUESTS — İstek limiti aşıldı",
+    "severity": "YÜKSEK",
+    "plainCause": "Bir dakikada izin verilenden çok fazla istek gönderildi (ağırlık bütçesi aşıldı). Borsa sizi geçici olarak soğutma penceresine aldı.",
+    "botAction": "2026 hız sınırlayıcı X-MBX-USED-WEIGHT-1M başlığını izler: 4500'de kısılar, 5400'de dondurur, HTTP 429'da Retry-After süresi kadar tam kilit; emirler 8 emir/sn token bucket ile dağıtılır.",
+    "operatorSteps": [
+      "Canlı sekmesinde hız limiti göstergesini kontrol edin (kalan ağırlık bütçesi).",
+      "Bot başına tick frekansını düşürmeyi düşünün (10 sn varsayılan yeterlidir).",
+      "Kilit otomatik açılana kadar bekleyin — manuel emir göndermeyin."
+    ]
+  },
+  {
+    "code": "-2010",
+    "newOrderRejected": true,
+    "exchange": "BINANCE",
+    "title": "NEW_ORDER_REJECTED — Emir reddedildi",
+    "severity": "KRİTİK",
+    "plainCause": "Borsa emri genel geçerlik denetiminde reddetti. Tarihsel olarak en sık neden aynı clientOrderId'in tekrar kullanılmasıydı (idempotency çakışması).",
+    "botAction": "v4.2 düzeltmesi kalıcıdır: clientOrderId mikrosaniye base36 üretimiyle her emirde benzersizdir. Red yine gelirse In-Flight sondası yalnız -2013 için yeniden dener; -2010 için sürekli deneme yapmaz (dürüst başarısızlık).",
+    "operatorSteps": [
+      "Olay günlüğünde ORDER_INTENT kaydını açın ve forensik şelalesiyle reddin zamanını inceleyin.",
+      "Hata Sözlüğü dışında -1013/-2011 gibi alt kod var mı diye bakın (filtre mi, bakiye mi).",
+      "Sorun sürerse testnet bağlantısını yeniden doğrulayın (API Yöneticisi)."
+    ]
+  },
+  {
+    "code": "-1013",
+    "exchange": "BINANCE",
+    "title": "FILTER_FAILURE — Fiyat/miktar filtresi ihlali",
+    "severity": "ORTA",
+    "plainCause": "Emir fiyatı veya miktarı sembolün tick/step/minNotional kurallarına uymuyor (ör. 4 ondalık istenen sembole 6 ondalık gönderildi).",
+    "botAction": "M08 tickDown/qtyDown hizalaması tüm emir yolunda zorunludur; minQty/minNotional altında otomatik büyütme YASAKTIR (emir atlanır, kapı 6).",
+    "operatorSteps": [
+      "Sembol detayında tickSize/stepSize değerlerini doğrulayın.",
+      "Manuel parametre girdiyseniz ondalık basamak sayısını filtreyle eşitleyin.",
+      "Backtest'te aynı sembolü çalıştırıp M08 hizalama kaydını görün."
+    ]
+  },
+  {
+    "code": "-1021",
+    "exchange": "BINANCE",
+    "title": "Timestamp outside recvWindow — Saat kayması",
+    "severity": "YÜKSEK",
+    "plainCause": "İstek zaman damgası sunucu saatinden çok farklı (yerel saat kayması veya gecikmiş istek).",
+    "botAction": "live.ts zaman senkronizasyonu sunucu ofsetini önbelleğe alır ve her imzalı isteğe ekler; ofset tekrar bozulursa selfcheck item'ları raporlar.",
+    "operatorSteps": [
+      "API Yöneticisi'nde bağlantıyı yeniden doğrulayın (RTT + saat kayması sonda).",
+      "Kapsayıcı NTP senkronizasyonunu kontrol edin.",
+      "recvWindow 5000 ms'tir — çok yüksek gecikmeli ağda tekrar deneyin."
+    ]
+  },
+  {
+    "code": "-2011",
+    "exchange": "BINANCE",
+    "title": "CANCEL_REJECTED — İptal reddedildi",
+    "severity": "ORTA",
+    "plainCause": "İptal edilmek istenen emir artık açık değil (zaten dolmuş, doldu veya iptal edilmişti).",
+    "botAction": "v6.0 atomik cancelReplace STOP_ON_FAILURE: iptal başarısızsa değiştirme asla gönderilmez. Reconcile rutini 60 sn'de bir gerçekliği yeniden okur; -2011 idempotent kabul edilir.",
+    "operatorSteps": [
+      "Panik yapmayın: -2011 çoğunlukla emrin dolmuş olduğu anlamına gelir (deal güncellenmiştir).",
+      "Deal tablosunda güncel ortalama maliyeti (WAC) kontrol edin.",
+      "Tutarsızlık görürseniz MUTABAKAT (reconcile) raporunu çalıştırın."
+    ]
+  },
+  {
+    "code": "10002",
+    "exchange": "BYBIT",
+    "title": "Invalid signature — İmza geçersiz",
+    "severity": "YÜKSEK",
+    "plainCause": "HMAC-SHA256 imzası sunucuda doğrulanmadı: yanlış gizli anahtar, saat kayması veya imza dizgisi yanlış sıralanmış (timestamp+key+recvWindow+gövde).",
+    "botAction": "BybitAdapter imza zarfını sunucu şablonuna birebir uygular; sihirbaz adım 3 imzalı sonda yapmadan kayda izin vermez.",
+    "operatorSteps": [
+      "API Yöneticisi sihirbazında gizli anahtarı boşluk kırpmasıyla (trim) yeniden girin.",
+      "Saat kayması sonda raporunu görün (limit 1000 ms).",
+      "Anahtarın kopyalanmasında eksik karakter kalmadığından emin olun."
+    ]
+  },
+  {
+    "code": "10006",
+    "exchange": "BYBIT",
+    "title": "Insufficient available balance — UTA kullanılabilir bakiye yetersiz",
+    "severity": "YÜKSEK",
+    "plainCause": "Unified Trading Account'ta özkaynak yeterli görünse de bakım marjı ayrılmış olabilir — bot spot nakdi hesap özkaynağı sanırsa DCA adımları anında reddedilir (2023 UTA dersi).",
+    "botAction": "BybitAdapter dinamik marj kesiği uygular: AvailableOrderCash = max(0, TotalEquity − TotalMM × 1.15). Sihirbaz bakiye adımında bu değeri gösterir.",
+    "operatorSteps": [
+      "API Yöneticisi'nde marj kesiği değerini (availableOrderCash) kontrol edin.",
+      "Açık pozisyonların bakım marjı tüketimini inceleyin.",
+      "Kaldıraç katmanını düşürerek r_MM baskısını azaltın."
+    ]
+  },
+  {
+    "code": "110007",
+    "exchange": "BYBIT",
+    "title": "Insufficient balance — Spot bakiye yetersiz",
+    "severity": "ORTA",
+    "plainCause": "Spot kategorisinde emir tutarı için serbest bakiye yok (quote varlık eksik).",
+    "botAction": "Sihirbaz adım 4'te USDT + komisyon varlığı (MNT) bakiyesini sorgular; bakiye yetersizse mikro-emir adımı atlanır (dürüst rapor).",
+    "operatorSteps": [
+      "Bakiye adımında serbest USDT miktarını doğrulayın.",
+      "Testnet bakiyesini borsa musluğundan tazeleyin.",
+      "Daha küçük base order ile başlayın."
+    ]
+  },
+  {
+    "code": "10001",
+    "exchange": "BYBIT",
+    "title": "Params error — Parametre hatası",
+    "severity": "ORTA",
+    "plainCause": "İstek gövdesinde zorunlu alan eksik veya biçim yanlış (ör. qty pozitif değil, symbol yok).",
+    "botAction": "Adapter tüm emirlerde M08 hizalı string alanlar gönderir; parametre reddi tekrar denemez (loop kilitlenmesi önlenir).",
+    "operatorSteps": [
+      "Sembol adının V5 biçimiyle eşleştiğini doğrulayın (BTCUSDT).",
+      "Miktar/limit değerlerinin pozitif olduğunu kontrol edin.",
+      "Sürüm notlarında kategori (spot/linear) alanını doğrulayın."
+    ]
+  },
+  {
+    "code": "50004",
+    "exchange": "OKX",
+    "title": "Rate limit reached — İstek limiti",
+    "severity": "YÜKSEK",
+    "plainCause": "Uç nokta başına istek bütçesi doldu (OKX uç başına ayrık sayar).",
+    "botAction": "Sondalar 8 sn zaman aşımı ve tek deneme ilkesiyle çalışır; 429 döngüsüne girilmez.",
+    "operatorSteps": [
+      "Birkaç saniye bekleyip yeniden doğrulayın.",
+      "Aynı anahtarla paralel uygulama çalıştırmadığınızdan emin olun."
+    ]
+  },
+  {
+    "code": "51008",
+    "exchange": "OKX",
+    "title": "Insufficient balance — Bakiye yetersiz",
+    "severity": "ORTA",
+    "plainCause": "Hesapta emir için yeterli serbest varlık yok (availEq/availBal düşük).",
+    "botAction": "OkxAdapter bakiyeyi Decimal ile okur; frozen rezervi muhafazakâr MM olarak sayar (kesik 1.15).",
+    "operatorSteps": [
+      "Bakiye adımında serbest/donmuş ayrımını görün.",
+      "Demo (x-simulated-trading) hesabında varlık musluğunu kullanın.",
+      "posMode assertion'ını kontrol edin (long_short_mode)."
+    ]
+  },
+  {
+    "code": "51006",
+    "exchange": "OKX",
+    "title": "Order ID already exists — clientOrderId çakışması",
+    "severity": "ORTA",
+    "plainCause": "clOrdId daha önce kullanılmış — idempotency anahtarı çakıştı (Binance -2010 dersinin OKX kardeşi).",
+    "botAction": "Mikro-emir sondası clOrdId'ye zaman damgası + rastgele 4 karakter ekler (mikrosaniye base36 dersi v4.2).",
+    "operatorSteps": [
+      "İsteği tekrar deneyin (yeni clOrdId otomatik üretilir).",
+      "Sorun sürerse aynı clOrdId'yi gönderen başka istemci olup olmadığını araştırın."
+    ]
+  },
+  {
+    "code": "IN-FLIGHT TIMEOUT",
+    "exchange": "NETWORK",
+    "title": "In-Flight Timeout — Soket düşüşü sonrası belirsizlik",
+    "severity": "KRİTİK",
+    "plainCause": "Emir gönderildi ancak yanıt gelmeden bağlantı düştü; emrin dolup dolmadığı bilinmiyor (idempotency tehlike bölgesi).",
+    "botAction": "v6.0 In-Flight sondası: zaman aşımında GET /order ile gerçekliği sorar; YALNIZ -2013 (emir yok) yanıtında aynı clientOrderId ile tek yeniden gönderim. Diğer kodlarda yeniden deneme YOK.",
+    "operatorSteps": [
+      "Forensik şelalesinde In-Flight span'ını bulun (kırmızı gecikme çubuğu).",
+      "Sonda sonucunu (emir bulundu/bulunamadı) okuyun.",
+      "MUTABAKAT raporuyla deal gerçekliğini teyit edin."
+    ]
+  },
+  {
+    "code": "pu!=u Sequence Break",
+    "exchange": "NETWORK",
+    "title": "Orderbook sequence break — L2 derinlik zinciri kırıldı",
+    "severity": "YÜKSEK",
+    "plainCause": "Orderbook akışında pu (previous update) ile u (update) zinciri koparı — anlık görüntü ile artım verileri tutarsız; bu veriyle fiyat kurgulamak kapı 1 ihlalidir.",
+    "botAction": "v6.0 pu==u sıra bekçisi: kırılmada derinlik buffer'ı anında synced=false olur → MarketDataPort fetchOrderBook null döner (fail-closed), senkron snapshot gelene kadar emir üretilmez.",
+    "operatorSteps": [
+      "Piyasa sekmesinde orderbook senkron rozetini kontrol edin (senkron değil görünmeli).",
+      "Botların senkronsuzluk penceresinde emir üretmediğini olay günlüğünden doğrulayın.",
+      "Bağlantı toparlanınca zincir otomatik yeniden kurulur."
+    ]
+  },
+  {
+    "code": "SQLITE_BUSY",
+    "exchange": "NETWORK",
+    "title": "SQLite veritabanı meşgul — Yazma kilidi çatışması",
+    "severity": "ORTA",
+    "plainCause": "Aynı anda birden çok yazma isteği kilit çatışmasına düştü (WAL modunda nadir; uzun okuyucu veya harici erişimde olur).",
+    "botAction": "db.ts başlangıç pragma'ları: journal_mode=WAL + busy_timeout=5000 + synchronous=NORMAL ($queryRawUnsafe ile — satır sonuçları asla throw etmez). Olay havuzu bulkhead'lidir: yazım düşse bile çekirdek devam eder.",
+    "operatorSteps": [
+      "Aynı custom.db'ye ikinci bir süreç bağlamadığınızdan emin olun.",
+      "Uzun süren rapor sorgularını düşük trafikte çalıştırın.",
+      "Sık yinelenirse tarball dışa aktarımından önce wal_checkpoint(TRUNCATE) çalıştırın."
+    ]
+  }
+]

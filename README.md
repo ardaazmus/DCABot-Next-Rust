@@ -1,0 +1,204 @@
+# DCABOT v3.0 — Rust Kuantitatif Çekirdek + Next.js Trading Terminali
+
+## Windows üzerinde yerel çalıştırma
+
+Node.js, Rust/MSVC derleme araçları ve proje bağımlılıkları kurulu olmalıdır. Rust paketleri yerel Cargo önbelleğinde bulunmalıdır; başlatıcı kilit dosyasını kullanarak çevrimdışı derler.
+
+```powershell
+npm run local:start
+```
+
+Arayüz: http://127.0.0.1:3000. Başlatıcı önce güncel Rust motorunu derler, ardından motoru ve Next.js'i gizli arka plan süreçlerinde başlatır; iki servisin HTTP yanıtını kontrol eder. Derleme paralelliği ve SWC iş parçacığı sayısı sınırlıdır. 3000/3002 portları boş olmalıdır.
+
+**Kimlik doğrulama (SEC-01/C-1/C-2):** Motor tüm yönetim uçlarında `Authorization: Bearer <DCA_API_KEY>` zorunlu tutar (yalnız `/api/health` açıktır). Başlatıcı ilk çalıştırmada rastgele `DCA_API_KEY` + `DCA_VAULT_KEY` üretir ve `.local-runtime/local-keys.env` içinde saklar; UI bu anahtarı `NEXT_PUBLIC_ENGINE_API_KEY` ile dev-time gömer ve `engineFetch` tüm isteklere Bearer ekler. SSE (`EventSource` başlık koyamaz) `/api/stream` route handler'ı üzerinden sunucu tarafında proxy'lenir. Anahtarlar yerel çalışma içindir, depoya girmez.
+
+Yerel çalıştırma `.local-runtime/paper.sqlite3` veritabanını kullanır; mevcut `db/dca-core.sqlite3` dosyasındaki botları veya anahtarları yüklemez. Bybit testnet varsayılanı kullanılır; `.env` içindeki özel Bybit base URL ayarları adapter tarafından öncelikli değerlendirilir. Gerçek hesap anahtarı eklemeyin; inceleme raporundaki LIVE işlem engelleri halen geçerlidir. Motor 3002 portunu yalnız 127.0.0.1 üzerinde dinler.
+
+Günlükler `.local-runtime/` içindedir. Durdurmak için:
+
+```powershell
+npm run local:stop
+```
+
+Yerel PAPER veritabanı durdurmada korunur. Geliştirme sunucusu üretim dağıtımı için kullanılmamalıdır.
+
+### Bot oluşturma API'si — örnek gövde (D-1)
+
+`POST /api/bots` gövdesinde `config`, `BotConfig`'in serde şemasının TAMAMINI taşımalıdır (`kind` ve `symbol` üst düzey alanlarla çiftlenir). Çalışan en küçük örnek:
+
+```json
+{
+  "name": "ornek-bot",
+  "kind": "DCA_LONG",
+  "venue": "BYBIT",
+  "mode": "PAPER",
+  "symbol": "BTCUSDT",
+  "interval": "1h",
+  "start_cash": "1000",
+  "config": {
+    "kind": "DCA_LONG", "symbol": "BTCUSDT",
+    "base_order_size": "50", "safety_order_size": "25",
+    "sizing_mode": "QUOTE_NOTIONAL",
+    "deviation_pct": "0.005", "step_scale": "1.2", "volume_scale": "1.1",
+    "max_safety_orders": 3, "target_profit_pct": "1", "use_net_tp": true,
+    "trailing_enabled": false, "trailing_trigger_pct": "1", "trailing_deviation_pct": "0.5",
+    "stop_loss_pct": null, "leverage": "1",
+    "hedge_ratio": "0.5", "combined_target_profit": "50",
+    "grid_lower": null, "grid_upper": null, "grid_levels": null,
+    "grid_mode": null, "grid_trail": false, "cooldown_bars": 0,
+    "entry_trigger": "INSTANT"
+  }
+}
+```
+
+Dikkat: `deviation_pct` KESİR olarak yazılır (`0.005` = %0,5); `start_cash` pozitif olmalıdır. Hatalı kombinasyonlar (örn. kümülatif sapmanın %100'ü aşması) kurulumda 422 ile reddedilir.
+
+> **Sürüm:** 3.0-CANONICAL-UNIFIED
+> **Mimari:** Rust High-Performance Quantitative Engine (`dca-core`) + Next.js App Router Quantitative Terminal
+> **Temel İlkeler:** Sıfır-Float Rasyonel Aritmetik (M01–M21), 8 Fail-Closed Risk Kapısı, Sıfır-Emir-Yetkili AI, Sıfır-Çekim-Yetkili Vault, Tek Süreç / Düşük Kaynak Dağıtımı
+
+---
+
+## 1. Mimari Genel Bakış
+
+```
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                  NEXT.JS 16 QUANTITATIVE TRADING TERMINAL                      │
+│   Kokpit / Dashboard • 5-Adım Bot Yaratma Sihirbazı • 7-Sekmeli Bot Stüdyosu   │
+│   İnteraktif DCA/Grid Hesaplayıcı • Backtest Lab • AES-256-GCM Vault Ayarları   │
+└──────────────────────────────────────┬─────────────────────────────────────────┘
+                                       │  Gateway (XTransformPort=3002) / SSE
+                                       ▼
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                       RUST QUANTITATIVE CORE ENGINE  (port 3002)               │
+│          Safe Rust • Tokio Async Event Loop • SQLite WAL Persistence           │
+│                                                                                │
+│  ┌────────────────────────┐ ┌────────────────────────┐ ┌────────────────────┐  │
+│  │     dca_math Crate     │ │    dca_kernel Crate    │ │ dca_strategy Crate │  │
+│  │ - 4096-bit Rational    │ │ - 8 Fail-Closed Gates  │ │ - DCA Long / Short │  │
+│  │   Fraction Arithmetic  │ │ - Single Event Kernel  │ │ - Spot/Fut Grid    │  │
+│  │ - Half-Even Rounding   │ │ - SimulationStepper    │ │ - Hedge Groups     │  │
+│  │ - WAC Accounting       │ │ - M16 Order Reconciler │ │ - Combo & Infinity │  │
+│  │ - M01–M21 Normative    │ │ - Liquidation Monitor  │ │ - Sizing Engine    │  │
+│  └────────────────────────┘ └────────────────────────┘ └────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────────────────────┐  │
+│  │                   dca_exchange & dca_risk Crates                         │  │
+│  │  - BYBIT v5 Adapter (ÖNCELİKLİ: REST + HMAC imza + WS hazır)             │  │
+│  │  - Binance Adapter (ikincil) + Paper Venue                               │  │
+│  │  - Zero-Withdrawal Hard Gate (HTTP 422) & AES-256-GCM Vault              │  │
+│  │  - M21 NYSE Paskalya Takvimi + 23/5 Emtia + 24/7 Kripto Seansları        │  │
+│  └──────────────────────────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 2. Dizin Yapısı
+
+```
+/home/z/my-project
+├── src/app/page.tsx                 # Terminal UI (tek route — client-side view switching)
+├── src/components/terminal/         # Kokpit, Fleet, Studio (7 sekme), Wizard (5 adım),
+│                                    # Hesaplayıcı, Backtest Lab, Ayarlar, grafikler
+├── src/hooks/use-engine.ts          # engineFetch (XTransformPort), SSE store, polling hooks
+├── src/lib/engine-types.ts          # Rust motor wire tipleri (exact decimal strings)
+├── src/lib/format.ts                # fmtFrac / fmtUsd / fmtTs — half-even display yardımcıları
+├── docs/BYBIT_RESEARCH.md           # Bybit v5 derin araştırma (canlı doğrulanmış, 731 satır)
+├── db/dca-core.sqlite3              # SQLite WAL (bots, fills, events, deals, vault_keys…)
+└── mini-services/dca-core/          # RUST ÇEKİRDEK (Cargo workspace, 6 crate)
+    ├── crates/dca_math/             # M01–M21: Fraction 4096-bit + tüm normatif formüller
+    ├── crates/dca_kernel/           # Bar, OrderIntent, SimulationStepper (tek olay çekirdeği)
+    ├── crates/dca_risk/             # 8 Fail-Closed Gate saf fonksiyonları
+    ├── crates/dca_strategy/         # DCA/Grid/Infinity/Hedge motorları + backtest runner
+    ├── crates/dca_exchange/         # Bybit v5 (öncelik), Binance, Paper venue
+    └── crates/dca_server/           # axum REST+SSE :3002, SQLite WAL, vault, bot supervisor
+```
+
+## 3. Rust Çekirdek — Çalıştırma
+
+```bash
+cd mini-services/dca-core
+bun run dev        # release binary yoksa derler, sonra :3002'de servis eder
+bun run test       # cargo test --workspace (60 test)
+bun run build      # cargo build --release
+```
+
+Port sabit: **3002**. Next.js gateway üzerinden erişim: `/api/<yol>?XTransformPort=3002`.
+
+## 4. Matematiksel Çekirdek (M01–M21)
+
+| Modül | İçerik | Test |
+|---|---|---|
+| M01 | 4096-bit rasyonel kesir; `gcd=1`, `den>0`; NaN/Inf reddi; half-even display (yalnız raporlama sınırında) | 13 |
+| M02 | DCA sabit seviye planı; kümülatif sapma `D_i = d·Σa^k`; tickDown/Up hizalama | 6 |
+| M03 | Plan notional, initial margin, stres teminatı (Ω şok yolları) | — |
+| M04 | WAC muhasebe; kısmi kapanışta ortalama SABİT; `fill_key` idempotensi; overfill ihlal kaydı | 6 |
+| M05 | Ücret/funding; exact net TP: Long `(qA+F+T)/(q(1−f))` tickUp, Short `(qA−F−T)/(q(1+f))` tickDown; funding işaret köprüsü | 3 |
+| M06 | Equity, unrealized PnL, HWM/DD/MDD, TWR | 1 |
+| M07 | Exact likidasyon sınırı; MMR bracket iterasyonu: Long `(qA−W−d)/(q(1−r))`, Short `(qA+W+d)/(q(1+r))` | 2 |
+| M08 | Tick/step ızgarası; qtyDown; intrabar penetrasyon kuralları | — |
+| M15 | Aritmetik/geometrik mesh; geometrik mesh **BigInt tam n'inci kök** (sıfır float!); fee-breaker `g_min=(f_b+f_s)/(1−f_s)` | 4 |
+| M16 | Order reconciliation: minimal diff (cancel→place sırası, sıfır duplikat) | 2 |
+| M17 | Infinity grid: `V_base` sabit; `Δq = q − V/(p+Δp)` | 1 |
+| M18 | Hedge coupling: `Δ_net = q_main − ρ·q_hedge`; combined exit | 1 |
+| M20 | SL–merdiven çakışma dedektörü: `SL_trig(A_k) ≥ P_{k+1}` ulaşılır | 2 |
+| M21 | NYSE tatil takvimi (Meeus/Jones/Butcher Paskalya), EDT/EST, 23:00–22:00 UTC emtia, borç faizi N·r/360 | 5 |
+
+**Toplam: 60 test — hepsi yeşil.** Float tipi yalnızca raporlama sınırında (Sharpe display) kullanılır.
+
+## 5. 8 Fail-Closed Risk Kapısı
+
+1. **GATE1 Veri Bütünlüğü** — OHLCV yapısal geçerlilik + monoton zaman damgası; ihlalde **MOTOR DURUR**
+2. **GATE2 Ücret Kesintisi** — sıfır ücret fill doğrulanmış promosyon yoksa reddedilir
+3. **GATE3 Kayma Cezası** — market emirleri tetik fiyatından derefilledemez: `P_fill = P_open·(1±slip)`
+4. **GATE4 Sıfır Look-Ahead** — bar kapanışında alınan karar en erken t+1'de çalışır
+5. **GATE5 Limit Gerçekçiliği** — `MARKETABLE_TAKER / RESTING_TOUCH / OPEN_GAP_BETTER` etiketleri + bar hacminin %10'unu aşan fill yok
+6. **GATE6 Sermaye Koruması** — nakit/marj yetersizde SKIP/WAIT; negatif nakit asla
+7. **GATE7 Seans Koruması** — piyasa kapalıyken ADD reddedilir (FAIL_CLOSED), TP/SL/REDUCE korunur
+8. **GATE8 Gap Koruması** — 09:30–09:35 ET açılış salvosunda safety emirleri ertelenir; çoklu seviye gap'lerinde tek sentetik VWAP fill
+
+## 6. Bybit Entegrasyonu (Öncelikli Platform)
+
+`docs/BYBIT_RESEARCH.md` — canlı `curl` doğrulamalı tam araştırma:
+- **İmza:** `HMAC-SHA256(ts + api_key + recv_window + queryString|jsonBody)` → lowercase hex
+- **Header'lar:** `X-BAPI-API-KEY, X-BAPI-SIGN, X-BAPI-TIMESTAMP, X-BAPI-RECV-WINDOW`
+- **İzin taraması:** `GET /v5/user/query-api` → `permissions.Wallet` dizisinde `"Withdraw"` varsa **HTTP 422 HARD FAIL** (sıfır-çekim kapısı)
+- **Enstrümanlar:** `priceFilter.tickSize`, `lotSizeFilter.qtyStep/minOrderQty/minNotionalValue` (spot+linear)
+- **Kline:** `result.list` DESC → kernel'e ASC normalize
+- **Fee:** spot 0.10%/0.10%, linear maker 0.020%/taker 0.055% (varsayılan kademe)
+
+## 7. API Kontratı (dca-core :3002)
+
+| Yöntem | Yol | Açıklama |
+|---|---|---|
+| GET | `/api/health` | motor durumu |
+| GET | `/api/summary` | NAV, exposure, allocation, fleet sayıları |
+| GET/POST | `/api/bots` | fleet listesi / bot oluştur (M20 + fee-breaker pre-flight) |
+| GET/PATCH/DELETE | `/api/bots/:id` | detay (ladder dâhil) / dinamik TP-SL-trailing patch / durdur |
+| POST | `/api/bots/:id/actions` | START/PAUSE/STOP/CLOSE_ALL/ADD_FUNDS |
+| GET | `/api/bots/:id/fills` | fill kayıtları (role, fee, realism etiketi) |
+| GET | `/api/bots/:id/events` | kernel olay günlüğü |
+| POST | `/api/calc/dca` | DCA merdiven hesaplayıcı + M20 + likidasyon |
+| POST | `/api/calc/grid` | Grid mesh hesaplayıcı + fee-breaker |
+| POST | `/api/backtest` | 1000 bar'a kadar backtest (equity curve, MDD, win rate) |
+| GET | `/api/markets` | enstrüman önbelleği (Bybit canlı) |
+| GET | `/api/klines` | mum verisi (Bybit canlı) |
+| POST/GET/DELETE | `/api/vault/keys` | AES-256-GCM şifreli anahtar kasası + zero-withdrawal gate |
+| GET | `/api/stream` | SSE: `FILL`, `EQUITY`, `LOG`, `BOT_STATE`, `ORDER`, `PING` |
+
+## 8. Güvenlik
+
+- **Zero-Withdrawal Hard Gate:** çekim yetkili anahtar anında 422 ile reddedilir — aşılamaz
+- **AES-256-GCM Vault:** anahtarlar 12-byte rastgele nonce ile şifreli; master key env (`DCA_VAULT_KEY`) veya otomatik üretim + SQLite'ta saklanır
+- **Sıfır-Float:** tüm fiyat/miktar/ücret/PnL hesapları `Fraction` (BigInt num/den); JSON'da exact `"n/d"` string
+- **Fail-Closed:** belirsiz/eksik durumda emir ASLA gönderilmez
+
+## 9. Bilinen Kısıtlar / Yol Haritası (Horizon 5)
+
+- ✅ Horizon 1: Pure Math & Kernel (M01–M21 + 8 Gate)
+- ✅ Horizon 2: Strategies & Backtesting
+- ✅ Horizon 3: Live Connectors (Bybit REST tam; WS feed modülü hazır — private WS aboneliği testnet doğrulaması bekliyor) + Vault + SQLite WAL
+- ✅ Horizon 4: Next.js Terminal (tek-route kısıtı: tüm görünümler client-side nav ile `/` altında)
+- ⏳ Horizon 5: 6 aylık testnet rampası — 20/20 testnet checklist + dual-run parity audit (TS referans motoru yokluğunda Rust-dahili parity: backtest vs paper replay)
+
+## 10. Sandbox Notu
+
+Bu kısıtlı bulut ortamında `next dev` soğuk derlemesi ~2GB tepe bellek kullanır; paylaşımlı node'da global OOM baskısı dönemsel olarak derlemeyi keser. Rust çekirdeği (`dca_server`, ~7MB RSS) bu kısıttan bağımsız stabil çalışır. UI derlemesi bir kez tamamlandığında `.next` önbelleği sıcak kalır.

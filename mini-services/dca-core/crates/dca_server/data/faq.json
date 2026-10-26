@@ -1,0 +1,114 @@
+[
+  {
+    "id": "dca-nedir",
+    "category": "DCA İlkeleri",
+    "question": "DCA (Dolar Maliyeti Ortalaması) botu nasıl çalışır?",
+    "answer": "Bot bir baz emirle (base order) pozisyon açar; piyasa aleyhinize her 'Sapma Adımı %' kadar hareket ettiğinde önceden hesaplanmış güvenlik emirleriyle (safety orders) ortalama maliyeti düşürür. Fiyat toparlayınca Net Alım Hedefi (TP) dengeli noktada kâr kapatır. Tüm miktar ve maliyet muhasebesi WAC (Weighted Average Cost) lot defteriyle tam kesinlik yapılır.",
+    "keywords": ["dca", "baz emir", "güvenlik", "ortalama maliyet", "wac", "tp"]
+  },
+  {
+    "id": "deviation-step",
+    "category": "DCA İlkeleri",
+    "question": "Sapma Adımı (%) ne anlama gelir?",
+    "answer": "Piyasa aleyhinize hareket ettiğinde alım yapılacak yüzde mesafedir. Örn. %2 sapma ile fiyat girişin %2 altına düştüğünde ilk güvenlik emri tetiklenir. Ardışık emirler Adım Ölçeği (step scale) ile katlanarak genişler.",
+    "keywords": ["sapma", "deviation", "step", "güvenlik emri", "aralık"]
+  },
+  {
+    "id": "grid-fee-breaker",
+    "category": "Grid",
+    "question": "Grid aralığı neden bazen 'çok dar' reddediliyor?",
+    "answer": "Grid'de her alım-satım çifti iki kez komisyon öder. G_min = 2f/(1−f) altında grid adımı kâr etmez (fee kırıcı). Örn. %0.1 komisyonda minimum özgül kâr aralığı ≈ %0.2002'dir — altındaki adımlar motor tarafından yasaklanır.",
+    "keywords": ["grid", "komisyon", "fee", "dar", "g_min", "adım"]
+  },
+  {
+    "id": "leverage-bracket",
+    "category": "Vadeli",
+    "question": "Kaldıraç basamağı (leverage bracket) maliyeti nasıl etkiler?",
+    "answer": "Vadelide pozisyon büyüdükçe bakım marj katsayısı (r_MM) basamak basamak artar. Motor M07 likidasyon kökünü ve M03 stres teminatını aktif basamağın r_MM'i ile hesaplar — yanlış basamak sanırsa tersine çevrilmiş likidasyon tanımı zorunlu denetimle yakalanır.",
+    "keywords": ["kaldıraç", "leverage", "bracket", "bakım marjı", "r_mm", "likidasyon"]
+  },
+  {
+    "id": "funding-fee",
+    "category": "Vadeli",
+    "question": "Fonlama (funding) ücreti hesaba nasıl katılır?",
+    "answer": "Vadeli pozisyonlarda 8 saatlik fonlama oranı uzun/kısa taraf arasında denge ödemesidir. Motor M05 fonlama işaret köprüsüyle pozisyon yönünüze göre ücreti gelir/gider olarak ayrıştırır ve Net TP hedefini fonlama dahil hesaplar.",
+    "keywords": ["funding", "fonlama", "ücret", "vadeli", "8 saat"]
+  },
+  {
+    "id": "dsr-pbo",
+    "category": "Dürüstlük",
+    "question": "Deflated Sharpe Ratio (DSR) ve PBO nedir?",
+    "answer": "DSR: stratejinin şans eseri mi gerçek bir kenardan mı kazandığını kanıtlayan aşırı-uyum rozeti (Bailey & López de Prado 2014). CSCV PBO: parametre seçiminin dış-örnekte tersine dönme olasılığı (8 blok, 70 kombinasyon, Bailey et al. 2017). Rozetleri geçmeyen strateji canlıya eklenemez.",
+    "keywords": ["dsr", "sharpe", "pbo", "aşırı uyum", "overfit", "sertifika", "backtest"]
+  },
+  {
+    "id": "edge-ratio",
+    "category": "Dürüstlük",
+    "question": "Edge Ratio neyi ölçer?",
+    "answer": "Sweeney (1992) MFE/MAE oranı: işlemlerin ulaştığı ortalama maksimum kâr (MFE) ile maruz kaldığı ortalama maksimum zarar (MAE) oranı. > 1.0 olması pozitif getiri kenarını kanıtlar; Backtest Stüdyosu'ndaki dağılım grafiği bunu bar-chat turuyla görselleştirir.",
+    "keywords": ["edge ratio", "sweeney", "mae", "mfe", "kenar"]
+  },
+  {
+    "id": "vwap-z-gate",
+    "category": "Canlı Döngü",
+    "question": "VWAP-Z tükenme kapısı güvenlik emirlerimi neden geciktiriyor?",
+    "answer": "Piyasa sert düşerken düşen bıçağı yakalamamak için: güvenlik emri tetiklendiğinde VWAP-Z > −1.5 ise emir 60 sn dedup ile ertelenir (SAFETY_THROTTLED_VWAP_Z), Z ≤ −2.5 ise serbest kalır. Bu kapı v7.0'dan beri canlı döngüdedir ve olay günlüğünde şeffaftır.",
+    "keywords": ["vwap", "z skoru", "tükenme", "gecikme", "düşen bıçak", "güvenlik"]
+  },
+  {
+    "id": "macro-blackout",
+    "category": "Canlı Döngü",
+    "question": "Makro kara pencere ne zaman devrede olur?",
+    "answer": "FOMC, CPI, NFP gibi yüksek-etki duyuruların [T−30dk, T+15dk] penceresinde yeni baz emir açılmaz (BASE_ORDER_ABSTAIN_MACRO_BLACKOUT). Amaç whipshaw ve flash-crash korumasıdır; açık deal'lerin yönetimi normalde sürer.",
+    "keywords": ["makro", "kara pencere", "blackout", "fomc", "cpi", "duyuru"]
+  },
+  {
+    "id": "kill-switch",
+    "category": "Güvenlik",
+    "question": "Kill-switch ne yapar, neden kırmızı yanıyor?",
+    "answer": "Üst üste 5 API hatasında veya DONDUR (soft freeze) komutunda yürütüm hattı kapanır: yeni emir açılmaz, ancak açık pozisyon denetimi sürer. Rozet 'Kill-Switch devrede' görünüyorsa Canlı sekmesinden nedeni okuyun; hat serbest rozeti yürütümün açık olduğunu gösterir.",
+    "keywords": ["kill switch", "dondur", "serbest", "hata serisi", "yürütüm"]
+  },
+  {
+    "id": "api-security",
+    "category": "Güvenlik",
+    "question": "API anahtarlarım nasıl saklanıyor?",
+    "answer": "AES-256-GCM zarf şifresiyle (v1:iv:ct:tag) dinlenir — düz metin asla veritabanına yazılmaz ve asla API yanıtlarında dönülmez. Sihirbaz çekim (withdraw) izni taşıyan anahtarı HARD FAIL ile reddeder (3Commas dersi). İzin sondası kayıttan önce çalışır.",
+    "keywords": ["api", "anahtar", "şifre", "güvenlik", "aes", "withdraw", "çekim"]
+  },
+  {
+    "id": "testnet-vs-live",
+    "category": "Güvenlik",
+    "question": "Testnet ile canlı arasındaki fark nedir?",
+    "answer": "Bu terminal varsayılan olarak Binance Testnet'e bağlanır (testnet.binance.vision): emirler gerçek borsa mantığıyla ama sanal parayla işlenir. Canlı yürütüm ayrı sertifika kapısından geçer; rozetleri geçmeyen strateji canlı hatta eklenemez.",
+    "keywords": ["testnet", "canlı", "live", "sanal", "para", "gerçek"]
+  },
+  {
+    "id": "forensic-waterfall",
+    "category": "Denetim",
+    "question": "Forensik şelalesi (tick-to-trade) nasıl okunur?",
+    "answer": "Her işlem döngüsü W3C traceId ile izlenir. Şelale [T=0ms] Tik Alındı kökünden başlar; sinyal, konfluans kapısı, hız limiti, emir gönderimi span'ları alt sistem gecikme çubuklarıyla dizilir. Kırmızı çubuklar hata/kapı reddi, sarı hız-limiti vurgusudur.",
+    "keywords": ["forensik", "şelale", "trace", "tik", "gecikme", "span"]
+  },
+  {
+    "id": "ai-copilot",
+    "category": "AI Asistan",
+    "question": "AI Asistanı emir verebilir mi?",
+    "answer": "HAYIR — tasarım gereği veremez. Kopyilot salt-okunur teşhis kum havuzudur: W3C iz şelalelerini, haber duyarlılığını ve hata sözlüğünü okuyabilir; ExecutionPort'a (placeOrder/cancelOrder/livedriver) hiçbir programatik erişimi yoktur (López de Prado 2018 kuralı).",
+    "keywords": ["ai", "asistan", "kopyilot", "emir", "salt okunur", "sandbox"]
+  },
+  {
+    "id": "bybit-uta",
+    "category": "Borsalar",
+    "question": "Bybit UTA bağlantısında nelere dikkat etmeliyim?",
+    "answer": "Bybit V5 Unified Trading Account'ta spot, vadeli ve opsiyon marjı birleşiktir. Bot özkaynağı değil marj kesiğini kullanır: AvailableOrderCash = max(0, TotalEquity − TotalMM × 1.15). Sihirbaz bakiye adımında bu değeri gösterir; 10006 hatası görürseniz Hata Sözlüğü'ne bakın.",
+    "keywords": ["bybit", "uta", "marj", "kesik", "equity", "10006"]
+  },
+  {
+    "id": "okx-posmode",
+    "category": "Borsalar",
+    "question": "OKX'te posMode uyarısı ne demek?",
+    "answer": "OKX hesabı varsayılan net_mode'dadır; bu modda DCA_SHORT açma girişimi borçlanma olmadan reddedilir veya spot satışa dönüşür. Sihirbaz posMode !== 'long_short_mode' tespit ederse vadeli aktivasyonu kilitler ve pozisyon modunu değiştirme adımlarını gösterir.",
+    "keywords": ["okx", "posmode", "net_mode", "long_short_mode", "pozisyon modu"]
+  }
+]

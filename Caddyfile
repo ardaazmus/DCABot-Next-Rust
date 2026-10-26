@@ -1,0 +1,22 @@
+:81 {
+	# SEC-06: Sabit upstream — istemci kontrollü query parametresi ile port
+	# seçimi KALDIRILDI. Yalnız /api* motoruna (3002) ve /*'e Next'e (3000)
+	# proxy'lenir. Başka yerel porta yönlendirme yapılamaz.
+	handle /api/* {
+		reverse_proxy localhost:3002 {
+			header_up Host {host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	handle {
+		reverse_proxy localhost:3000 {
+			header_up Host {host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+}

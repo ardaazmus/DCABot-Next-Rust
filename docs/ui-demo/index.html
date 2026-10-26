@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DCABOT UI/UX Onerileri - Interaktif Demo</title>
+<style>
+  :root{
+    --bg:#0d1119; --surface:#10141d; --surface-2:#141a26; --border:#1f2637; --border-strong:#2a3347;
+    --text-1:#f1f5f9; --text-2:#94a3b8; --text-3:#64748b;
+    --success:#10b981; --danger:#f43f5e; --warn:#f59e0b; --info:#06b6d4;
+    --on-dark:#04150e; --radius:12px; --font:Inter,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text-1);font-family:var(--font);font-size:15px;line-height:1.6}
+  .wrap{max-width:1080px;margin:0 auto;padding:32px 20px 80px}
+  header.top{display:flex;flex-wrap:wrap;gap:16px;align-items:center;justify-content:space-between;margin-bottom:8px}
+  h1{font-size:26px;margin:0;letter-spacing:-.01em}
+  .sub{color:var(--text-2);font-size:14px;max-width:70ch}
+  .badge{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:3px 10px;border-radius:999px;border:1px solid var(--border-strong);color:var(--text-2)}
+  section.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:22px;margin:22px 0}
+  section.card h2{font-size:17px;margin:0 0 4px;display:flex;align-items:center;gap:10px}
+  section.card p.desc{color:var(--text-2);font-size:13.5px;margin:0 0 16px;max-width:78ch}
+  .cols{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:760px){.cols{grid-template-columns:1fr}}
+  .panel{background:var(--surface-2);border:1px solid var(--border);border-radius:10px;padding:16px;min-width:0}
+  .panel h3{font-size:12px;text-transform:uppercase;letter-spacing:.09em;margin:0 0 12px}
+  .panel h3.bad{color:var(--danger)} .panel h3.good{color:var(--success)}
+  .btn{display:inline-flex;align-items:center;gap:8px;background:var(--success);color:var(--on-dark);font-weight:700;font-size:14px;border:0;border-radius:9px;padding:10px 18px;cursor:pointer;min-height:44px}
+  .btn.sec{background:transparent;color:var(--text-1);border:1px solid var(--border-strong)}
+  .btn.danger{background:transparent;color:var(--danger);border:1px solid var(--danger)}
+  .btn:disabled{opacity:.45;cursor:default}
+  .btn:focus-visible,a:focus-visible,button:focus-visible,input:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--info);outline-offset:2px}
+  /* telefon cercevesi */
+  .phone{width:250px;margin:0 auto;background:#05080d;border:1px solid var(--border-strong);border-radius:26px;overflow:hidden}
+  .phone .scr{padding:14px 14px 0;min-height:190px;font-size:12px;color:var(--text-2)}
+  .phone .mnav{display:flex;border-top:1px solid var(--border);background:var(--surface);padding-bottom:env(safe-area-inset-bottom,0)}
+  .phone .mnav button{flex:1;background:none;border:0;color:var(--text-3);font-size:9px;font-weight:600;display:flex;flex-direction:column;align-items:center;gap:2px;padding:9px 0 7px;cursor:pointer;min-height:52px;min-width:0}
+  .phone .mnav button.on{color:var(--success)}
+  .phone .mnav button span{max-width:64px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .dot{width:14px;height:14px;border-radius:50%;background:currentColor;opacity:.9}
+  .sheet{position:relative;margin:8px;border:1px dashed var(--border-strong);border-radius:10px;padding:10px;font-size:12px;display:none}
+  .sheet.open{display:block}
+  .sheet button{display:block;width:100%;text-align:left;background:none;border:0;color:var(--text-1);padding:9px 6px;font-size:13px;cursor:pointer;border-bottom:1px solid var(--border)}
+  /* tokenlar */
+  .swatches{display:grid;grid-template-columns:repeat(auto-fill,minmax(128px,1fr));gap:10px}
+  .sw{border:1px solid var(--border);border-radius:9px;overflow:hidden}
+  .sw i{display:block;height:44px}
+  .sw b{display:block;font-size:11.5px;padding:6px 8px;font-weight:600}
+  .sw code{display:block;font-size:10.5px;color:var(--text-2);padding:0 8px 7px;font-family:ui-monospace,Consolas,monospace}
+  /* tipografi */
+  .type-old{font-size:10px;color:var(--text-3)}
+  .type-old2{font-size:11px;color:var(--text-3)}
+  .type-new{font-size:13px;color:var(--text-2)}
+  .ratio{font-size:11px;font-weight:700;border-radius:6px;padding:1px 7px;margin-left:8px;white-space:nowrap}
+  .ratio.fail{background:rgba(244,63,94,.14);color:#fda4af}
+  .ratio.pass{background:rgba(16,185,129,.14);color:#6ee7b7}
+  /* grafik */
+  .chartbox{position:relative}
+  svg.eq{width:100%;height:190px;display:block;background:#0a0e15;border:1px solid var(--border);border-radius:9px}
+  . readout,.readout{font-variant-numeric:tabular-nums}
+  .readout{margin-top:10px;font-size:13.5px;background:#0a0e15;border:1px solid var(--border);border-radius:8px;padding:9px 12px}
+  .sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+  table.data{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:10px}
+  table.data th,table.data td{border-bottom:1px solid var(--border);padding:7px 9px;text-align:right;font-variant-numeric:tabular-nums}
+  table.data th:first-child,table.data td:first-child{text-align:left}
+  table.data th button{background:none;border:0;color:var(--text-1);font:inherit;font-weight:700;cursor:pointer;padding:0}
+  /* ilerleme + skeleton */
+  .bar{height:10px;background:#0a0e15;border:1px solid var(--border);border-radius:99px;overflow:hidden;margin:10px 0}
+  .bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--success),var(--info));transition:width .35s ease}
+  .phase{font-size:13px;color:var(--text-2);min-height:22px}
+  .skel{border-radius:8px;background:linear-gradient(90deg,#141a26 25%,#1d2433 50%,#141a26 75%);background-size:200% 100%;animation:sh 1.2s infinite linear;border:1px solid var(--border)}
+  @keyframes sh{to{background-position:-200% 0}}
+  /* secret */
+  .fld{display:flex;gap:8px;align-items:stretch;margin-top:8px}
+  .fld input{flex:1;min-width:0;background:#0a0e15;border:1px solid var(--border-strong);color:var(--text-1);border-radius:9px;padding:0 12px;font-size:14px;min-height:44px;font-family:ui-monospace,Consolas,monospace}
+  .okmsg{font-size:12.5px;color:var(--success);min-height:20px;margin-top:6px}
+  /* hareket */
+  .ping{width:10px;height:10px;border-radius:50%;background:var(--success);display:inline-block;animation:pg 1.6s infinite}
+  @keyframes pg{0%{box-shadow:0 0 0 0 rgba(16,185,129,.5)}70%{box-shadow:0 0 0 9px rgba(16,185,129,0)}100%{box-shadow:0 0 0 0 rgba(16,185,129,0)}}
+  .reduce-motion *,.reduce-motion *::before,.reduce-motion *::after{animation:none!important;transition:none!important}
+  footer.note{color:var(--text-3);font-size:12.5px;margin-top:26px}
+  kbd{background:#0a0e15;border:1px solid var(--border-strong);border-radius:5px;padding:0 6px;font-size:11.5px;font-family:inherit}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div>
+      <span class="badge">ui-ux-pro-max &middot; interaktif demo &middot; bota dokunmaz</span>
+      <h1>DCABOT Terminal UI/UX Onerileri</h1>
+      <p class="sub">Rapordaki 8 onerinin calisan karsilastirmasi. Hersey bu tek dosyada; bot kaynagina dokunulmaz.</p>
+    </div>
+    <button class="btn sec" id="rmToggle" aria-pressed="false">Hareketi azalt: kapali</button>
+  </header>
+
+  <!-- P1 -->
+  <section class="card" aria-labelledby="t1">
+    <h2 id="t1"><span class="badge">P1 &middot; Navigasyon</span> Mobil alt bar: 7 oge vs 4 + Diger</h2>
+    <p class="desc">7 ogede etiketler kirpiliyor ("Bot Filosu" okunmuyor). 4 birincil + "Diger" paneli hem kurali saglar hem dokunma hedefini buyutur.</p>
+    <div class="cols">
+      <div class="panel"><h3 class="bad">Onceki: 7 oge (kirkilma)</h3>
+        <div class="phone"><div class="scr">Kokpit icerigi...<br><br><span class="ping"></span> BYBIT BAGLI</div>
+          <nav class="mnav" aria-label="Ornek kotu">
+            <button class="on"><span class="dot"></span><span>Kokpit</span></button>
+            <button><span class="dot"></span><span>Bot Filosu</span></button>
+            <button><span class="dot"></span><span>Yeni Bot</span></button>
+            <button><span class="dot"></span><span>Hesaplayici</span></button>
+            <button><span class="dot"></span><span>Backtest Lab</span></button>
+            <button><span class="dot"></span><span>Bilgi</span></button>
+            <button><span class="dot"></span><span>Ayarlar</span></button>
+          </nav></div>
+      </div>
+      <div class="panel"><h3 class="good">Oneri: 4 + Diger (deneyin)</h3>
+        <div class="phone"><div class="scr">Kokpit icerigi...<br><br><span class="ping"></span> BYBIT BAGLI</div>
+          <div class="sheet" id="moreSheet" role="dialog" aria-label="Diger bolumler">
+            <button>Hesaplayici</button><button>Bilgi Merkezi</button><button>Ayarlar</button>
+          </div>
+          <nav class="mnav" aria-label="Ornek iyi">
+            <button class="on"><span class="dot"></span><span>Kokpit</span></button>
+            <button><span class="dot"></span><span>Filo</span></button>
+            <button><span class="dot"></span><span>Yeni Bot</span></button>
+            <button><span class="dot"></span><span>Lab</span></button>
+            <button id="moreBtn" aria-expanded="false" aria-controls="moreSheet"><span class="dot"></span><span>Diger</span></button>
+          </nav></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- P2 -->
+  <section class="card" aria-labelledby="t2">
+    <h2 id="t2"><span class="badge">P2 &middot; Tokenlar</span> 362 ham hex yerine semantik token</h2>
+    <p class="desc">Ayni "kart" bugun 4-5 farkli border hex'i kullaniyor. Token seti: surface / border / text-1-2-3 + success / danger / warn / info.</p>
+    <div class="swatches">
+      <div class="sw"><i style="background:#10141d"></i><b>surface</b><code>--surface</code></div>
+      <div class="sw"><i style="background:#141a26"></i><b>surface-2</b><code>--surface-2</code></div>
+      <div class="sw"><i style="background:#1f2637"></i><b>border</b><code>--border</code></div>
+      <div class="sw"><i style="background:#2a3347"></i><b>border-strong</b><code>--border-strong</code></div>
+      <div class="sw"><i style="background:#f1f5f9"></i><b>text-1</b><code>7:1+ koyu zeminde</code></div>
+      <div class="sw"><i style="background:#94a3b8"></i><b>text-2</b><code>ikincil metin</code></div>
+      <div class="sw"><i style="background:#10b981"></i><b>success</b><code>#10B981</code></div>
+      <div class="sw"><i style="background:#f43f5e"></i><b>danger</b><code>#F43F5E</code></div>
+      <div class="sw"><i style="background:#f59e0b"></i><b>warn</b><code>#F59E0B</code></div>
+      <div class="sw"><i style="background:#06b6d4"></i><b>info</b><code>#06B6D4</code></div>
+    </div>
+  </section>
+
+  <!-- P3 -->
+  <section class="card" aria-labelledby="t3">
+    <h2 id="t3"><span class="badge">P3 &middot; Tipografi</span> Mikro metin + kontrast</h2>
+    <p class="desc">slate-500 (#64748B) kucuk yazida ~3.3:1 ile 4.5 barajinin altinda. Kural: govde en az 12px mobilde, kucuk metin slate-400.</p>
+    <div class="cols">
+      <div class="panel"><h3 class="bad">Onceki</h3>
+        <p class="type-old">Fonlama orani: 0.0100% (8s) <span class="ratio fail">3.3:1</span></p>
+        <p class="type-old2">Makro takvim: guncel, 14 etkinlik <span class="ratio fail">4.1:1</span></p>
+      </div>
+      <div class="panel"><h3 class="good">Oneri</h3>
+        <p class="type-new">Fonlama orani: %0.0100 (8s) <span class="ratio pass">7.0:1</span></p>
+        <p class="type-new">Makro takvim: guncel, 14 etkinlik <span class="ratio pass">7.0:1</span></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- P4 -->
+  <section class="card" aria-labelledby="t4">
+    <h2 id="t4"><span class="badge">P4 &middot; Grafik</span> Klavyeyle gezilebilir equity + veri tablosu</h2>
+    <p class="desc">Grafik odaktayken <kbd>&larr;</kbd> <kbd>&rarr;</kbd> ile nokta gezin (ekran okuyucu degeri okur). "Veri tablosu" siralanabilir alternatiftir.</p>
+    <div class="panel chartbox"><h3 class="good">Oneri (deneyin)</h3>
+      <svg class="eq" id="eq" viewBox="0 0 600 190" tabindex="0" role="img" aria-label="Ozkaynak egrisi. Ok tuslariyla noktalari gezin.">
+        <line x1="40" y1="20" x2="40" y2="165" stroke="#1f2637"/><line x1="40" y1="165" x2="585" y2="165" stroke="#1f2637"/>
+        <polyline id="eql" fill="none" stroke="#10b981" stroke-width="2.5" points=""/>
+        <g id="eqdots"></g>
+      </svg>
+      <p class="sr-only" id="eqsum">Ozet: 12 noktada %6.4 yukselis, en dusuk 100.0 en yuksek 107.3.</p>
+      <div class="readout" role="status" id="eqread">Nokta secilmedi — grafige tiklayin ya da odaklayip ok tuslarini kullanin.</div>
+      <div style="margin-top:10px"><button class="btn sec" id="tblBtn" aria-expanded="false" aria-controls="eqtbl">Veri tablosu</button></div>
+      <div id="eqtbl" hidden>
+        <table class="data"><caption class="sr-only">Ozkaynak degerleri</caption>
+          <thead><tr><th scope="col"><button id="sortBtn">Nokta <span aria-hidden="true">↕</span></button></th><th scope="col">Deger</th><th scope="col">Degisim</th></tr></thead>
+          <tbody id="eqbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- P5 -->
+  <section class="card" aria-labelledby="t5">
+    <h2 id="t5"><span class="badge">P5 &middot; Geri bildirim</span> Backtest: faz cubugu + iptal + skeleton</h2>
+    <p class="desc">Dakikalar suren kosuda kor bekleme yok: fazlar SSE'den ilerler, kullanici iptal edebilir, sonuc alani skeleton ile rezerve edilir.</p>
+    <div class="panel"><h3 class="good">Oneri (deneyin)</h3>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn" id="runBtn">Backtest calistir</button>
+        <button class="btn danger" id="cancelBtn" disabled>Iptal</button>
+      </div>
+      <div class="bar" role="progressbar" aria-label="Backtest ilerlemesi" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="pbar"><i id="pfill"></i></div>
+      <div class="phase" role="status" id="phase">Hazir.</div>
+      <div id="skel" style="display:grid;gap:8px;margin-top:8px" hidden>
+        <div class="skel" style="height:52px"></div><div class="skel" style="height:90px"></div>
+      </div>
+      <div class="readout" id="result" hidden></div>
+    </div>
+  </section>
+
+  <!-- P7 -->
+  <section class="card" aria-labelledby="t7">
+    <h2 id="t7"><span class="badge">P7 &middot; Semantik tablo</span> Siralanabilir filo tablosu</h2>
+    <p class="desc">Div listeler yerine gercek <code>&lt;table&gt;</code>: ekran okuyucu satir/sutun baglamini korur, basliklar <code>aria-sort</code> ile siralar.</p>
+    <div class="panel"><h3 class="good">Oneri (basliklara tiklayin)</h3>
+      <table class="data" id="fleet"><caption class="sr-only">Bot filosu</caption>
+        <thead><tr>
+          <th scope="col" aria-sort="none"><button data-k="n">Bot <span aria-hidden="true">↕</span></button></th>
+          <th scope="col" aria-sort="none"><button data-k="p">PnL % <span aria-hidden="true">↕</span></button></th>
+          <th scope="col" aria-sort="none"><button data-k="s">Durum <span aria-hidden="true">↕</span></button></th>
+        </tr></thead>
+        <tbody id="fleetBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- P8 -->
+  <section class="card" aria-labelledby="t8">
+    <h2 id="t8"><span class="badge">P8 &middot; Form</span> Secret'te goster/gizle + kopyalama onayi</h2>
+    <p class="desc">Yanlis anahtar/laboratuvar hatalarinin buyuk kismi gorunmez yazimdan gelir. Toggle + kopyalama onayi bunu kapatir.</p>
+    <div class="panel"><h3 class="good">Oneri (deneyin)</h3>
+      <label for="sec" style="font-size:13px;font-weight:600">API Secret</label>
+      <div class="fld">
+        <input id="sec" type="password" value="tvw_9f2K-41xq-ZD7m" autocomplete="off" aria-describedby="secm">
+        <button class="btn sec" id="eye" aria-pressed="false" aria-label="Secret'i goster">Goster</button>
+        <button class="btn sec" id="cpy">Kopyala</button>
+      </div>
+      <div class="okmsg" role="status" id="secm"></div>
+    </div>
+  </section>
+
+  <footer class="note">P6 (reduced-motion) sayfanin sag ustundeki dugmeyle tum demoda denenebilir — ping ve skeleton durur. Tum ornekler statik; gercek veriye bagli degil.</footer>
+</div>
+<script>
+(function(){
+  "use strict";
+  /* P1 sheet */
+  var more=document.getElementById("moreBtn"),sheet=document.getElementById("moreSheet");
+  more.addEventListener("click",function(){
+    var open=sheet.classList.toggle("open");
+    more.setAttribute("aria-expanded",open?"true":"false");
+  });
+  /* P6 reduced motion */
+  var rm=document.getElementById("rmToggle");
+  rm.addEventListener("click",function(){
+    var on=document.body.classList.toggle("reduce-motion");
+    rm.setAttribute("aria-pressed",on?"true":"false");
+    rm.textContent="Hareketi azalt: "+(on?"acik":"kapali");
+  });
+  /* P4 chart */
+  var pts=[100,101.2,100.6,102.4,103.1,102.2,104.0,105.5,104.6,106.1,107.3,106.8];
+  var W=600,H=190,padL=40,padB=25,min=99,max=108;
+  function X(i){return padL+(585-padL)*i/(pts.length-1);}
+  function Y(v){return (H-padB)-((v-min)/(max-min))*((H-padB)-20);}
+  var pl=document.getElementById("eql"),g=document.getElementById("eqdots"),read=document.getElementById("eqread"),svg=document.getElementById("eq"),cur=-1;
+  pl.setAttribute("points",pts.map(function(v,i){return X(i).toFixed(1)+","+Y(v).toFixed(1);}).join(" "));
+  pts.forEach(function(v,i){
+    var c=document.createElementNS("http://www.w3.org/2000/svg","circle");
+    c.setAttribute("cx",X(i));c.setAttribute("cy",Y(v));c.setAttribute("r","5");
+    c.setAttribute("fill","#0d1119");c.setAttribute("stroke","#10b981");c.setAttribute("stroke-width","2");
+    c.style.cursor="pointer";
+    c.addEventListener("click",function(){sel(i);});
+    c.addEventListener("mouseenter",function(){sel(i,true);});
+    g.appendChild(c);
+  });
+  function sel(i,quiet){
+    cur=i;var v=pts[i],d=(v-pts[0]).toFixed(1);
+    Array.prototype.forEach.call(g.childNodes,function(c,j){
+      c.setAttribute("r",j===i?"7":"5");c.setAttribute("fill",j===i?"#10b981":"#0d1119");
+    });
+    read.textContent="Nokta "+(i+1)+"/"+pts.length+": "+v.toFixed(1)+" (baslangictan "+(d>=0?"+":"")+d+")";
+    if(!quiet)svg.focus({preventScroll:true});
+  }
+  svg.addEventListener("keydown",function(e){
+    if(e.key==="ArrowRight"){sel(Math.min(pts.length-1,cur+1));e.preventDefault();}
+    else if(e.key==="ArrowLeft"){sel(Math.max(0,cur-1));e.preventDefault();}
+    else if(e.key==="Home"){sel(0);e.preventDefault();}
+    else if(e.key==="End"){sel(pts.length-1);e.preventDefault();}
+  });
+  /* P4 table */
+  var tb=document.getElementById("tblBtn"),tw=document.getElementById("eqtbl"),bd=document.getElementById("eqbody"),ascT=true;
+  function fillEq(){
+    bd.innerHTML="";
+    var idx=pts.map(function(_,i){return i;});
+    if(!ascT)idx.reverse();
+    idx.forEach(function(i){
+      var tr=document.createElement("tr");
+      var d=(pts[i]-pts[0]).toFixed(1);
+      tr.innerHTML="<td>N"+(i+1)+"</td><td>"+pts[i].toFixed(1)+"</td><td>"+(d>=0?"+":"")+d+"</td>";
+      bd.appendChild(tr);
+    });
+  }
+  tb.addEventListener("click",function(){
+    var open=tw.hidden;tw.hidden=!open;
+    tb.setAttribute("aria-expanded",open?"true":"false");
+    if(open)fillEq();
+  });
+  document.getElementById("sortBtn").addEventListener("click",function(){ascT=!ascT;fillEq();});
+  /* P5 run */
+  var phases=["Kline cekiliyor (BYBIT 1h, 500 bar)...","Motor kosuyor (SAF-G2 + kapilar)...","Skorlar hesaplaniyor (DSR/PBO/WFE)..."];
+  var run=document.getElementById("runBtn"),cx=document.getElementById("cancelBtn"),
+      fill=document.getElementById("pfill"),bar=document.getElementById("pbar"),
+      ph=document.getElementById("phase"),sk=document.getElementById("skel"),res=document.getElementById("result"),
+      timer=null,pct=0,phi=0;
+  function setP(p){pct=p;fill.style.width=p+"%";bar.setAttribute("aria-valuenow",String(Math.round(p)));}
+  run.addEventListener("click",function(){
+    run.disabled=true;cx.disabled=false;res.hidden=true;sk.hidden=false;pct=0;phi=0;setP(2);ph.textContent=phases[0];
+    timer=setInterval(function(){
+      pct+=4+Math.random()*5;
+      if(pct>=100){done(false);return;}
+      var ni=Math.min(2,Math.floor(pct/34));
+      if(ni!==phi){phi=ni;ph.textContent=phases[ni];}
+      setP(pct);
+    },220);
+  });
+  function done(cancelled){
+    clearInterval(timer);timer=null;run.disabled=false;cx.disabled=true;sk.hidden=true;
+    if(cancelled){setP(0);ph.textContent="Iptal edildi — yari kosu diske yazilmadi.";return;}
+    setP(100);ph.textContent="Tamamlandi (2.4s).";
+    res.hidden=false;
+    res.textContent="Ornek sonuc: Sharpe 1.8 · maks. dusus %4.2 · fill 34 · gecerlilik: GECTI";
+  }
+  cx.addEventListener("click",function(){done(true);});
+  /* P7 fleet sort */
+  var fleet=[{n:"e2e-dca-eth",p:2.4,s:"RUNNING"},{n:"grid-btc-01",p:-1.1,s:"PAUSED"},{n:"hedge-sol",p:0.8,s:"RUNNING"}];
+  var fb=document.getElementById("fleetBody"),dir={n:1,p:1,s:1};
+  function fillFleet(){
+    fb.innerHTML="";
+    fleet.forEach(function(b){
+      var tr=document.createElement("tr");
+      var col=b.p>=0?"#6ee7b7":"#fda4af";
+      tr.innerHTML="<td>"+b.n+"</td><td style='color:"+col+"'>"+(b.p>=0?"+":"")+b.p.toFixed(1)+"</td><td>"+b.s+"</td>";
+      fb.appendChild(tr);
+    });
+  }
+  document.querySelectorAll("#fleet th button").forEach(function(btn){
+    btn.addEventListener("click",function(){
+      var k=btn.getAttribute("data-k");dir[k]*=-1;
+      fleet.sort(function(a,b){return (a[k]>b[k]?1:a[k]<b[k]?-1:0)*dir[k];});
+      document.querySelectorAll("#fleet th").forEach(function(th){th.setAttribute("aria-sort","none");});
+      btn.parentElement.setAttribute("aria-sort",dir[k]===1?"ascending":"descending");
+      fillFleet();
+    });
+  });
+  fillFleet();
+  /* P8 secret */
+  var sec=document.getElementById("sec"),eye=document.getElementById("eye"),msg=document.getElementById("secm");
+  eye.addEventListener("click",function(){
+    var show=sec.type==="password";
+    sec.type=show?"text":"password";
+    eye.setAttribute("aria-pressed",show?"true":"false");
+    eye.setAttribute("aria-label",show?"Secret'i gizle":"Secret'i goster");
+    eye.textContent=show?"Gizle":"Goster";
+  });
+  document.getElementById("cpy").addEventListener("click",function(){
+    sec.select();
+    try{document.execCommand("copy");}catch(e){}
+    msg.textContent="Kopyalandi — kimseyle paylasmayin.";
+  });
+})();
+</script>
+</body>
+</html>

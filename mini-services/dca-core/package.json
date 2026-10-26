@@ -1,0 +1,10 @@
+{
+  "name": "dca-core",
+  "version": "3.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "bash run.sh",
+    "build": "bash build.sh",
+    "test": "bash test.sh"
+  }
+}

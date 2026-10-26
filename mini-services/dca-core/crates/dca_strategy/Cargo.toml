@@ -1,0 +1,16 @@
+[package]
+name = "dca_strategy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dca_math = { path = "../dca_math" }
+dca_kernel = { path = "../dca_kernel" }
+dca_risk = { path = "../dca_risk" }
+dca_signals = { path = "../dca_signals" }
+dca_pine = { path = "../dca_pine" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }

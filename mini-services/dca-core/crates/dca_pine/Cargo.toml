@@ -1,0 +1,12 @@
+[package]
+name = "dca_pine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dca_math = { path = "../dca_math" }
+dca_kernel = { path = "../dca_kernel" }
+num-bigint = { workspace = true }
+num-traits = { workspace = true }
+serde = { workspace = true }
