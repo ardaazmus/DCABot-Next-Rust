@@ -539,9 +539,9 @@ async fn restore_bots(app: &Arc<AppState>) {
         let mut credentials: Option<VenueCreds> = None;
         if effective_mode == "LIVE" {
             // Faz 4 (C-5): HEDGE LIVE kilitli — restore'da dürüst düşürme.
-            if matches!(cfg.kind, StrategyKind::HedgeProtective | StrategyKind::HedgeDual) {
-                effective_mode = "PAPER".into();
-                state::persist_event(app, &id, "WARN", "RESTORE", "HEDGE LIVE kanalı kilitli (bacak muhasebesi tamamlanmadı) — bot PAPER modunda restore edildi").await;
+            if false {
+                // Faz 13B: HEDGE LIVE kilidi kaldırıldı (bacak-başına stepper) —
+                // dal yapısı korundu; ileride tekrar kilit gerekirse buraya.
             } else if venue.to_uppercase() != "BYBIT" && venue.to_uppercase() != "OKX" {
                 effective_mode = "PAPER".into();
                 state::persist_event(app, &id, "WARN", "RESTORE", &format!("{venue} LIVE kanalı desteklenmiyor — bot PAPER modunda restore edildi")).await;
@@ -1183,11 +1183,9 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
     // a LIVE bot requires an active vault key for the venue.
     let mut credentials: Option<VenueCreds> = None;
     if mode == "LIVE" {
-        // Faz 4 (C-5): HEDGE stratejileri LIVE'a kilitli — bacak-bazlı muhasebe
-        // ve venue positionIdx eşlemesi tamamlanana kadar (Faz 4.5) dürüst ret.
-        if matches!(kind, StrategyKind::HedgeProtective | StrategyKind::HedgeDual) {
-            return Err(err422("HEDGE stratejileri LIVE kanalında kilitli — bacak-bazlı pozisyon muhasebesi ve positionIdx eşlemesi tamamlanana kadar PAPER kullanın (C-5)"));
-        }
+        // Faz 13B: HEDGE LIVE kilidi KALDIRILDI — bacak-başına stepper (EX-06
+        // çözümü) + positionIdx eşlemesi (Faz 4.5/5) tam; Demo kabulü sonrası canlı.
+        // Hesap hedge-moddaysa POS_MODE denetimi emirleri positionIdx ile eşler.
         let venue_uc = req.venue.to_uppercase();
         if venue_uc != "BYBIT" && venue_uc != "OKX" {
             return Err(err422("Bu venue'de LIVE kanal kapalı (Binance fill-reconciliation ile doğrulanmadı) — PAPER modunu kullan"));

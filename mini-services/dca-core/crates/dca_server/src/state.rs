@@ -61,6 +61,10 @@ pub struct BotRuntime {
     /// Faz 13A-POLL: dispatch LIVE dalları ağ yapmaz — intent burada birikir,
     /// poll_inner'ın kilit-dışı cascade fazı çalıştırıp uygular.
     pub pending_live_intents: Vec<LiveIntent>,
+    /// Faz 13B: hedge bacağı için AYRI kernel stepper (direction=-1) —
+    /// EX-06'nın kalıcı çözümü: iki bacak artık tek kernel pozisyonunda
+    /// birleşmez; her bacak kendi cash/IM/fee/pozisyon defterini tutar.
+    pub hedge_stepper: Option<SimulationStepper>,
     /// Faz 5 (C-5/EX-07): hesap hedge modundaysa DCA emirleri positionIdx
     /// eşlemesiyle çalışır (Buy→1 long bacası, Sell→2 short bacası) — mod
     /// uyuşmazlığı artık engel değil, eşlemedir.
@@ -185,6 +189,20 @@ impl BotRuntime {
     pub fn snapshot_json(&self) -> serde_json::Value {
         let snap = self.engine_kind.snapshot();
         let warnings = dca_strategy::compute_warnings(&self.cfg, &self.stepper.instrument);
+        // Faz 13B: equity'ler makro öncesi hesaplanır (json! blok kısıtı).
+        let mark_now = self.stepper.last_close.as_deref().and_then(|x| dca_math::fraction::Fraction::from_any_str(x).ok());
+        let mut eq_comb = mark_now.as_ref().and_then(|m| self.stepper.equity(m).ok());
+        let hedge_equity_now = self
+            .hedge_stepper
+            .as_ref()
+            .and_then(|hs| mark_now.as_ref().and_then(|m| hs.equity(m).ok()))
+            .map(|x| x.to_string());
+        if let (Some(hs), Some(m)) = (self.hedge_stepper.as_ref(), mark_now.as_ref()) {
+            if let Ok(he) = hs.equity(m) {
+                eq_comb = Some(eq_comb.and_then(|e| e.add(&he).ok()).unwrap_or(he));
+            }
+        }
+        let equity_now = eq_comb.map(|x| x.to_string());
         json!({
             "id": self.bot_id,
             "name": self.name,
@@ -209,14 +227,10 @@ impl BotRuntime {
             "riskPolicy": serde_json::to_value(&self.cfg.risk_policy).unwrap_or(serde_json::Value::Null),
             "regime": self.last_regime.label(),
             "breakerTripped": self.breaker_tripped,
-            // Faz 13 dilim 2: Özet cache-agregasyonu bu iki alanla çalışır.
-            "equityNow": self
-                .stepper
-                .last_close
-                .as_deref()
-                .and_then(|x| dca_math::fraction::Fraction::from_any_str(x).ok())
-                .and_then(|m| self.stepper.equity(&m).ok())
-                .map(|x| x.to_string()),
+            // Faz 13 dilim 2 + 13B: değerler makro ÖNCESİ hesaplanır (json! blok
+            // ifadeyi nested-JSON sanır). Hedge bot: equity = ana + hedge bacak.
+            "equityNow": equity_now,
+            "hedgeEquityNow": hedge_equity_now,
             "unrealizedNow": self
                 .stepper
                 .last_close
@@ -507,6 +521,20 @@ pub struct RuntimeSnapshot {
     /// eski snapshot'larla uyum için Option+default).
     #[serde(default)]
     pub webhook_secret: Option<String>,
+    /// Faz 13B: hedge bacağı kernel snapshot'ı (EX-06 kalıcı çözüm).
+    #[serde(default)]
+    pub hedge_kernel: Option<HedgeKernelSnap>,
+}
+
+/// Faz 13B: hedge bacağı kernel defteri — ana bacaktan bağımsız restore.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HedgeKernelSnap {
+    pub cash: Fraction,
+    pub im_used: Fraction,
+    pub cumulative_fees: Fraction,
+    pub cumulative_funding: Fraction,
+    pub realized_net: Fraction,
+    pub position: dca_math::m04::PositionState,
 }
 
 /// Faz 3 (C-4): runtime snapshot'i bots.runtime_state'a yazar (UPSERT).
@@ -523,6 +551,14 @@ pub fn save_runtime_state(app: &AppState, bot_id: &str, rt: &BotRuntime) {
         grid_bootstrapped: rt.grid_bootstrapped,
         leverage_synced: rt.leverage_synced,
         webhook_secret: Some(rt.webhook_secret.clone()),
+        hedge_kernel: rt.hedge_stepper.as_ref().map(|hs| HedgeKernelSnap {
+            cash: hs.cash.clone(),
+            im_used: hs.im_used.clone(),
+            cumulative_fees: hs.cumulative_fees.clone(),
+            cumulative_funding: hs.cumulative_funding.clone(),
+            realized_net: hs.realized_net.clone(),
+            position: hs.position.clone(),
+        }),
     };
     let json = match serde_json::to_string(&snap) {
         Ok(j) => j,
@@ -638,8 +674,8 @@ pub async fn create_runtime(
         _ => EngineTag::Dca(dca_strategy::DcaEngine::new(id, cfg.clone(), inst.clone())?),
     };
     let stepper = SimulationStepper::new(
-        inst,
-        start_cash,
+        inst.clone(),
+        start_cash.clone(),
         StepperConfig {
             // Task 16: seans tipi artık kullanıcının risk politikasından gelir
             // (Gate 7/8a gerçek piyasa takvimiyle tetiklenir).
@@ -657,6 +693,27 @@ pub async fn create_runtime(
     if kind.direction() == Some(dca_math::m02::Direction::Short) {
         stepper.set_position_direction(-1);
     }
+    // Faz 13B: hedge bacak stepper'ı — her iki hedge türü için baştan kurulur
+    // (protective spawn sonrası devreye girer; dual ilk barda). Bacak defteri
+    // bağımsızdır: aynı start_cash, yön -1 (sell-to-open).
+    let hedge_stepper = if matches!(kind, StrategyKind::HedgeProtective | StrategyKind::HedgeDual) {
+        let mut hs = SimulationStepper::new(
+            inst.clone(),
+            start_cash.clone(),
+            StepperConfig {
+                session_type: cfg.risk_policy.session_type.into(),
+                capital_shortfall_mode: dca_exchange_gate_mode(),
+                is_spot: !kind.is_futures(),
+                leverage: Fraction::from_decimal_str(&cfg.leverage).unwrap_or_else(|_| Fraction::one()),
+                policy: cfg.risk_policy.clone(),
+                ..Default::default()
+            },
+        );
+        hs.set_position_direction(-1);
+        Some(hs)
+    } else {
+        None
+    };
     let is_grid_kind = matches!(kind, StrategyKind::SpotGrid | StrategyKind::FuturesGrid | StrategyKind::InfinityGrid);
     // TradingView webhook secret — stable per bot session (persisted bots get a
     // fresh secret on restore; the UI surfaces it in bot settings).
@@ -696,6 +753,7 @@ pub async fn create_runtime(
         pos_mode_checked: false,
         pos_mode_blocked: false,
         pending_live_intents: Vec::new(),
+        hedge_stepper,
         pos_mode_hedge: false,
         mmr_brackets: None,
         mmr_brackets_at: 0,
@@ -721,6 +779,15 @@ pub async fn create_runtime(
                     if !sec.trim().is_empty() {
                         rt.webhook_secret = sec;
                     }
+                }
+                // Faz 13B: hedge bacak kernel defteri geri yüklenir.
+                if let (Some(hk), Some(hs)) = (snap.hedge_kernel, rt.hedge_stepper.as_mut()) {
+                    hs.cash = hk.cash;
+                    hs.im_used = hk.im_used;
+                    hs.cumulative_fees = hk.cumulative_fees;
+                    hs.cumulative_funding = hk.cumulative_funding;
+                    hs.realized_net = hk.realized_net;
+                    hs.position = hk.position;
                 }
             }
             Err(e) => {

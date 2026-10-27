@@ -36,48 +36,31 @@ pub async fn process_bar(
     pre: &PreSignals,
 ) -> Result<(), String> {
     let bot_id = rt.bot_id.clone();
-    // 1) kernel step: fill resting orders through gates
+    // 1) kernel step: fill resting orders through gates (ana bacak)
     let fills = rt.stepper.step(bar, bar.t, false).map_err(|e| e.to_string())?;
-    // 1.5) Task 16 — advisory drain: kernel'de kullanıcı izniyle aşılan korumalar
-    // (SESSION_CLOSED, MACRO_BLACKOUT, OPENING_SALVO_BYPASS, GAP_*) RISK olayına
-    // ve olay günlüğüne yazılır.
-    for adv in rt.stepper.drain_new_gate_logs() {
-        if let Some(code) = adv.verdict.strip_prefix("ADVISORY:") {
-            crate::state::persist_event(app, &bot_id, "WARN", &format!("RISK:{code}"), &adv.detail).await;
+    ingest_kernel_fills(app, rt, fills, bar.t, sse).await?;
+    // 1b) Faz 13B: hedge bacak stepper'ı AYRI kernel olarak step edilir —
+    // iki bacak tek kernel pozisyonunda birleşmez (EX-06 kalıcı çözüm).
+    if rt.hedge_stepper.is_some() {
+        let (hfills, hadv) = {
+            let hs = rt.hedge_stepper.as_mut().unwrap();
+            let hfills = hs.step(bar, bar.t, false).map_err(|e| e.to_string())?;
+            let hadv: Vec<String> = hs
+                .drain_new_gate_logs()
+                .iter()
+                .filter_map(|adv| adv.verdict.strip_prefix("ADVISORY:").map(|code| format!("RISK:{code}|{}", adv.detail)))
+                .collect();
+            (hfills, hadv)
+        };
+        ingest_kernel_fills(app, rt, hfills, bar.t, sse).await?;
+        for entry in hadv {
+            let (code, detail) = entry.split_once('|').unwrap_or(("RISK:?", ""));
+            let code = code.trim_start_matches("RISK:");
+            crate::state::persist_event(app, &bot_id, "WARN", &format!("RISK:{code}"), &format!("[hedge] {detail}")).await;
             let _ = sse.send(SseEvent {
                 event: "RISK".into(),
-                data: json!({"botId": bot_id, "code": code, "message": adv.detail, "ts": adv.ts}).to_string(),
+                data: json!({"botId": bot_id, "code": code, "message": detail}).to_string(),
             });
-        }
-    }
-    // 2) forward fills to engine + persist + SSE (BOT-02: idempotency —
-    // zaten kayıtlı fill_key'li fill kernel'e tekrar uygulanmaz).
-    for fill in &fills {
-        if fill_exists(app, &bot_id, &fill.fill_key).await.unwrap_or(false) {
-            continue;
-        }
-        let acts = rt.engine_kind.on_fill(fill);
-        let _inserted = persist_fill(app, &bot_id, fill).await;
-        let _ = sse.send(SseEvent {
-            event: "FILL".into(),
-            data: json!({
-                "botId": bot_id,
-                "fillKey": fill.fill_key,
-                "orderId": fill.order_id,
-                "role": fill.role,
-                "side": format!("{:?}", fill.side),
-                "kind": format!("{:?}", fill.kind),
-                "price": fill.price.to_string(),
-                "qty": fill.qty.to_string(),
-                "fee": fill.fee.to_string(),
-                "feeRole": format!("{}", fill.fee_role),
-                "fillModel": format!("{:?}", fill.realism),
-                "ts": fill.ts,
-            })
-            .to_string(),
-        });
-        for a in acts {
-            dispatch_action(app, rt, a, bar.t, sse).await?;
         }
     }
     // 2.5) Futures margin guard — M07 liquidation boundary (paper/live parity)
@@ -353,6 +336,21 @@ async fn check_funding(
         // Grid engines carry no net-TP ledger (funding already moved the cash).
         dca_strategy::EngineTag::Grid(_) => {}
     }
+    // Faz 13B: hedge bacağı AYRI kernel — kendi pozisyonuyla ayrı settlement.
+    if let Some(hs) = rt.hedge_stepper.as_mut() {
+        if !hs.position.qty.is_zero() {
+            let hnotional = hs.position.qty.mul(&close).unwrap_or_else(|_| Fraction::zero());
+            let hdir = Fraction::from_i64(hs.position.direction as i64);
+            if let Ok(hexp) = rate.mul(&hnotional).and_then(|x| x.mul(&hdir)).and_then(|x| if crossings > 1 { x.mul(&Fraction::from_i64(crossings)) } else { Ok(x) }) {
+                hs.apply_funding_expense(&hexp);
+                if let dca_strategy::EngineTag::Hedge(h) = &mut rt.engine_kind {
+                    if let Some(hleg) = h.hedge.as_mut() {
+                        hleg.apply_funding(&hexp);
+                    }
+                }
+            }
+        }
+    }
     let bot_id = rt.bot_id.clone();
     let _ = sse.send(SseEvent {
         event: "FUNDING".into(),
@@ -387,14 +385,21 @@ async fn check_funding(
 /// ISOLATED semantics: only the committed position margin (im_used) backs the
 /// position — the bot's free reserve (cash) is for safety orders, not collateral.
 pub fn current_liq_price(rt: &BotRuntime) -> Option<Fraction> {
-    if rt.stepper.cfg.is_spot || rt.stepper.position.qty.is_zero() {
+    liq_price_of_stepper(&rt.stepper, rt.mmr_brackets.as_ref())
+}
+
+/// Faz 13B: stepper-bağımsız likidasyon fiyatı — her bacak kendi M07 sınırını
+/// kendi pozisyonuyla hesaplar.
+pub fn liq_price_of_stepper(
+    st: &dca_kernel::SimulationStepper,
+    brackets: Option<&Vec<dca_math::MmrBracket>>,
+) -> Option<Fraction> {
+    if st.cfg.is_spot || st.position.qty.is_zero() {
         return None;
     }
-    let avg = rt.stepper.position.avg_price.as_ref()?;
-    let qty = rt.stepper.position.qty.clone();
-    // Faz 4 (H-5): venue risk-limit kademeleri (TTL'li cache) — sabit 0.005
-    // MMR yalnız kademeler hiç çekilememişse son çare varsaylandır.
-    let brackets = match &rt.mmr_brackets {
+    let avg = st.position.avg_price.as_ref()?;
+    let qty = st.position.qty.clone();
+    let brackets = match brackets {
         Some(b) if !b.is_empty() => b.clone(),
         _ => vec![dca_math::MmrBracket {
             min_notional: Fraction::zero(),
@@ -404,10 +409,10 @@ pub fn current_liq_price(rt: &BotRuntime) -> Option<Fraction> {
         }],
     };
     dca_math::m03_m07::liquidation_price(
-        rt.stepper.position.direction,
+        st.position.direction,
         &qty,
         avg,
-        &rt.stepper.im_used,
+        &st.im_used,
         &brackets,
         &Fraction::zero(),
     )
@@ -433,6 +438,34 @@ async fn check_liquidation(
     // gösterge olarak yaşamaya devam eder (SSE equity kartı).
     if rt.mode == "LIVE" {
         return Ok(());
+    }
+    // Faz 13B: hedge bacağı AYRI kernel — kendi likidasyon sınırıyla izlenir;
+    // tetiklenirse YALNIZ hedge bacağı kapanır (ana bacak etkilenmez).
+    if let Some(hs) = rt.hedge_stepper.as_mut() {
+        if !hs.cfg.is_spot && hs.cfg.leverage > Fraction::one() {
+            if let Some(hliq) = liq_price_of_stepper(hs, rt.mmr_brackets.as_ref()) {
+                let hlow = Fraction::from_decimal_str(&bar.l).map_err(|e| e.to_string())?;
+                let hhigh = Fraction::from_decimal_str(&bar.h).map_err(|e| e.to_string())?;
+                let hopen = Fraction::from_decimal_str(&bar.o).map_err(|e| e.to_string())?;
+                let hdir = hs.position.direction;
+                let hcrossed = if hdir == 1 { hlow <= hliq } else { hhigh >= hliq };
+                if hcrossed {
+                    let hliq_px = if hdir == 1 { Fraction::min(&hopen, &hliq) } else { Fraction::max(&hopen, &hliq) };
+                    hs.cancel_pending();
+                    if let Some(hfill) = hs.force_close(&hliq_px, bar.t, "LIQ").map_err(|e| e.to_string())? {
+                        let _ = persist_fill(app, &rt.bot_id, &hfill).await;
+                        let _ = sse.send(SseEvent {
+                            event: "LIQUIDATION".into(),
+                            data: json!({"botId": rt.bot_id, "leg": "hedge", "liqPrice": hliq_px.to_string(), "qty": hfill.qty.to_string(), "ts": bar.t}).to_string(),
+                        });
+                        crate::state::persist_event(app, &rt.bot_id, "CRITICAL", "LIQUIDATION", "hedge bacağı likide oldu (yerel simülasyon)").await;
+                        if let dca_strategy::EngineTag::Hedge(h) = &mut rt.engine_kind {
+                            h.hedge.as_mut().map(|l| l.force_liquidate());
+                        }
+                    }
+                }
+            }
+        }
     }
     if rt.stepper.cfg.leverage <= Fraction::one() {
         return Ok(());
@@ -495,11 +528,9 @@ async fn check_liquidation(
             e.force_liquidate();
         }
         if let dca_strategy::EngineTag::Hedge(h) = &mut rt.engine_kind {
-            // Both legs reference the shared forced-closed position.
+            // Faz 13B: ANA bacak likide oldu — yalnız ana bacak force_liquidate;
+            // hedge bacağı kendi stepper'ıyla izlenmeye devam eder.
             h.main.force_liquidate();
-            if let Some(hg) = &mut h.hedge {
-                hg.force_liquidate();
-            }
         }
         for a in acts {
             dispatch_action(app, rt, a, bar.t, sse).await?;
@@ -672,18 +703,28 @@ async fn apply_intent_outcomes(
                 if fill_exists(app, &rt.bot_id, &fk).await.unwrap_or(false) {
                     continue;
                 }
-                if let Ok(Some(f)) = rt.stepper.ingest_external_fill_with_fee(
-                    &id,
-                    &role,
-                    side,
-                    kind,
-                    &qty_filled,
-                    &price,
-                    dca_kernel::FeeRole::Taker,
-                    FillRealism::MarketableTaker,
-                    ts2,
-                    fee.as_ref(),
-                ) {
+                // Faz 13B: dolum, order-id prefix'ine göre DOĞRU bacak kernel'ine.
+                let hedge_prefix_mf = format!("{}-hedge", rt.bot_id);
+                let mf_target = if id.starts_with(&hedge_prefix_mf) {
+                    rt.hedge_stepper.as_mut()
+                } else {
+                    Some(&mut rt.stepper)
+                };
+                if let Ok(Some(f)) = mf_target
+                    .ok_or("hedge stepper yok")?
+                    .ingest_external_fill_with_fee(
+                        &id,
+                        &role,
+                        side,
+                        kind,
+                        &qty_filled,
+                        &price,
+                        dca_kernel::FeeRole::Taker,
+                        FillRealism::MarketableTaker,
+                        ts2,
+                        fee.as_ref(),
+                    )
+                {
                     let _ = persist_fill(app, &rt.bot_id, &f).await;
                     let acts = rt.engine_kind.on_fill(&f);
                     let _ = sse.send(SseEvent {
@@ -859,6 +900,48 @@ pub fn rollback_pending_phase_after_gate_reject(app: &AppState, rt: &mut BotRunt
 /// aynı venue'daki diğer LIVE botların açık-emir yükü) kontrol edilir. Başarısız
 /// durumda emir GÖNDERİLMEZ; WARN ile görünür kalır ve motor akışı sürer
 /// (fail-closed + fail-safe). Ölçüm: wallet.available (venue gerçekliği).
+/// Faz 13B: kernel fill'leri (ana veya hedge stepper'dan) engine'e iletir —
+/// idempotency + persist + SSE + cascade. Engine, order-id prefix'ine göre
+/// bacak mirror'ına zaten yönlendirir (hedge.rs on_fill_leg).
+async fn ingest_kernel_fills(
+    app: &AppState,
+    rt: &mut BotRuntime,
+    fills: Vec<FillRecord>,
+    bar_t: i64,
+    sse: &broadcast::Sender<SseEvent>,
+) -> Result<(), String> {
+    let bot_id = rt.bot_id.clone();
+    for fill in &fills {
+        if fill_exists(app, &bot_id, &fill.fill_key).await.unwrap_or(false) {
+            continue;
+        }
+        let acts = rt.engine_kind.on_fill(fill);
+        let _inserted = persist_fill(app, &bot_id, fill).await;
+        let _ = sse.send(SseEvent {
+            event: "FILL".into(),
+            data: json!({
+                "botId": bot_id,
+                "fillKey": fill.fill_key,
+                "orderId": fill.order_id,
+                "role": fill.role,
+                "side": format!("{:?}", fill.side),
+                "kind": format!("{:?}", fill.kind),
+                "price": fill.price.to_string(),
+                "qty": fill.qty.to_string(),
+                "fee": fill.fee.to_string(),
+                "feeRole": format!("{}", fill.fee_role),
+                "fillModel": format!("{:?}", fill.realism),
+                "ts": fill.ts,
+            })
+            .to_string(),
+        });
+        for a in acts {
+            dispatch_action(app, rt, a, bar_t, sse).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn pre_order_gate_ctx(
     app: &AppState,
     gate: &crate::state::GateCtx,
@@ -918,20 +1001,30 @@ pub async fn dispatch_action(
             let is_close = role == "GRID_CLOSE";
             match rt.mode.as_str() {
                 "PAPER" => {
-                    rt.stepper.submit_intent(
-                        OrderIntent {
-                            id: id.clone(),
-                            side,
-                            kind: if is_close { OrderKind::Reduce } else { OrderKind::Add },
-                            price: Some(price),
-                            qty,
-                            decision_ts: ts,
-                            role: role.to_string(),
-                            placement_ref_price: rt.stepper.last_close.clone().and_then(|s| Fraction::from_any_str(&s).ok()),
-                        },
-                        ts,
-                    )
-                    .map_err(|e| e.to_string())?;
+                    // Faz 13B: hedge-prefix'li emirler hedge bacak stepper'ına.
+                    let is_hedge = id.starts_with(&format!("{}-hedge", rt.bot_id));
+                    let ref_price = rt.stepper.last_close.clone().and_then(|s| Fraction::from_any_str(&s).ok());
+                    let target = if is_hedge {
+                        rt.hedge_stepper.as_mut()
+                    } else {
+                        Some(&mut rt.stepper)
+                    };
+                    target
+                        .ok_or_else(|| "hedge stepper yok".to_string())?
+                        .submit_intent(
+                            OrderIntent {
+                                id: id.clone(),
+                                side,
+                                kind: if is_close { OrderKind::Reduce } else { OrderKind::Add },
+                                price: Some(price),
+                                qty,
+                                decision_ts: ts,
+                                role: role.to_string(),
+                                placement_ref_price: ref_price,
+                            },
+                            ts,
+                        )
+                        .map_err(|e| e.to_string())?;
                 }
                 _ => {
                     // Faz 13A-POLL: LIVE ağ çağrısı yok — intent kuyruğa alınır;
@@ -977,7 +1070,15 @@ pub async fn dispatch_action(
             let kind = if matches!(role, "TP" | "SL" | "MANUAL" | "TRAIL") { OrderKind::Reduce } else { OrderKind::Add };
             match rt.mode.as_str() {
                 "PAPER" => {
-                    rt.stepper
+                    // Faz 13B: hedge-prefix'li emirler hedge bacak stepper'ına.
+                    let is_hedge = id.starts_with(&format!("{}-hedge", rt.bot_id));
+                    let target = if is_hedge {
+                        rt.hedge_stepper.as_mut()
+                    } else {
+                        Some(&mut rt.stepper)
+                    };
+                    target
+                        .ok_or_else(|| "hedge stepper yok".to_string())?
                         .submit_intent(
                             OrderIntent {
                                 id: id.clone(),
@@ -1036,11 +1137,23 @@ pub async fn dispatch_action(
             }
         }
         Action::CancelResting { id } => {
+            // Faz 13B: hedge bacak pending'i de temizlenir.
+            let is_hedge = id.starts_with(&format!("{}-hedge", rt.bot_id));
             if id.ends_with('*') {
                 let prefix = id.trim_end_matches('*');
-                rt.stepper.pending.retain(|o| !o.id.starts_with(prefix));
+                if !is_hedge {
+                    rt.stepper.pending.retain(|o| !o.id.starts_with(prefix));
+                }
+                if let Some(hs) = rt.hedge_stepper.as_mut() {
+                    hs.pending.retain(|o| !o.id.starts_with(prefix));
+                }
             } else {
-                rt.stepper.pending.retain(|o| o.id != id);
+                if !is_hedge {
+                    rt.stepper.pending.retain(|o| o.id != id);
+                }
+                if let Some(hs) = rt.hedge_stepper.as_mut() {
+                    hs.pending.retain(|o| o.id != id);
+                }
             }
             // Faz 13A-POLL: LIVE cancel — ağ (wildcard çözümü + cancel) kilit
             // dışı cascade'de; yerel pending listesi yukarıda senkron temizlendi.
@@ -1632,6 +1745,14 @@ async fn close_position_as_venue_liquidated(
         crate::state::persist_event(app, &bot_id, "CRITICAL", "LIQUIDATION", "venue pozisyonu yok oldu ama kapanış fiyatı referansı yok — manuel uzlaştırma gerekli").await;
         return Ok(());
     }
+    // Faz 13B: venue flat — hedge bacağın kernel defteri de kapatılır.
+    if let Some(hs) = rt.hedge_stepper.as_mut() {
+        if !hs.position.qty.is_zero() {
+            if let Ok(Some(hfill)) = hs.force_close(px, ts, "LIQ") {
+                let _ = persist_fill(app, &bot_id, &hfill).await;
+            }
+        }
+    }
     if let Some(fill) = rt.stepper.force_close(px, ts, "LIQ").map_err(|e| e.to_string())? {
         let acts = rt.engine_kind.on_fill(&fill);
         persist_fill(app, &bot_id, &fill).await?;
@@ -1718,8 +1839,15 @@ async fn live_fill_sweep(
             let fee_role = if ex.is_maker { dca_kernel::FeeRole::Maker } else { dca_kernel::FeeRole::Taker };
             let realism = if ex.is_maker { FillRealism::RestingTouch } else { FillRealism::MarketableTaker };
             let ts = if ex.exec_time > 0 { ex.exec_time } else { crate::state::now_ms() };
-            match rt
-                .stepper
+            // Faz 13B: dolum, order-id prefix'ine göre DOĞRU bacak kernel'ine.
+            let hedge_prefix = format!("{}-hedge", rt.bot_id);
+            let ingest_target = if order.id.starts_with(&hedge_prefix) {
+                rt.hedge_stepper.as_mut()
+            } else {
+                Some(&mut rt.stepper)
+            };
+            match ingest_target
+                .ok_or("hedge stepper yok")?
                 .ingest_external_fill_with_fee(&order.id, &order.role, order.side, order.kind.clone(), &ex.exec_qty, &ex.exec_price, fee_role, realism, ts, ex.exec_fee.as_ref())
             {
                 Ok(Some(f)) => {
@@ -1764,7 +1892,16 @@ async fn live_fill_sweep(
                             let ts = crate::state::now_ms();
                             let px = st.price.clone().unwrap_or_else(|| order.price.clone());
                             let fee_role = if st.status == "Filled" { dca_kernel::FeeRole::Taker } else { dca_kernel::FeeRole::Maker };
-                            if let Ok(Some(f)) = rt.stepper.ingest_external_fill_with_fee(&order.id, &order.role, order.side, order.kind.clone(), &st.cum_exec_qty, &px, fee_role, FillRealism::MarketableTaker, ts, st.cum_exec_fee.as_ref()) {
+                            let hedge_prefix_fb = format!("{}-hedge", rt.bot_id);
+                            let fb_target = if order.id.starts_with(&hedge_prefix_fb) {
+                                rt.hedge_stepper.as_mut()
+                            } else {
+                                Some(&mut rt.stepper)
+                            };
+                            if let Ok(Some(f)) = fb_target
+                                .ok_or("hedge stepper yok")?
+                                .ingest_external_fill_with_fee(&order.id, &order.role, order.side, order.kind.clone(), &st.cum_exec_qty, &px, fee_role, FillRealism::MarketableTaker, ts, st.cum_exec_fee.as_ref())
+                            {
                                 let acts = rt.engine_kind.on_fill(&f);
                                 persist_fill(app, &rt.bot_id, &f).await?;
                                 let _ = sse.send(SseEvent {

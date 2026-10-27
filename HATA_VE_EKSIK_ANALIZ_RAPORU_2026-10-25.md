@@ -20,6 +20,8 @@ Proje matematik çekirdeği (M01–M21), fail-closed kapı mimarisi ve muhasebe 
 
 Canlı testte ayrıca iki API sağlamlık açığı gözlemlendi: geçersiz `"FOO"` status'ü `200 {"ok":true}` ile kabul ediliyor (H-10 canlı kanıt) ve `start_cash="-500"` ile bot `201 RUNNING` kuruluyor (M-5 canlı kanıt).
 
+**27 Ekim (Faz 13B) — UYGULANDI (§4.8):** HedgeEngine bacak-başına stepper: iki bacak artık ayrı kernel defterinde (EX-06 kalıcı çözüm); per-bacak likidasyon/funding; hedge kernel snapshot; **LIVE hedge kilidi kaldırıldı**. Canlı kanıt: HEDGE_DUAL PAPER — iki bacak iki fill, kernel net delta 0. **Tüm Faz 13 tamamlandı** — 23 Ekim denetim raporundaki tüm kritik/yüksek bulgular kapalı ya da kilitle sınırlı olmaktan çıktı. Kalan: testnet rampası (operasyonel) + arşiv temizliği.
+
 **27 Ekim (Faz 13A-POLL) — UYGULANDI (§4.7):** Dispatch LIVE dalları intent'e döndü; place/gate/market-sorgu/cancel ağları poll kilidi DIŞINDA cascade fazında koşuyor (≤8 tur, cascade apply yeni intent üretir). Canlı kanıt: Demo LIVE BASE emri intent yolundan verildi ve doldu (Open, 0.002 BTC, gerçek fee). Kalan tek refactor: 13B hedge bacak-stepper (ayrı oturum, plan §4.6).
 
 **27 Ekim (Faz 13A dilim 3 + TAM PLAN §4.6):** ADD_FUNDS LIVE kilit-dışı ağa geçti (IEA, handler ölçeği; PAPER kabul canlı: kesir-defter +100 tam). Kalan iki kalemin icra-ready tasarımı rapora yazıldı: 13A-POLL (dispatch IEA worklist, 8-tur cascade sınırı) ve 13B (hedge bacak-stepper, 7 adımlı kabul planı) — taze oturumda bu tasarımlardan mekanik uygulanır.
@@ -609,6 +611,25 @@ Rapor §4.6'daki icra-detayından mekanik uygulama:
 - 271 test / 0 hata; süreç notu: 5 mekanik derleme hatası canlı yakalanıp düzeltildi (OrderKind move, Option-price, String move, çift-imza, brace telafisi) — git güvenlik ağıyla sıfır risk.
 
 **Kalan (13B):** HedgeEngine bacak-başına stepper (§4.6'daki 7 adımlı plan) — LIVE hedge kilidini açar; ayrı oturum işi.
+
+---
+
+
+## 4.8 Faz 13B — HedgeEngine bacak-başına stepper UYGULANDI (27 Ekim: EX-06 kalıcı çözüm, LIVE hedge kilidi açıldı)
+
+§4.6'daki 7 adımlı plan uygulandı:
+
+1. **`BotRuntime.hedge_stepper: Option<SimulationStepper>`** — her iki hedge türü için baştan kurulur (yön -1, aynı start_cash/instrument/risk policy); protective spawn sonrası devreye girer, dual ilk barda.
+2. **Routing (order-id prefix):** `{bot}-hedge` → hedge kernel; `{bot}-main` → ana kernel. PAPER dispatch (limit+market), process_bar dual-step (fill ingest `ingest_kernel_fills` helper'ıyla iki kernel için), LIVE sweep (executions + fallback top-fill), 13A apply (MarketFilled) — **tümü prefix'e göre yönlendiriyor**.
+3. **Emirler:** hedge bacak emirleri mevcut positionIdx eşlemesiyle (Sell→2, Buy→1 hedge-modda) venue'a gider — kod değişikliği gerekmedi (Faz 4.5/5 eşlemesi taraf-bazlıydı).
+4. **Likidasyon per-bacak:** `liq_price_of_stepper` helper'ı — hedge bacağı kendi M07 sınırıyla izlenir; tetiklenirse YALNIZ hedge bacağı force-close + `h.hedge.force_liquidate` (ana bacak etkilenmez). Ana bacak likidasyonu artık yalnız ana bacağı kapatır (eski "iki bacağı birden" davranışı kaldırıldı). Venue-flat öğrenimi: her iki kernel defteri de kapatılır.
+5. **Funding per-bacak:** hedge stepper kendi notional'iyla ayrı settlement + `h.hedge.apply_funding`.
+6. **Snapshot:** `RuntimeSnapshot.hedge_kernel: Option<HedgeKernelSnap>` (cash/IM/fees/funding/realized/PositionState — PositionState serde'li) — restore iki bacağı bağımsız geri yükler. `snapshot_json`: `equityNow` **combined** (ana+hedge), `hedgeEquityNow` bacak-bazlı.
+7. **LIVE hedge kilidi KALDIRILDI:** create_bot 422'si ve restore PAPER-düşürmesi kaldırıldı (hesap hedge-moddaysa POS_MODE denetimi emirleri positionIdx ile eşlemeye devam eder).
+
+**Canlı kanıt (HEDGE_DUAL PAPER, rho=1, 2000 USDT/bacak):** ilk bar → **iki fill**: `…-hedge-BASE-1` (Sell 1/1000) + `…-main-BASE-1` (Buy 1/1000) → **kernel net delta: 0**; `hedge_kernel` snapshot: qty 1/1000, yön -1, IM rezerve, fees birikmiş; `equityNow` 4000 = iki bacak toplamı (ayrı defterlerin toplamı). 271 test / 0 hata. Süreç notu: json! makro blok-ifade kısıtı ve 4 borrow-check hatası canlı yakalanıp düzeltildi (git ağı ile).
+
+**Not:** Demo hesapta HEDGE LIVE kabul turu (testnet rampası kapsamında) önerilir; PAPER dual kanıtı + positionIdx eşlemesi + tüm güvenlik kapıları mevcut.
 
 ---
 
