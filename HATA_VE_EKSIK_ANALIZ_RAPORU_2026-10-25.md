@@ -1040,3 +1040,9 @@ Sektörel karşılık: Freqtrade'in "son işlenen mumdan devam" ilkesinin minima
 | Muhasebe çekirdeği | M-1 (sözleşme netliği) | — (BOT-01/02 düzeltilmiş; canlı fill doğru etiketlendi) |
 
 **Canlı test hüküm özeti (§3.5):** cargo test + tsc + eslint PASS; PAPER yaşam döngüsü, kill/freeze, hesaplayıcı, backtest, piyasa uçları, selfcheck/parity dürüst sınıflandırmaları ÇALIŞIYOR; C-1/C-4/H-10/M-5/M-7/M-8/M-10 canlı kanıtlandı; H-2 pratikte büyük ölçüde kapalı; yeni bulgular D-1 (config şeması ergonomisi) ve D-2 (hatalı config kurulumda kabul + ERROR spam).
+
+## 5.1 Faz 15 - 1 Haftalik Test Programi (kurgu + kurulum, 27 Ekim)
+
+Guvenlik testleri simdi kosuldu: SQL injection (name/symbol, parametreli sorgu saglam), yol manipulasyonu (404), anahtarsiz erisim (401). Yeni bulgu M-15 kapatildi: /api/bots 1MB govdeyi kabul ediyordu, DefaultBodyLimit 128KB eklendi. Mantik/yazilimsal: 271 birim test, e2e 107/120 (4.10), hedge net-delta-0, restart recovery - tamamlandi.
+
+Uzun-surec SIMDI BASLADI: temiz DB uzerine 12-botluk tum-ozellik matrisi kuruldu - DCA_LONG/SHORT, FUTURES_DCA, HEDGE_DUAL/PROTECTIVE, SPOT/FUTURES/INFINITY GRID, Pine MACD, RSI tetikleyici, TV webhook, zamanlanmis giris; interval 1m-1h. 7 gun boyunca surekli kosacak. Gunluk otomatik denetim gorevi (her gun 09:00, 7 kosum): motor health, bot durumu, ERROR/CRITICAL sayilari, DB buyumesi; .local-runtime/audit/ altina rapor yazar. Temiz DB gecisi: eski paper.sqlite3 silindi (talep uzerine), motor taze semayla acti, pine seed yeniden yazildi, UI yeniden basladi. M-15 bu binary'de. 7 gun sonunda: ERROR birikimi, rate-limit davranisi, kernel net-delta tutarliligi (hedge), events buyume egrisi degerlendirilir.
