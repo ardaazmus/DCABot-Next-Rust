@@ -54,3 +54,7 @@ server.log
 /skills/
 /.local-runtime/
 /.audit-runtime/
+target/
+mini-services/dca-core/target/
+.mimosa/
+mini-services/dca-core/.mimosa/
