@@ -4,6 +4,7 @@
 
 use crate::dca::DcaEngine;
 use crate::grid::GridEngine;
+use crate::hedge::HedgeEngine;
 use crate::{Action, BarContext, BotConfig, StrategyKind};
 use dca_kernel::{Bar, OrderIntent, OrderKind, SimulationStepper, StepperConfig};
 use dca_math::fraction::Fraction;
@@ -225,7 +226,7 @@ pub fn run_backtest(
             session_type: session,
             capital_shortfall_mode: dca_risk::CapitalShortfallMode::Wait,
             is_spot: margin_mode,
-            leverage: stepper_lev,
+            leverage: stepper_lev.clone(),
             // Task 16: backtest = live paritesi — politika bar-through geçer.
             policy: cfg.risk_policy.clone(),
             ..Default::default()
@@ -249,10 +250,34 @@ pub fn run_backtest(
         None => None,
     };
 
+    // Faz 13B-backtest: hedge türleri İKİ stepper ile koşar — ana (yön +1) ve
+    // hedge (yön −1) bacakların kernel defterleri canlıdaki gibi ayrıdır (EX-06).
+    let is_hedge_kind = matches!(cfg.kind, StrategyKind::HedgeProtective | StrategyKind::HedgeDual);
+    let mut hedge_stepper: Option<SimulationStepper> = if is_hedge_kind {
+        let mut hs = SimulationStepper::new(
+            inst.clone(),
+            start_cash.clone(),
+            StepperConfig {
+                session_type: session,
+                capital_shortfall_mode: dca_risk::CapitalShortfallMode::Wait,
+                is_spot: margin_mode,
+                leverage: stepper_lev,
+                policy: cfg.risk_policy.clone(),
+                ..Default::default()
+            },
+        );
+        hs.set_position_direction(-1);
+        Some(hs)
+    } else {
+        None
+    };
     let mut engine: EngineBox = match cfg.kind {
         StrategyKind::SpotGrid | StrategyKind::FuturesGrid | StrategyKind::InfinityGrid => {
             let mark0 = Fraction::from_decimal_str(&bars.first().ok_or("no bars")?.c).map_err(|e| e.to_string())?;
             EngineBox::Grid(GridEngine::new("bt", cfg.clone(), inst.clone(), &mark0)?)
+        }
+        StrategyKind::HedgeProtective | StrategyKind::HedgeDual => {
+            EngineBox::Hedge(HedgeEngine::new("bt", cfg.clone(), inst.clone())?)
         }
         _ => EngineBox::Dca(DcaEngine::new("bt", cfg.clone(), inst.clone())?),
     };
@@ -280,6 +305,7 @@ pub fn run_backtest(
         .collect();
     funding_events.sort_by_key(|x| x.0);
     let mut f_cursor = 0usize;
+    let mut f_cursor_h = 0usize;
     let mut total_funding = Fraction::zero();
     let mut prev_bar_t: Option<i64> = None;
     // Task 16 — günlük DD devre kesici (spec 2.9): UTC gün başına eşik.
@@ -315,6 +341,12 @@ pub fn run_backtest(
         };
 
         let fills = stepper.step(bar, bar.t, false).map_err(|e| e.to_string())?;
+        // Faz 13B-backtest: hedge bacak stepper'ı AYRI kernel olarak step edilir
+        // ve fill'leri prefix routing'iyle EngineBox::Hedge'e iletilir.
+        let hedge_fills = match hedge_stepper.as_mut() {
+            Some(hs) => hs.step(bar, bar.t, false).map_err(|e| e.to_string())?,
+            None => Vec::new(),
+        };
 
         // Task 16 — rejim sınıflandırma (zero look-ahead: yalnız kapalı barlar).
         regime_closes.push(c.to_f64_display());
@@ -375,9 +407,16 @@ pub fn run_backtest(
                                     Vec::new()
                                 }
                                 EngineBox::Grid(_) => Vec::new(),
+                                EngineBox::Hedge(h) => {
+                                    // Faz 13B: ana bacak LIQ — hedge bacağı kendi
+                                    // stepper'ıyla izlenmeye devam eder.
+                                    h.on_fill_leg(&fill);
+                                    h.main.force_liquidate();
+                                    Vec::new()
+                                }
                             };
                             for a in acts {
-                                dispatch(&mut stepper, a, bar.t)?;
+                                dispatch_leg(&mut stepper, hedge_stepper.as_mut(), a, bar.t)?;
                             }
                         }
                     }
@@ -403,13 +442,16 @@ pub fn run_backtest(
                         let boot_acts = g.bootstrap(&o);
                         sync_grid_levels(&engine, &mut grid_level_map);
                         for a in boot_acts {
-                            dispatch(&mut stepper, a, bar.t)?;
+                            dispatch_leg(&mut stepper, hedge_stepper.as_mut(), a, bar.t)?;
                         }
                         bootstrap_done = true;
                     }
                 }
                 EngineBox::Dca(_) => {
                     bootstrap_done = true; // DCA engines gate internally
+                }
+                EngineBox::Hedge(_) => {
+                    bootstrap_done = true; // hedge engines gate internally
                 }
             }
         }
@@ -448,6 +490,29 @@ pub fn run_backtest(
                 total_funding = total_funding.add(&applied).unwrap_or_else(|_| total_funding.clone());
             }
         }
+        // Faz 13B-backtest: hedge bacağı AYRI kernel — kendi notional'iyle settlement.
+        if let Some(hs) = hedge_stepper.as_mut() {
+            if !hs.cfg.is_spot && !hs.position.qty.is_zero() {
+                let mut happlied = Fraction::zero();
+                while f_cursor_h < funding_events.len() && funding_events[f_cursor_h].0 <= bar.t {
+                    let (_, rate) = funding_events[f_cursor_h].clone();
+                    let notional = hs.position.qty.mul(&c).map_err(|e| e.to_string())?;
+                    let dir = Fraction::from_i64(hs.position.direction as i64);
+                    let expense = rate.mul(&notional).map_err(|e| e.to_string())?.mul(&dir).map_err(|e| e.to_string())?;
+                    hs.apply_funding_expense(&expense);
+                    if let EngineBox::Hedge(h) = &mut engine {
+                        if let Some(hleg) = h.hedge.as_mut() {
+                            hleg.apply_funding(&expense);
+                        }
+                    }
+                    happlied = happlied.add(&expense).unwrap_or_else(|_| happlied.clone());
+                    f_cursor_h += 1;
+                }
+                if !happlied.is_zero() {
+                    total_funding = total_funding.add(&happlied).unwrap_or_else(|_| total_funding.clone());
+                }
+            }
+        }
 
         for fill in &fills {
             // Grid fills resolve their mesh level from the engine's own
@@ -460,12 +525,26 @@ pub fn run_backtest(
                     let map = grid_level_map.clone();
                     g.on_fill(fill, move |id| map.get(id).copied())
                 }
+                EngineBox::Hedge(h) => h.on_fill_leg(fill),
             };
             for a in acts {
-                dispatch(&mut stepper, a, bar.t)?;
+                dispatch_leg(&mut stepper, hedge_stepper.as_mut(), a, bar.t)?;
             }
         }
         all_fills.extend(fills);
+
+        // Faz 13B-backtest: hedge bacak fill'leri EngineBox::Hedge'e (on_fill_leg
+        // prefix routing'iyle) iletilir ve cascade eylemleri hedge stepper'ına dispatch.
+        for fill in &hedge_fills {
+            let acts = match &mut engine {
+                EngineBox::Hedge(h) => h.on_fill_leg(fill),
+                _ => Vec::new(),
+            };
+            for a in acts {
+                dispatch_leg(&mut stepper, hedge_stepper.as_mut(), a, bar.t)?;
+            }
+        }
+        all_fills.extend(hedge_fills);
 
         let ctx = BarContext {
             bar,
@@ -506,19 +585,26 @@ pub fn run_backtest(
                             pine_exit_log = true;
                         }
                     }
+                    EngineBox::Hedge(h) => {
+                        if pos_qty_nonzero {
+                            h.main.request_close_all();
+                            pine_exit_log = true;
+                        }
+                    }
                 }
             }
         }
         let acts = match &mut engine {
             EngineBox::Dca(e) => e.on_bar(&ctx),
             EngineBox::Grid(g) => g.on_bar(&ctx),
+            EngineBox::Hedge(h) => h.process_bar(&ctx),
         };
         for a in acts {
-            dispatch(&mut stepper, a, bar.t)?;
+            dispatch_leg(&mut stepper, hedge_stepper.as_mut(), a, bar.t)?;
         }
         let halted_mesh = !pine_exit_acts.is_empty();
         for a in pine_exit_acts {
-            dispatch(&mut stepper, a, bar.t)?;
+            dispatch_leg(&mut stepper, hedge_stepper.as_mut(), a, bar.t)?;
         }
         if pine_exit_log {
             let detail = if halted_mesh {
@@ -539,6 +625,13 @@ pub fn run_backtest(
     let (deals, wins) = match &engine {
         EngineBox::Dca(e) => (e.deals_closed, e.wins),
         EngineBox::Grid(g) => (g.deals_closed, g.wins),
+        EngineBox::Hedge(h) => {
+            let hd = h.hedge.as_ref();
+            (
+                h.main.deals_closed + hd.map(|l| l.deals_closed).unwrap_or(0),
+                h.main.wins + hd.map(|l| l.wins).unwrap_or(0),
+            )
+        }
     };
     let losses = deals.saturating_sub(wins);
     let _ = losses;
@@ -603,6 +696,10 @@ pub fn run_backtest(
                 format!("{n} barda config sayısal alanı veya SL aralığı geçersiz — deal reddedildi", n = e.invalid_config_bars),
             );
         }
+        EngineBox::Hedge(_) => {
+            // Faz 13B: hedge backtest'leri için no-deal sayaçları henüz ayrı
+            // alınmıyor (bacaklar kendi phase'lerinde ilerler) — bilinçli boş.
+        }
         EngineBox::Grid(g) => {
             let trigger_desc = g.cfg.entry_trigger.describe();
             push_reason(
@@ -658,6 +755,7 @@ pub fn run_backtest(
 enum EngineBox {
     Dca(DcaEngine),
     Grid(GridEngine),
+    Hedge(HedgeEngine),
 }
 
 /// Keep the backtest id → level map in sync with the grid engine's own
@@ -667,6 +765,28 @@ fn sync_grid_levels(engine: &EngineBox, map: &mut std::collections::HashMap<Stri
         for (k, v) in g.order_levels() {
             map.entry(k.clone()).or_insert(*v);
         }
+    }
+}
+
+/// Faz 13B-backtest: eylemi order-id prefix'ine göre DOĞRU bacak stepper'ına
+/// yönlendirir (bt-hedge → hedge kernel; diğer → ana kernel).
+fn dispatch_leg(
+    main: &mut SimulationStepper,
+    hedge: Option<&mut SimulationStepper>,
+    action: Action,
+    ts: i64,
+) -> Result<(), String> {
+    let id = match &action {
+        Action::PlaceLimit { id, .. } | Action::PlaceMarket { id, .. } | Action::CancelResting { id } => id.clone(),
+        Action::Log { .. } => String::new(),
+    };
+    if id.starts_with("bt-hedge") {
+        match hedge {
+            Some(hs) => dispatch(hs, action, ts),
+            None => Err("hedge stepper yok — hedge emri yönlendirilemedi".into()),
+        }
+    } else {
+        dispatch(main, action, ts)
     }
 }
 

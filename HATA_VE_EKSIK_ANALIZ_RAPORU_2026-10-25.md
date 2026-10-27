@@ -20,6 +20,8 @@ Proje matematik çekirdeği (M01–M21), fail-closed kapı mimarisi ve muhasebe 
 
 Canlı testte ayrıca iki API sağlamlık açığı gözlemlendi: geçersiz `"FOO"` status'ü `200 {"ok":true}` ile kabul ediliyor (H-10 canlı kanıt) ve `start_cash="-500"` ile bot `201 RUNNING` kuruluyor (M-5 canlı kanıt).
 
+**27 Ekim gece (Faz 13B-backtest) — UYGULANDI (§4.12):** Backtest runner hedge desteği kazandı (çift-stepper, prefix routing, per-bacak liq/funding); HEDGE_DUAL backtest 422→200 (3 işlem/8 fill); sertifika kapısı hedge için gerçek hüküm veriyor; **Demo'da HEDGE_DUAL LIVE çift bacak fill canlı kanıtlandı** (venue 2 pozisyon kaydı — positionIdx eşlemesi borsada doğrulandı). Tüm kod işleri BİTTİ; kalan salt operasyon: testnet rampası + Tunnel açılışı + e2e rate sönümü.
+
 **27 Ekim (Faz 14) — KALAN HAVUZ KAPANDI (§4.11):** M-10 (delete_bot DB temizliği), CF-3 (Caddy localhost kısıtı), CF-2 hazırlığı (DCA_EXTRA_ORIGINS), stop-local port-bazlı güvenli kapatma — hepsi kabul edildi (271 test). 13B-backtest kesin tasarımı yazıldı: HEDGE sertifika engelinin kökü backtest runner'da Hedge varyantı yokluğu; çift-stepper tasarımı icra-ready. Sonrası salt operasyon.
 
 **27 Ekim (Faz 13B) — UYGULANDI (§4.8):** HedgeEngine bacak-başına stepper: iki bacak artık ayrı kernel defterinde (EX-06 kalıcı çözüm); per-bacak likidasyon/funding; hedge kernel snapshot; **LIVE hedge kilidi kaldırıldı**. Canlı kanıt: HEDGE_DUAL PAPER — iki bacak iki fill, kernel net delta 0. **Tüm Faz 13 tamamlandı** — 23 Ekim denetim raporundaki tüm kritik/yüksek bulgular kapalı ya da kilitle sınırlı olmaktan çıktı. Kalan: testnet rampası (operasyonel) + arşiv temizliği.
@@ -744,6 +746,38 @@ Motor sözleşmeleri (health/auth/calc/backtest/pine/vault/halt/webhook korumas�
 7. Kabul: HEDGE_DUAL backtest 400 bar → iki BASE fill (Sell+Buy), net delta 0, deals ≥ 1; sertifika kapısı hedge için deneme koşusu üretir; Demo'da HEDGE_DUAL LIVE kabul turu (POZ_MODE positionIdx eşlemesiyle) — testnet rampası kapsamında.
 
 **Değerlendirme:** Bu eklentiyle 23 Ekim raporunun tüm kapsamı (bulgular + ürün yolu) tüketilmiş olur; sonrası salt operasyon (testnet rampası, Tunnel açılışı — §4.9).
+
+---
+
+
+## 4.12 Faz 13B-backtest — UYGULANDI (27 Ekim gece: HEDGE sertifika yolu açıldı, çift bacak LIVE kanıtı)
+
+§4.11'deki tasarım uygulandı: `EngineBox::Hedge(HedgeEngine)` varyantı, hedge türleri için **çift stepper** (ana +1 / hedge −1, ayrı cash/IM), `dispatch_leg` prefix routing (bt-hedge → hedge kernel), dual step (ana + hedge fill'leri `on_fill_leg` ile EngineBox::Hedge'e), per-bacak M07 likidasyon + per-bacak funding (ayrı f_cursor_h), bootstrap/pine-exit/liq-acts/deals-matches/no-deal-match kolonları tamamlandı.
+
+### Kabul kanıtları
+
+| Test | Önce | Sonra |
+|---|---|---|
+| `POST /api/backtest` HEDGE_DUAL | **422** "DcaEngine requires…" | **200**: 3 işlem/8 fill, win %66.7; BASE Buy 3 + BASE Sell 2 (ana deal başına yeniden giriş + hedge spawn — beklenen davranış) |
+| `POST /api/backtest/cert` HEDGE_DUAL | "all trial backtests failed" | **Gerçek hüküm**: KALDI (trades=3 OK, WFE OK, DSR/PBO strateji kalitesi) — artık dürüst değerlendirme var |
+| Demo **HEDGE_DUAL LIVE** | imkansız | **ÇİFT BACAK CANLI**: `…-hedge-BASE-1` SELL + `…-main-BASE-1` BUY, ikisi de gerçek fee'li; **iki ayrı kernel defteri** (main qty 1/500, hedge qty 1/500, hedge IM+fees ayrı); venue **2 pozisyon kaydı** (positionIdx 1+2 — borsada hedge-mod eşlemesi çalıştı) |
+
+271 test / 0 hata. Süreç notu: 6 mekanik derleme hatası (non-exhaustive match'ler, move/clone) git ağıyla düzeltildi.
+
+### Dürüst notlar
+
+- Kapanış barı gelmeden bot silindi → Demo hesapta pozisyonlar açık kaldı (rapor net: kernel main +1/500, hedge −1/500; venue 2 kayıt). Sanal para; temizleme: botu yeniden kurup CLOSE_ALL bir bar beklemek ya da Demo panelinden kapatmak.
+- Sertifika kapısı hedge için artık GERÇEK hüküm veriyor (KALDI: DSR/PBO) — naif hedge config'i geçmiyor; cert_acknowledged istisnası ile açılış mümkün (DCA'daki gibi).
+
+### Final yol haritası durumu
+
+| Kalem | Durum |
+|---|---|
+| 13A-POLL (dispatch IEA) | ✅ |
+| 13B-backtest (hedge cert yolu) | ✅ **bu tur** |
+| Testnet rampası + Demo HEDGE LIVE tam kabul (kapanış barlı temiz kapanış dâhil) | operasyonel — strateji kalitesi (DSR/PBO geçen config) hazır olunca |
+| Cloudflare Tunnel + Access açılışı | operasyonel — §4.9 taslağı hazır |
+| e2e tam-yeşil (rate sönümü/testnet anahtarı) | operasyonel |
 
 ---
 
