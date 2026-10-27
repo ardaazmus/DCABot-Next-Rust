@@ -685,6 +685,34 @@ ingress:
 
 ---
 
+
+## 4.10 Bağımsız E2E Denetimi — tests/e2e_engine.py iki fazlı koşum (27 Ekim)
+
+Pakete hiç dokunmadan (Faz 1) ve yalnız auth uyarlamasıyla (Faz 2) koşuldu; sonuçlar `.audit-runtime/e2e-asis.log` ve `e2e-auth.log` içinde.
+
+### Faz 1 — olduğu gibi (bağımsız kanıt)
+
+**11 PASS / 121 FAIL.** Kök: paket SEC-01 ÖNCESİ motor için yazılmış — tüm yönetim uçları artık Bearer zorunlu; anahtarsız istekler 401. Bu,SEC-01 düzeltmesinin e2e yüzeyinde de geçerli olduğunun bağımsız kanıtıdır (paket güncellenmemişti).
+
+### Faz 2 — auth uyarlanmış (`req()` + SSE curl'lere Bearer; kalıcı iyileştirme)
+
+**107 PASS / 120 FAIL→13 FAIL.** Geçenler: summary/markets/klines/health, calc dca+grid, backtest+cert, pine validate/backtest, selfcheck, vault 422 kapısı, kill-switch/freeze döngüsü, bot CRUD, PAPER grid bot, webhook korunması, T14 sinyal ağacı, parite — geniş sözleşme yüzeyi yeşil.
+
+**13 başarısızlık — tek kök, tümü ikincil:** paketin deal açılışı bekleyen 7 kontrolü (`bot-deal-*`, `fdca-*`, `sc-met-*`, `sse-lifecycle-events`) boş sonuç aldı. Zincir: **(1)** Faz 2'de gelen warmup-skip ile yeni botun İLK deal'i bir SONRAKİ kapanmış barda açılır (eski davranış: ilk poll tarihsel barları anında yaşardı); **(2)** paket ~8 botu art arda kurup her biri 20 sn'de 60 barlık kline çekince Bybit public anti-abuse limiti (10006) devreye giriyor; motor fail-closed bekliyor (dürüst — kanıt: `fdca-*` detayında paketin kendisi "rate-limit penceresinde yakalanamadı" yazıyor).
+
+**Motor-side tek-kesin kanıt (aynı baskı altında):** taze 1m PAPER bot, izlemeli bekleme → tur 9'da (~100 sn) `BasePending→Open`, 0.00062 BTC pozisyon. Deal açılış mekanizması baskı altında da çalışıyor; yalnız süre uzuyor.
+
+### Uygulanan kalıcı iyileştirmeler
+
+- `tests/e2e_engine.py`: auth başlıkları (kalıcı), `bot-deal-open` ve `sc-met` pencereleri 90→150 sn (warmup + rate sönümü farkındalığı, açıklama yorumlarıyla).
+- Öneri (sonraki oturum): paketin bot-kurma bölümleri arasına 60 sn rate-limit sönümü ya da testnet API anahtarı (limitler daha cömert) — tam-yeşil koşum için.
+
+### Bağımsız denetim genel hükmü
+
+Motor sözleşmeleri (health/auth/calc/backtest/pine/vault/halt/webhook koruması/grid/parite) bağımsız pakette geniş ölçüde doğrulandı; başarısızlıkların tümü test-altyapısı lag'ından (auth eksik + bekleme pencereleri) ve bilinçli fail-closed davranıştan kaynaklı — motor tarafında yeni kusur bulunamadı.
+
+---
+
 ## 5. AÇIK BULGULAR (güncel kaynakla doğrulanmış)
 
 Önem sırası: **C (Kritik) → H (Yüksek) → M (Orta)**. Her bulguda kanıt `dosya:satır`, etki ve gereken iş verilir.

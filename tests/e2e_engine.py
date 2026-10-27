@@ -49,6 +49,10 @@ def req(method: str, path: str, body: dict | None = None, timeout: float = 30.0)
     r = urllib.request.Request(url, data=data, method=method)
     if data:
         r.add_header("Content-Type", "application/json")
+    # Bağımsız denetim uyarlama: SEC-01 sonrası tüm yönetim uçları Bearer zorunlu.
+    _ak = os.environ.get("E2E_API_KEY", "")
+    if _ak:
+        r.add_header("Authorization", f"Bearer {_ak}")
     try:
         with urllib.request.urlopen(r, timeout=timeout) as resp:
             raw = resp.read().decode() or "{}"
@@ -371,7 +375,7 @@ open(sse_file, "w").close()
 def sse_listener():
     with open(sse_file, "w") as fh:
         subprocess.run(
-            ["curl", "-sN", "-m", "90", f"{BASE}/api/stream?XTransformPort={PORT}"],
+            ["curl", "-sN", "-m", "90", "-H", f"Authorization: Bearer {os.environ.get('E2E_API_KEY', '')}", f"{BASE}/api/stream?XTransformPort={PORT}"],
             stdout=fh, stderr=subprocess.DEVNULL, timeout=100,
         )
 
@@ -381,9 +385,11 @@ sse_thread.start()
 time.sleep(1.5)
 
 # wait for supervisor tick (20s cadence) to open deal on live price
+# Bağımsız denetim 2026-10-27: warmup-skip sonrası ilk deal BİR SONRAKİ kapanmış
+# barda açılır + çoklu-bot Bybit 10006 rate baskısı sönümü için pencere 90s→150s.
 deal_open = False
 snap = {}
-for _ in range(9):
+for _ in range(15):
     time.sleep(10)
     s, snap = req("GET", f"/api/bots/{bot_id}")
     stats = snap.get("stats") or {}
@@ -615,7 +621,7 @@ check("vault-error-body", bool(str(j.get("_raw") or j.get("error") or "")), f"bo
 section("T12 SSE STREAM — direct probe")
 try:
     out = subprocess.run(
-        ["curl", "-sN", "-m", "26", f"{BASE}/api/stream?XTransformPort={PORT}"],
+        ["curl", "-sN", "-m", "26", "-H", f"Authorization: Bearer {os.environ.get('E2E_API_KEY', '')}", f"{BASE}/api/stream?XTransformPort={PORT}"],
         capture_output=True, text=True, timeout=30,
     )
     data = out.stdout
@@ -691,7 +697,7 @@ if met_id:
     # pencere 50s → 90s; ayrıca "kapalı deal + aktif deal_id" kanıtı da kabul:
     # motor deal AÇTIYSA ya phase Open'tır ya da deal açılıp TP ile kapanmıştır
     # (deals_closed >= 1). İkisi de "tetikleyici met → deal açılır" kanıtıdır.
-    for _ in range(9):
+    for _ in range(15):
         time.sleep(10)
         s, snap = req("GET", f"/api/bots/{met_id}")
         st = snap.get("stats") or {}
