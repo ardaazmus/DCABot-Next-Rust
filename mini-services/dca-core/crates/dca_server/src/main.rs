@@ -203,7 +203,9 @@ async fn main() {
             }),
         )
         // SEC-01: kimlik doğrulama middleware'i (yönetim routes'ları).
-        .route_layer(middleware::from_fn_with_state(api_key_clone, auth_middleware));
+        .route_layer(middleware::from_fn_with_state(api_key_clone, auth_middleware))
+        // M-15: yönetim uçlarında gövde limiti — 1MB isim gibi aşırı yük reddedilir.
+        .layer(axum::extract::DefaultBodyLimit::max(131_072));
 
     let app = health_routes
         .merge(api_routes)
