@@ -20,6 +20,8 @@ Proje matematik çekirdeği (M01–M21), fail-closed kapı mimarisi ve muhasebe 
 
 Canlı testte ayrıca iki API sağlamlık açığı gözlemlendi: geçersiz `"FOO"` status'ü `200 {"ok":true}` ile kabul ediliyor (H-10 canlı kanıt) ve `start_cash="-500"` ile bot `201 RUNNING` kuruluyor (M-5 canlı kanıt).
 
+**27 Ekim (Faz 14) — KALAN HAVUZ KAPANDI (§4.11):** M-10 (delete_bot DB temizliği), CF-3 (Caddy localhost kısıtı), CF-2 hazırlığı (DCA_EXTRA_ORIGINS), stop-local port-bazlı güvenli kapatma — hepsi kabul edildi (271 test). 13B-backtest kesin tasarımı yazıldı: HEDGE sertifika engelinin kökü backtest runner'da Hedge varyantı yokluğu; çift-stepper tasarımı icra-ready. Sonrası salt operasyon.
+
 **27 Ekim (Faz 13B) — UYGULANDI (§4.8):** HedgeEngine bacak-başına stepper: iki bacak artık ayrı kernel defterinde (EX-06 kalıcı çözüm); per-bacak likidasyon/funding; hedge kernel snapshot; **LIVE hedge kilidi kaldırıldı**. Canlı kanıt: HEDGE_DUAL PAPER — iki bacak iki fill, kernel net delta 0. **Tüm Faz 13 tamamlandı** — 23 Ekim denetim raporundaki tüm kritik/yüksek bulgular kapalı ya da kilitle sınırlı olmaktan çıktı. Kalan: testnet rampası (operasyonel) + arşiv temizliği.
 
 **27 Ekim (Faz 13A-POLL) — UYGULANDI (§4.7):** Dispatch LIVE dalları intent'e döndü; place/gate/market-sorgu/cancel ağları poll kilidi DIŞINDA cascade fazında koşuyor (≤8 tur, cascade apply yeni intent üretir). Canlı kanıt: Demo LIVE BASE emri intent yolundan verildi ve doldu (Open, 0.002 BTC, gerçek fee). Kalan tek refactor: 13B hedge bacak-stepper (ayrı oturum, plan §4.6).
@@ -710,6 +712,38 @@ Pakete hiç dokunmadan (Faz 1) ve yalnız auth uyarlamasıyla (Faz 2) koşuldu; 
 ### Bağımsız denetim genel hükmü
 
 Motor sözleşmeleri (health/auth/calc/backtest/pine/vault/halt/webhook koruması/grid/parite) bağımsız pakette geniş ölçüde doğrulandı; başarısızlıkların tümü test-altyapısı lag'ından (auth eksik + bekleme pencereleri) ve bilinçli fail-closed davranıştan kaynaklı — motor tarafında yeni kusur bulunamadı.
+
+---
+
+
+## 4.11 Faz 14 — kalan bulgu havuzunun kapatılması (27 Ekim) + 13B-backtest tasarımı
+
+### Uygulanan ve kabul edilenler
+
+| İş | Bulgu | Kanıt |
+|---|---|---|
+| `delete_bot` artık DB kaydını da temizliyor: `bots` satırı + `live_orders` + (varsa) `runtime_state` silinir; fill/equity geçmişi analiz için korunur; LIFECYCLE olayı yazılır | M-10 | canlı: oluştur→sil→DB `bots=0, live_orders=0` |
+| Caddyfile dinleyicisi `localhost:81`'e kısıtlandı (LAN'a açık yüzey kaldırıldı; Tunnel doğrudan 3000/3002'ye bağlanabilir) | CF-3 | yapılandırma değişikliği |
+| `DCA_EXTRA_ORIGINS` env: CORS listesi virgülle ayrık ek origin'leri kabul eder (Tunnel domain'i kod değişikliği olmadan) | CF-2 hazırlığı | kod + derleme |
+| `stop-local.ps1` port-dinleyici bazlı güvenli kapatma: yalnız 3002'de `dca_server` ve 3000'de `node/bun` kapatılır, beklenmeyen süreçlere dokunulmaz — "identity changed" reddi dönemi bitti | ops | script |
+| e2e rate sönümü: `bot-deal-open` ve `sc-met` pencereleri 90→150 sn + auth başlıkları kalıcı | §4.10 önerisi | §4.10 |
+
+271 test / 0 hata; motor yeniden başlatıldı, 4 kullanıcı botu restore.
+
+### 13B-backtest — kesin tasarım (HEDGE LIVE sertifikasının önündeki son engel)
+
+**Kök neden:** `backtest.rs` `EngineBox`'ın Hedge varyantı yok — HEDGE_DUAL/HEDGE_PROTECTIVE backtest'leri `DcaEngine::new`'e düşüp `"DcaEngine requires DCA_LONG/DCA_SHORT/FUTURES_DCA"` ile reddediliyor. Bu yüzden sertifika kapısı hedge için "all trial backtests failed" döner (fail-closed doğru çalışıyor — canlı doğrulandı).
+
+**Tasarım (taze oturumda mekanik uygulama):**
+1. `EngineBox::Hedge(HedgeEngine)` varyantı ekle.
+2. `run_backtest` başında hedge ise İKİ stepper kur (ana yön=+1, hedge yön=−1, ayrı cash/IM) — canlı `engine.rs process_bar` deseniyle birebir.
+3. `dispatch` iki-stepper sürümü: role/id prefix (`{bt}-hedge`) → hedge stepper; HedgeEngine BASE emirleri `…-hedge-…` id taşır (mevcut).
+4. `stepper.step` iki kez (ana + hedge), fill'ler prefix'e göre `engine.on_fill_leg`'e (mevcut routing).
+5. Per-bacak M07 likidasyon + funding (`liq_price_of_stepper` deseni canlıda var — runner'a ayna).
+6. Metrics: deals/wins/losses HedgeEngine leg'lerinden (snapshot sözleşmesi mevcut), equity = ana+hedge toplamı.
+7. Kabul: HEDGE_DUAL backtest 400 bar → iki BASE fill (Sell+Buy), net delta 0, deals ≥ 1; sertifika kapısı hedge için deneme koşusu üretir; Demo'da HEDGE_DUAL LIVE kabul turu (POZ_MODE positionIdx eşlemesiyle) — testnet rampası kapsamında.
+
+**Değerlendirme:** Bu eklentiyle 23 Ekim raporunun tüm kapsamı (bulgular + ürün yolu) tüketilmiş olur; sonrası salt operasyon (testnet rampası, Tunnel açılışı — §4.9).
 
 ---
 

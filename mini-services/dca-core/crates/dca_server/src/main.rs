@@ -213,10 +213,22 @@ async fn main() {
         // de açık (motor doğrudan hedeflenirse preflight reddi kalmasın).
         .layer(
             CorsLayer::new()
-                .allow_origin(AllowOrigin::list([
-                    "http://localhost:3000".parse::<axum::http::HeaderValue>().unwrap(),
-                    "http://127.0.0.1:3000".parse::<axum::http::HeaderValue>().unwrap(),
-                ]))
+                .allow_origin({
+                    // Faz 14-D: varsayılan localhost ikilisi + DCA_EXTRA_ORIGINS
+                    // (virgülle ayrık) — Tunnel domain'i kod değişikliği olmadan eklenir.
+                    let mut origins = vec![
+                        "http://localhost:3000".parse::<axum::http::HeaderValue>().unwrap(),
+                        "http://127.0.0.1:3000".parse::<axum::http::HeaderValue>().unwrap(),
+                    ];
+                    if let Ok(extra) = std::env::var("DCA_EXTRA_ORIGINS") {
+                        for o in extra.split(',').map(str::trim).filter(|o| !o.is_empty()) {
+                            if let Ok(hv) = o.parse::<axum::http::HeaderValue>() {
+                                origins.push(hv);
+                            }
+                        }
+                    }
+                    AllowOrigin::list(origins)
+                })
                 .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::PATCH, axum::http::Method::DELETE])
                 .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::AUTHORIZATION]),
         )
@@ -1492,7 +1504,14 @@ async fn delete_bot(State(app): State<Arc<AppState>>, Path(id): Path<String>) ->
     // H-1: bot silinince single-flight kilidi de kalkar (harita sızıntısı yok).
     app.poll_locks.lock().await.remove(&id);
     app.ui_cache.lock().await.remove(&id);
-    state::persist_status(&*app, &id, "STOPPED");
+    // Faz 14-A (M-10): DB kaydı da temizlenir — bots satırları sonsuz birikmesin.
+    // Fill/event/equity geçmişi analiz için korunur (bot_id artık bots'ta yok).
+    if let Ok(conn) = app.db.conn.lock() {
+        let _ = conn.execute("DELETE FROM bots WHERE id=?1", rusqlite::params![id]);
+        let _ = conn.execute("DELETE FROM live_orders WHERE bot_id=?1", rusqlite::params![id]);
+        let _ = conn.execute("DELETE FROM runtime_state WHERE bot_id=?1", rusqlite::params![id]);
+    }
+    state::persist_event(&*app, &id, "INFO", "LIFECYCLE", "bot silindi (DB kaydı temizlendi; fill/equity geçmişi korundu)").await;
     let _ = app.sse.send(SseEvent { event: "BOT_STATE".into(), data: json!({"botId": id, "status": "STOPPED", "action": "DELETED"}).to_string() });
     Ok(Json(json!({"ok": true})))
 }
