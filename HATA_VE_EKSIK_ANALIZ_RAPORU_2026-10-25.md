@@ -633,6 +633,58 @@ Rapor §4.6'daki icra-detayından mekanik uygulama:
 
 ---
 
+
+## 4.9 Cloudflare Denetimi — dışa-açılış mimarisi değerlendirmesi (27 Ekim)
+
+Cloudflare ürün kataloğu üzerinden tam proje denetimi; hedef AGENTS.md'de kayıtlı olan "offline-first, gerektiğinde Cloudflare Tunnels ile dışa açılış".
+
+### Bileşen bazlı Cloudflare eşlemesi
+
+| Bileşen | Cloudflare'a taşınabilir mi? | Hüküm |
+|---|---|---|
+| Rust motor (`dca_server`: SQLite WAL, tokio uzun-ömürlü süreç, Bybit/OKX'e giden TCP, 24/7 poll supervisor) | ❌ Workers kısa-ömürlü isolate + D1/KV modeline uymaz; Containers bile gereksiz karmaşıklık (Windows'ta sorunsuz koşuyor) | **Yerel kalır** — doğru karar |
+| Next.js UI | Workers'a taşınabilir (vinext) AMA motor `127.0.0.1`'e bağlı — Workers'tan localhost'a erişilemez; UI'nin değeri motora komşuluk | **Yerel kalır** |
+| TradingView webhook girişi | Tunnel ile dış dünyaya açılabilir; kendi koruması sağlam (constant-time secret, 60 sn replay, DUPLICATE dedup — canlı doğrulandı) | **Tunnel senaryosu** |
+| PAPER veritabanı / events / vault | D1/R2 yerine SQLite WAL kalır (motor ile aynı süreç, transactional bütünlük) | **Yerel kalır** |
+
+### Doğru Cloudflare kombinasyonu: Tunnel + Access + (WAF kuralları)
+
+1. **Cloudflare Tunnel** (`cloudflared` Windows servisi): motor+UI yerel kalmaya devam ederken panel ve webhook TLS + Cloudflare ağı üzerinden dışarıya açılır. Giden-bağlantı modeli: port açma yok, 0.0.0.0 yok — mevcut `127.0.0.1` bind'lar (doğrulandı: motor `main.rs:226`, UI `--hostname 127.0.0.1`) ile birebir uyumlu.
+2. **Cloudflare Access** (zorunlu değilse açma!): `NEXT_PUBLIC_ENGINE_API_KEY` tarayıcı bundle'ına gömülü (`engine-client.ts:35` — lokalde kabul edilebilir); panel dışarıya açılırsa anahtar her ziyaretçiye sızar. Access kimlik politikası panel önünde ilk kilit olmalı. Webhook yolu (`/api/webhooks/tradingview`) Access'in DIŞINDA tutulmalı (TradingView sunucuları Access login'i geçemez) — kendi secret katmanı yeterli.
+3. **WAF/Rate-limit kuralları**: webhook yoluna sadece TradingView'in duyurulan IP aralıkları; `/api/*` genelinde agresif rate-limit.
+4. **CORS hazırlığı** (kod değişikliği gerekli, açılış öncesi): motor CORS listesi yalnız `localhost` origin'leri içeriyor — Tunnel domain'i eklenmeli.
+5. **Caddyfile notu**: `:81` tüm arayüzlerde dinler (LAN'a açık); Windows güvenlik duvarına güvenmek yerine `localhost:81` kısıtı önerilir. Tunnel doğrudan `localhost:3000/3002`'e de bağlanabilir — Caddy opsiyoneldir.
+
+### Somut cloudflared yapılandırma taslağı (uygulama istendiğinde)
+
+```yaml
+# ~/.cloudflared/config.yml
+tunnel: dcabot
+credentials-file: C:/Users/ArdaAzmus/.cloudflared/dcabot.json
+ingress:
+  - hostname: bot.ornek-domain.com        # Access ile korunur (UI paneli)
+    service: http://localhost:3000
+    originRequest:
+      noTLSVerify: true
+  - hostname: hook.ornek-domain.com       # Access DIŞI — TradingView webhook'u
+    service: http://localhost:3002
+    originRequest:
+      noTLSVerify: true
+  - service: http_status:404
+```
+
+### Denetim bulguları (Cloudflare lensi)
+
+- **CF-1 (önemli, açılış önü):** istemci gömülü `NEXT_PUBLIC_ENGINE_API_KEY` — dışa açılışta Access'siz panel açılmamalı; kalıcı çözüm olarak anahtar taşımanın Cloudflare Worker (Access JWT doğrulamalı) üzerinden yapılması değerlendirilebilir.
+- **CF-2 (açılış önü):** CORS listesine Tunnel domain'i eklenmeli (tek satır, `main.rs`).
+- **CF-3 (öneri):** `:81` Caddy dinleyicisi `localhost`'a kısıtlanmalı.
+- **CF-4 (bilgi):** API anahtarlarının IP kısıt listesi (`ips`) vault'ta toplanıyor ama motor tarafında zorlanmıyor — Bybit anahtarlarını kendi IP'nize kısıtlarsanız bu motor-uzayı riskini ortadan kaldırır (borsa tarafı önlemi).
+- **CF-5 (bilgi):** Telegram/webhook/SMTP bildirim kanalları Cloudflare'den bağımsız çalışır (giden bağlantı) — Tunnel kesintisinde bildirimler sürer; panel erişimi kesilir (kabul edilebilir).
+
+**Sonuç:** Proje mimarisi Cloudflare ile çelişmiyor; doğru desen "yerel motor + Tunnel + Access". Workers'a taşıma YAPILMAMALI (motorun çalışma modeli uyumsuz, kazanç sıfır). Açılış istendiğinde uygulama sırası: Tunnel servisi kur → Access politikası (UI hostname'i) → CORS'a domain ekle → webhook hostname'ini Access dışı + WAF kuralı → uçtan uca test.
+
+---
+
 ## 5. AÇIK BULGULAR (güncel kaynakla doğrulanmış)
 
 Önem sırası: **C (Kritik) → H (Yüksek) → M (Orta)**. Her bulguda kanıt `dosya:satır`, etki ve gereken iş verilir.
