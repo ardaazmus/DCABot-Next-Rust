@@ -58,3 +58,8 @@ target/
 mini-services/dca-core/target/
 .mimosa/
 mini-services/dca-core/.mimosa/
+
+# test artifacts
+__pycache__/
+*.pyc
+3100
