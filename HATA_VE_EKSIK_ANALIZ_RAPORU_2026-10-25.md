@@ -1046,3 +1046,10 @@ Sektörel karşılık: Freqtrade'in "son işlenen mumdan devam" ilkesinin minima
 Guvenlik testleri simdi kosuldu: SQL injection (name/symbol, parametreli sorgu saglam), yol manipulasyonu (404), anahtarsiz erisim (401). Yeni bulgu M-15 kapatildi: /api/bots 1MB govdeyi kabul ediyordu, DefaultBodyLimit 128KB eklendi. Mantik/yazilimsal: 271 birim test, e2e 107/120 (4.10), hedge net-delta-0, restart recovery - tamamlandi.
 
 Uzun-surec SIMDI BASLADI: temiz DB uzerine 12-botluk tum-ozellik matrisi kuruldu - DCA_LONG/SHORT, FUTURES_DCA, HEDGE_DUAL/PROTECTIVE, SPOT/FUTURES/INFINITY GRID, Pine MACD, RSI tetikleyici, TV webhook, zamanlanmis giris; interval 1m-1h. 7 gun boyunca surekli kosacak. Gunluk otomatik denetim gorevi (her gun 09:00, 7 kosum): motor health, bot durumu, ERROR/CRITICAL sayilari, DB buyumesi; .local-runtime/audit/ altina rapor yazar. Temiz DB gecisi: eski paper.sqlite3 silindi (talep uzerine), motor taze semayla acti, pine seed yeniden yazildi, UI yeniden basladi. M-15 bu binary'de. 7 gun sonunda: ERROR birikimi, rate-limit davranisi, kernel net-delta tutarliligi (hedge), events buyume egrisi degerlendirilir.
+
+
+## M-17 (YUKSEK, YENI - 28 Ekim): deals_closed artiyor ama realized_gross hep 0
+
+Kanit (.audit-runtime/sum-evidence-20261028.json): t9-pinemacd (PAPER) deals_closed=7, realized_gross=0; t11-tvhook deals_closed=1, realized=0. 7 kapanis gerceklesmisken realized gross'un 0 olmasi matematiksel olarak mumkun degil. Ayrica bot snapshot'larinda unrealized_gross alani 0/None donerken /api/summary totalUnrealizedPnl negatif deger uretiyor (stepper bazli hesap calisiyor) — iki tutarsizlik.
+
+Kok neden adaylari (sonraki oturumda incelenecek): (1) DcaEngine deals_closed sayaci close fill'i olmadan da artiyor olabilir (TP submit edildiginde); (2) pine close_all -> MANUAL piyasa emri kernel reduce fill'i position.realized_gross'u guncellemiyor olabilir; (3) snapshot'ta unrealized alaninin adı/paketi yanlis. Kanit dosyalari korunmustur.
