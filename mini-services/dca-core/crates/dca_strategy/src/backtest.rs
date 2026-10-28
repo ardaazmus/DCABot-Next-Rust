@@ -691,6 +691,14 @@ pub fn run_backtest(
                 format!("{n} barda önceki deal sonrası cooldown beklemesi", n = e.blocked_cooldown_bars),
             );
             push_reason(
+                "SIZE_BELOW_MIN",
+                e.blocked_size_bars,
+                format!(
+                    "{n} barda base notional enstrüman min_qty/step altına yuvarlandı (qty→0) — deal açılamadı; base_order_size yetersiz",
+                    n = e.blocked_size_bars
+                ),
+            );
+            push_reason(
                 "CONFIG_INVALID",
                 e.invalid_config_bars,
                 format!("{n} barda config sayısal alanı veya SL aralığı geçersiz — deal reddedildi", n = e.invalid_config_bars),

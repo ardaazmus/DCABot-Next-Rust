@@ -10,6 +10,9 @@ use dca_math::m04::PositionState;
 use dca_math::Instrument;
 use serde::{Deserialize, Serialize};
 
+/// M-18 — qty→0 abort sonrası yeniden deneme aralığı (bar sayısı).
+const ABORT_BACKOFF_BARS: usize = 30;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DcaPhase {
     Idle,
@@ -77,6 +80,10 @@ pub struct DcaEngine {
     pub blocked_regime_bars: u64,
     pub blocked_breaker_bars: u64,
     pub blocked_cooldown_bars: u64,
+    /// M-18: base emir qty adım boyutuna yuvarlanarak sıfırlandığında (notional
+    /// min_qty altı) artan honest sayaç — her bar bir kez, backtest no-deal raporu.
+    #[serde(default)]
+    pub blocked_size_bars: u64,
     pub invalid_config_bars: u64,
 }
 
@@ -134,6 +141,7 @@ impl DcaEngine {
             blocked_regime_bars: 0,
             blocked_breaker_bars: 0,
             blocked_cooldown_bars: 0,
+            blocked_size_bars: 0,
             invalid_config_bars: 0,
         })
     }
@@ -355,7 +363,25 @@ impl DcaEngine {
                 .unwrap_or_else(|_| Fraction::zero()),
         };
         if qty.is_zero() {
-            acts.push(Action::Log { level: "CRITICAL", message: format!("deal {deal_id} aborted: base order qty rounds to zero (notional below step_size)") });
+            // M-18: base notional adım boyutunun altında (qty→0) — her tick yeniden
+            // denemek CRITICAL seli + deal_seq yakımı üretir. Dürüst davranış:
+            // sayaç, tek CRITICAL (sonra %100'de bir hatırlatma) ve 30 bar geri
+            // çekilme; fiyat ivmesi tek başına geçerli kılabileceği için bot
+            // kapanmaz, aralıklı yeniden dener.
+            self.blocked_size_bars += 1;
+            self.deal_seq -= 1;
+            if self.blocked_size_bars == 1 || self.blocked_size_bars % 100 == 0 {
+                acts.push(Action::Log {
+                    level: if self.blocked_size_bars == 1 { "CRITICAL" } else { "WARN" },
+                    message: format!(
+                        "deal açılamadı: base notional adım boyutunun altında (qty→0) — {n}. engel; {backoff} bar sonra yeniden denenecek (base_order_size enstrüman min_qty'sını karşılamıyor)",
+                        n = self.blocked_size_bars,
+                        backoff = ABORT_BACKOFF_BARS,
+                    ),
+                });
+            }
+            self.cooldown_remaining = self.cfg.cooldown_bars.max(ABORT_BACKOFF_BARS);
+            self.phase = DcaPhase::Cooldown;
             return acts;
         }
         let base_seq = self.next_seq();
@@ -1355,5 +1381,46 @@ mod m17_realized_ledger_tests {
         v.as_object_mut().unwrap().remove("cum_realized_gross");
         let e2: DcaEngine = serde_json::from_value(v).unwrap();
         assert!(e2.cum_realized_gross.is_zero(), "eski persist kayıtları default 0 ile açılmalı");
+    }
+
+    /// M-18 regresyon: base notional step altına yuvarlanırsa (qty→0) motor
+    /// her tick yeniden denemez — 30 bar cooldown'a girer, ilk denemede tek
+    /// CRITICAL basar, sayaç her engeli sayar; backoff sonrası yeniden dener.
+    #[test]
+    fn qty_zero_abort_backs_off_instead_of_ticking_loop() {
+        // step_size'ı kasıtlı büyüt (1 BTC): base_order_size 100 → qty 0 → abort.
+        let mut inst = Instrument::default();
+        inst.step_size = Fraction::from_decimal_str("1").unwrap();
+        let mut e = DcaEngine::new("m18", BotConfig::default(), inst).unwrap();
+
+        // 1. deneme: CRITICAL + cooldown (100 USDT base @ 1000 → qty 0.1 → 0).
+        let acts = e.on_bar(&ctx(&bar(1_000, "1000"), Fraction::from_decimal_str("1000").unwrap()));
+        assert_eq!(e.blocked_size_bars, 1);
+        assert_eq!(e.phase, DcaPhase::Cooldown);
+        assert_eq!(e.cooldown_remaining, ABORT_BACKOFF_BARS);
+        assert_eq!(acts.iter().filter(|a| matches!(a, Action::Log { level: "CRITICAL", .. })).count(), 1);
+        // deal_seq abort'ta geri alınır — gerçek denemeye harcanmaz.
+        assert_eq!(e.deal_seq, 0);
+
+        // 2..ABORT_BACKOFF_BARS. bar: cooldown bloklar, CRITICAL YOK, sayaç sabit.
+        for i in 0..ABORT_BACKOFF_BARS {
+            let acts = e.on_bar(&ctx(&bar(2_000 + i as i64, "100"), Fraction::from_u64(100)));
+            assert!(acts.is_empty(), "cooldown bloğu sessiz olmalı (iter {i})");
+            assert_eq!(e.blocked_size_bars, 1, "backoff sırasında sayaç artmamalı");
+        }
+
+        // Backoff bitti: yeniden deneme — 2. engel sayılır, CRITICAL BASILMAZ.
+        let acts = e.on_bar(&ctx(&bar(9_999, "1000"), Fraction::from_decimal_str("1000").unwrap()));
+        assert_eq!(e.blocked_size_bars, 2);
+        assert_eq!(e.phase, DcaPhase::Cooldown);
+        assert!(acts.iter().all(|a| !matches!(a, Action::Log { level: "CRITICAL", .. })), "tekrar eden engel CRITICAL spam üretmemeli");
+
+        // İkinci backoff'u boşalt, sonra fiyat düşer (LONG için qty artar) → açılır.
+        for i in 0..ABORT_BACKOFF_BARS {
+            assert!(e.on_bar(&ctx(&bar(11_000 + i as i64, "100"), Fraction::from_u64(100))).is_empty());
+        }
+        let acts = e.on_bar(&ctx(&bar(20_000, "50"), Fraction::from_decimal_str("50").unwrap()));
+        assert!(acts.iter().any(|a| matches!(a, Action::PlaceMarket { role: "BASE", .. })), "backoff sonrası geçerli boyutta deal açılmalı");
+        assert_eq!(e.phase, DcaPhase::BasePending);
     }
 }
