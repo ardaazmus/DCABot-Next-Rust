@@ -10,6 +10,17 @@ import urllib.request
 import urllib.error
 
 CORE_URL = "http://127.0.0.1:3002/api/vault/keys"
+_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _assert_local_target(url: str) -> str:
+    """Bu arac yalniz localhost motor kasa'sina baglanir (SSRF guard)."""
+    from urllib.parse import urlparse
+
+    p = urlparse(url)
+    if p.scheme != "http" or (p.hostname or "") not in _LOCAL_HOSTS:
+        raise SystemExit(f"ingest yalniz localhost motora baglanir; reddedildi: {url}")
+    return url
 
 def parse_env(file_path=".env"):
     env_vars = {}
@@ -36,6 +47,7 @@ def post_vault_key(venue, label, api_key, api_secret):
         "api_secret": api_secret
     }
     data = json.dumps(payload).encode("utf-8")
+    _assert_local_target(CORE_URL)
     req = urllib.request.Request(
         CORE_URL,
         data=data,

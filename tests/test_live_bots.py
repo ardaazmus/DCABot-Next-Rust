@@ -10,9 +10,23 @@ import urllib.error
 import time
 
 BASE_URL = "http://127.0.0.1:3002"
+_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _assert_local_api(url: str, path: str) -> str:
+    """Yalniz localhost motora, / ile baslayan ve ../ icermeyen yollara istek (SSRF guard)."""
+    from urllib.parse import urlparse
+
+    if not path.startswith("/") or ".." in path:
+        raise SystemExit(f"gecersiz API yolu reddedildi: {path}")
+    p = urlparse(url)
+    if p.scheme != "http" or (p.hostname or "") not in _LOCAL_HOSTS:
+        raise SystemExit(f"test yalniz localhost motora baglanir; reddedildi: {url}")
+    return url
+
 
 def api_call(path, method="GET", payload=None):
-    url = f"{BASE_URL}{path}"
+    url = _assert_local_api(f"{BASE_URL}{path}", path)
     data = json.dumps(payload).encode("utf-8") if payload else None
     headers = {"Content-Type": "application/json"} if payload else {}
     req = urllib.request.Request(url, data=data, headers=headers, method=method)

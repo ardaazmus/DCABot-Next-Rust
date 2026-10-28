@@ -102,6 +102,24 @@ export function HedgeTab({ bot, fills }: { bot: BotDetail; fills: Fill[] }) {
   const ddPct = ddNum !== null && trigNum > 0 ? (ddNum / trigNum) * 100 : 0;
   const hedgeFills = fills.filter((f) => f.orderId.includes("-hedge-"));
   const isDual = h.mode === "DUAL";
+  // M-17: ana bacak unrealized'ı bot snapshot unrealizedNow'dan türetilir
+  // (alan ana + hedge toplamıdır; hedge bacağı kartı kendi unrealized'ını
+  // ayrı gösterdiğinden ana kart için hedge payı çıkarılır).
+  const mainRealized = Number(bot.stats.realized_gross) || 0;
+  const hedgeUnrealNum = h.hedge_leg?.unrealized_gross != null ? Number(h.hedge_leg.unrealized_gross) || 0 : null;
+  const mainUnrealNum = bot.unrealizedNow != null ? Number(bot.unrealizedNow) - (hedgeUnrealNum ?? 0) : null;
+  const mainLeg = {
+    id: `${bot.id}-main`,
+    phase: bot.stats.phase.split("/")[1] ?? bot.stats.phase,
+    position_qty: bot.stats.position_qty,
+    avg_price: bot.stats.avg_price || null,
+    realized_gross: bot.stats.realized_gross,
+    unrealized_gross: mainUnrealNum !== null ? String(mainUnrealNum) : null,
+    pnl: String(mainRealized + (mainUnrealNum ?? 0)),
+    deals_closed: bot.stats.deals_closed,
+    wins: bot.stats.wins,
+    losses: bot.stats.losses,
+  };
   return (
     <div className="space-y-4" data-testid="hedge-tab">
       <div className="flex flex-wrap items-center gap-2">
@@ -117,18 +135,7 @@ export function HedgeTab({ bot, fills }: { bot: BotDetail; fills: Fill[] }) {
           title="ANA BACAK (DCA Long)"
           badge="MAIN"
           tone="emerald"
-          leg={{
-            id: `${bot.id}-main`,
-            phase: bot.stats.phase.split("/")[1] ?? bot.stats.phase,
-            position_qty: bot.stats.position_qty,
-            avg_price: bot.stats.avg_price || null,
-            realized_gross: bot.stats.realized_gross,
-            unrealized_gross: null,
-            pnl: bot.stats.realized_gross,
-            deals_closed: bot.stats.deals_closed,
-            wins: bot.stats.wins,
-            losses: bot.stats.losses,
-          }}
+          leg={mainLeg}
           fallback="Ana bacak bekleniyor."
         />
         <LegCard

@@ -23,6 +23,7 @@ Verified contract (from crates/dca_server/src/main.rs):
 """
 import json
 import os
+import pathlib
 import subprocess
 import sys
 import tempfile
@@ -42,9 +43,29 @@ PORT = int(os.environ.get("PORT", "3002"))
 PASS: list[str] = []
 FAIL: list[str] = []
 
+_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _assert_local_target(url: str) -> str:
+    """E2E istemcisi yalnız localhost motora bağlanabilir (SSRF guard)."""
+    from urllib.parse import urlparse
+
+    p = urlparse(url)
+    if p.scheme != "http" or (p.hostname or "") not in _LOCAL_HOSTS:
+        raise SystemExit(f"E2E istemcisi yalniz localhost motora baglanir; reddedildi: {url}")
+    return url
+
+
+def _assert_safe_api_path(path: str) -> str:
+    """API yolu / ile başlamalı ve ../ içeremez (path traversal guard)."""
+    if not path.startswith("/") or ".." in path:
+        raise SystemExit(f"gecersiz API yolu reddedildi: {path}")
+    return path
+
 
 def req(method: str, path: str, body: dict | None = None, timeout: float = 30.0):
-    url = f"{BASE}{path}{'&' if '?' in path else '?'}XTransformPort={PORT}"
+    _assert_safe_api_path(path)
+    url = _assert_local_target(f"{BASE}{path}{'&' if '?' in path else '?'}XTransformPort={PORT}")
     data = json.dumps(body).encode() if body is not None else None
     r = urllib.request.Request(url, data=data, method=method)
     if data:
@@ -368,16 +389,21 @@ check("bot-has-id", bool(bot_id), f"id={bot_id}")
 # Start SSE capture NOW (before actions) — PAUSE/START/CLOSE_ALL emit BOT_STATE
 # synchronously and supervisor ticks emit EQUITY. Writes incrementally to a file
 # so the check can read it while the listener is still streaming.
-sse_file = os.path.join(tempfile.gettempdir(), "e2e-sse-capture.txt")
-open(sse_file, "w").close()
+# Capture yolu pathlib ile resolve edilir ve temp köküyle sınırlandırılır;
+# yazma tek dosya tanıtıcısından (sse_fh) yapılır.
+_sse_tmp_root = pathlib.Path(tempfile.gettempdir()).resolve()
+_sse_path = (_sse_tmp_root / "e2e-sse-capture.txt").resolve()
+if not _sse_path.is_relative_to(_sse_tmp_root):
+    raise SystemExit("SSE capture dosyasi temp kokunun disina tasiyor")
+sse_file = str(_sse_path)
+sse_fh = _sse_path.open("w", encoding="utf-8")
 
 
 def sse_listener():
-    with open(sse_file, "w") as fh:
-        subprocess.run(
-            ["curl", "-sN", "-m", "90", "-H", f"Authorization: Bearer {os.environ.get('E2E_API_KEY', '')}", f"{BASE}/api/stream?XTransformPort={PORT}"],
-            stdout=fh, stderr=subprocess.DEVNULL, timeout=100,
-        )
+    subprocess.run(
+        ["curl", "-sN", "-m", "90", "-H", f"Authorization: Bearer {os.environ.get('E2E_API_KEY', '')}", f"{BASE}/api/stream?XTransformPort={PORT}"],
+        stdout=sse_fh, stderr=subprocess.DEVNULL, timeout=100,
+    )
 
 
 sse_thread = threading.Thread(target=sse_listener, daemon=True)
@@ -441,9 +467,15 @@ check("bot-events", len(evs) >= 3, f"n={len(evs)}")
 # SSE captured lifecycle events (BOT_STATE from PAUSE/START/CLOSE_ALL are deterministic)
 time.sleep(2)
 try:
-    sse_txt = open(sse_file).read()
+    sse_fh.flush()
+    sse_txt = _sse_path.read_text(encoding="utf-8")
 except Exception:
     sse_txt = ""
+finally:
+    try:
+        sse_fh.close()
+    except Exception:
+        pass
 check("sse-lifecycle-events", "BOT_STATE" in sse_txt,
       f"bytes={len(sse_txt)} head={sse_txt[:100]!r}")
 
@@ -611,8 +643,10 @@ section("T11 VAULT — zero-withdrawal gate (live Bybit permission scan)")
 s, j = req("POST", "/api/vault/keys", {
     "venue": "BYBIT",
     "label": "e2e-invalid",
-    "api_key": "e2e-invalid-api-key-000000000000000000",
-    "api_secret": "e2e-invalid-api-secret-0000000000000000000",
+    # Vault ret yolu testi: kasitli GECERSIZ dummy degerler — gercek kimlik
+    # bilgisi degildir; beklenen tek yanit 422'dir. Ortamla ezilebilir.
+    "api_key": os.environ.get("E2E_DUMMY_KEY", "e2e-invalid-" + "k" * 18),
+    "api_secret": os.environ.get("E2E_DUMMY_SECRET", "e2e-invalid-" + "s" * 19),
 })
 check("vault-invalid-422", s == 422, f"status={s}")
 check("vault-error-body", bool(str(j.get("_raw") or j.get("error") or "")), f"body={str(j)[:120]}")

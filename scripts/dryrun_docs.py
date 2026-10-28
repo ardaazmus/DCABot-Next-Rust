@@ -1,9 +1,41 @@
 """One-shot: Faz 1.1 kayitlari (roadmap + envanter + worklog)."""
 
-R_OLD = '| 1.1 | Dry-run (`v3: /api/live/dryrun`'
-assert R_OLD in open("docs/YOL_HARITASI_KALAN.md", encoding="utf-8").read()
+import os
+import pathlib
 
-with open("docs/YOL_HARITASI_KALAN.md", encoding="utf-8") as f:
+# Belge yollari script konumundan cozunur ve izin-listesine hapsedilir
+# (path traversal guard: yalniz adlandirilmis docs dosyalari yazilabilir).
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_DOC_ROOT = os.path.realpath(os.path.join(_PROJECT_ROOT, "docs"))
+_ALLOWED_DOCS = frozenset({"YOL_HARITASI_KALAN.md", "ENVANTER_H_V3_PORT.md"})
+_ALLOWED_ROOT = frozenset({"worklog.md"})
+
+
+def _jail_path(base: str, allowed: frozenset, name: str) -> str:
+    if name not in allowed:
+        raise SystemExit(f"izinli liste disinda: {name}")
+    p = os.path.realpath(os.path.join(base, name))
+    if p != base and not p.startswith(base + os.sep):
+        raise SystemExit(f"yol kokunun disinda: {p}")
+    return p
+
+
+def _doc_path(name: str) -> str:
+    return _jail_path(_DOC_ROOT, _ALLOWED_DOCS, name)
+
+
+def _root_path(name: str) -> str:
+    return _jail_path(_PROJECT_ROOT, _ALLOWED_ROOT, name)
+
+
+ROADMAP_MD = _doc_path("YOL_HARITASI_KALAN.md")
+ENVANTER_MD = _doc_path("ENVANTER_H_V3_PORT.md")
+WORKLOG_MD = _root_path("worklog.md")
+
+R_OLD = '| 1.1 | Dry-run (`v3: /api/live/dryrun`'
+assert R_OLD in open(ROADMAP_MD, encoding="utf-8").read()
+
+with open(ROADMAP_MD, encoding="utf-8") as f:
     ym = f.read()
 start = ym.index(R_OLD)
 end = ym.index("\n", start)
@@ -17,12 +49,11 @@ ym = ym[:start] + (
     "Dogrulama: dca_server 17/17 (7 yeni) + workspace 229/229; canli E2E BUY->tickDown/SELL->tickUp, "
     "MARKET+quote ok:true, minQty/minNotional ret (buyutmesiz), eksik alan 422; tarayici: panel GONDERILEBILIR rozeti + hizalama satiri. |"
 ) + ym[end:]
-with open("docs/YOL_HARITASI_KALAN.md", "w", encoding="utf-8", newline="") as f:
-    f.write(ym)
+pathlib.Path(ROADMAP_MD).write_text(ym, encoding="utf-8", newline="")
 print("ok: roadmap")
 
 E_OLD = "| Dry-run (0-risk filtre dogrulama) | **YOK** | Port adayi **P3** |"
-with open("docs/ENVANTER_H_V3_PORT.md", encoding="utf-8") as f:
+with open(ENVANTER_MD, encoding="utf-8") as f:
     en = f.read()
 assert E_OLD in en, "envanter anchor yok"
 en = en.replace(
@@ -30,8 +61,7 @@ en = en.replace(
     "| Dry-run (0-risk filtre dogrulama) | **VAR** | `POST /api/live/dryrun` (M08, sent:false, fail-closed) "
     "+ Studio \"0-Risk Dene\" paneli; Binance `exchangeInfo` artik sembol-filtreli cekiliyor (hizli) + venue-nitelikli onbellek (Faz 1.1) |",
 )
-with open("docs/ENVANTER_H_V3_PORT.md", "w", encoding="utf-8", newline="") as f:
-    f.write(en)
+pathlib.Path(ENVANTER_MD).write_text(en, encoding="utf-8", newline="")
 print("ok: envanter")
 
 WL = """
@@ -60,7 +90,8 @@ eksik alan -> 422; `sent:false` hepsinde. Tarayici (:3101 dev + gateway): 0-Risk
 Not: ara adimda Binance tam-liste cekimi 15sn+decode-hatasi verdi (yavas hat) — sembol-filtre + onbellek
 sonrasi soguk 0.5sn / onbellekli 0.1sn. Siradaki: Faz 1.2 `/api/live/status` rollup.
 """
-with open("worklog.md", "a", encoding="utf-8", newline="") as f:
+WORKLOG_MD = _root_path("worklog.md")
+with pathlib.Path(WORKLOG_MD).open("a", encoding="utf-8", newline="") as f:
     f.write(WL)
 print("ok: worklog")
 print("ALL DONE")

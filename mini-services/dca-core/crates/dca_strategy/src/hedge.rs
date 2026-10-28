@@ -263,8 +263,10 @@ impl HedgeEngine {
     /// Task 21 — hedge bacağı panel bilgisi (studio Hedge sekmesi veri sözleşmesi).
     /// unrealized PnL SON İŞLENEN BARIN mark'ı ile hesaplanır (sokak ışığı:
     /// poll döngüsü bar sonrası çalışır; canlıda ~20s tazelik).
+    /// M-17: realized panelde bot ömrü kümülatifi (deals_closed ile aynı pencere);
+    /// M18 combined exit matematiği leg_pnl üzerinden deal-bazlı mirror'la devam eder.
     fn leg_info(&self, id: &str, leg: &DcaEngine) -> HedgeLegInfo {
-        let realized = leg.mirror.realized_gross.clone();
+        let realized = leg.cum_realized_gross.clone();
         let unreal = self
             .last_mark
             .as_ref()

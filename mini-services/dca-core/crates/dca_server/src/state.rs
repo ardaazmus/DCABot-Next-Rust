@@ -203,6 +203,22 @@ impl BotRuntime {
             }
         }
         let equity_now = eq_comb.map(|x| x.to_string());
+        // M-17: unrealizedNow hedge botlarda hedge bacağını da içerir (ana +
+        // hedge bacak unrealized gross, son bar kapanış mark'ı üzerinde).
+        let unrealized_now = (|| -> Option<String> {
+            let mark = self
+                .stepper
+                .last_close
+                .as_deref()
+                .and_then(|x| dca_math::fraction::Fraction::from_any_str(x).ok())?;
+            let mut u = self.stepper.position.unrealized_gross(&mark).ok()?;
+            if let Some(hs) = &self.hedge_stepper {
+                if let Ok(hu) = hs.position.unrealized_gross(&mark) {
+                    u = u.add(&hu).ok().unwrap_or(u);
+                }
+            }
+            Some(u.to_string())
+        })();
         json!({
             "id": self.bot_id,
             "name": self.name,
@@ -231,13 +247,7 @@ impl BotRuntime {
             // ifadeyi nested-JSON sanır). Hedge bot: equity = ana + hedge bacak.
             "equityNow": equity_now,
             "hedgeEquityNow": hedge_equity_now,
-            "unrealizedNow": self
-                .stepper
-                .last_close
-                .as_deref()
-                .and_then(|x| dca_math::fraction::Fraction::from_any_str(x).ok())
-                .and_then(|m| self.stepper.position.unrealized_gross(&m).ok())
-                .map(|x| x.to_string()),
+            "unrealizedNow": unrealized_now,
         })
     }
 }

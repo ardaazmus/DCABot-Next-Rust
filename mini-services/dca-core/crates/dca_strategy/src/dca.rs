@@ -55,6 +55,11 @@ pub struct DcaEngine {
     pub deals_closed: usize,
     pub wins: usize,
     pub losses: usize,
+    /// M-17: bot ömrü boyunca gerçekleşen brüt PnL. Mirror deal-başı WAC
+    /// defteridir ve her yeni deal'da sıfırlanır; kümülatif realizasyon
+    /// burada devredilir (deals_closed ile aynı pencere).
+    #[serde(default)]
+    pub cum_realized_gross: Fraction,
     pub rsi_window: Vec<Fraction>,
     pub manual_close_requested: bool,
     /// True once the start condition (entry trigger) is satisfied.
@@ -118,6 +123,7 @@ impl DcaEngine {
             deals_closed: 0,
             wins: 0,
             losses: 0,
+            cum_realized_gross: Fraction::zero(),
             rsi_window: Vec::new(),
             manual_close_requested: false,
             entry_trigger_met,
@@ -338,7 +344,8 @@ impl DcaEngine {
         self.filled_safety = 0;
         self.resting_safety = 0;
         self.mirror = PositionState::new(self.direction.sign() as i8);
-        self.funding = Fraction::zero();
+        // M-17: funding kümülatiftir (snapshot `cumulative_funding` sözleşmesi);
+        // deal açılışında sıfırlanmaz — yalnızca deal-bazlı WAC mirror sıfırlanır.
         self.trailing = if self.cfg.trailing_enabled { TrailingState::Idle } else { TrailingState::Off };
         self.trailing_peak = None;
         self.manual_close_requested = false;
@@ -741,6 +748,12 @@ impl DcaEngine {
         // Deal fully closed?
         if !is_add && self.mirror.qty.is_zero() && self.phase == DcaPhase::Closing {
             let realized = self.mirror.realized_gross.clone();
+            // M-17: mirror bir sonraki deal'da sıfırlanır — kapanış realizasyonunu
+            // kümülatif deftere devretmeden kaybedilmez.
+            self.cum_realized_gross = self
+                .cum_realized_gross
+                .add(&realized)
+                .unwrap_or_else(|_| self.cum_realized_gross.clone());
             if dca_math::Fraction::cmp(&realized, &Fraction::zero()) == std::cmp::Ordering::Greater {
                 self.wins += 1;
             } else {
@@ -772,6 +785,12 @@ impl DcaEngine {
     /// Margin call: the position was force-closed at the liquidation boundary.
     /// Mirror is already flat (runner force_close); reset deal bookkeeping.
     pub fn force_liquidate(&mut self) {
+        // M-17: liquidasyon öncesi mirror'da birikmiş realizasyonu kümülatif
+        // deftere devret (mirror sıfırlansa da bot ömrü k/z'si korunur).
+        self.cum_realized_gross = self
+            .cum_realized_gross
+            .add(&self.mirror.realized_gross.clone())
+            .unwrap_or_else(|_| self.cum_realized_gross.clone());
         self.losses += 1;
         self.deals_closed += 1;
         self.phase = DcaPhase::Cooldown;
@@ -805,7 +824,9 @@ impl DcaEngine {
             trailing_state: Some(format!("{:?}", self.trailing)),
             trailing_peak: self.trailing_peak.as_ref().map(|p| self.close_str(p, 8)),
             safety_triggered: self.filled_safety,
-            realized_gross: self.mirror.realized_gross.to_half_even_display(8),
+            // M-17: bot ömrü kümülatif realizasyon (deals_closed ile aynı pencere);
+            // mirror deal-başı olduğundan artık raporlanmaz.
+            realized_gross: self.cum_realized_gross.to_half_even_display(8),
             cumulative_funding: self.funding.to_half_even_display(8),
             deals_closed: self.deals_closed,
             wins: self.wins,
@@ -1191,5 +1212,148 @@ mod signal_gate_tests {
             }),
         });
         assert!(DcaEngine::new("bad", bad, Instrument::default()).is_err());
+    }
+}
+
+/// M-17 regresyon: mirror deal-başı WAC defteridir; kümülatif realizasyon
+/// `cum_realized_gross`'ta bot ömrü boyunca taşınır. deals_closed ile
+/// realized_gross artık aynı pencereyi raporlar.
+#[cfg(test)]
+mod m17_realized_ledger_tests {
+    use super::*;
+    use dca_kernel::{Bar, OrderKind};
+    use dca_math::{Instrument, Side};
+    use dca_risk::FillRealism;
+
+    fn bar(t: i64, c: &str) -> Bar {
+        Bar { t, o: c.into(), h: c.into(), l: c.into(), c: c.into(), v: "10".into() }
+    }
+
+    fn ctx<'a>(bar: &'a Bar, close: Fraction) -> BarContext<'a> {
+        let qty: &'static Fraction = Box::leak(Box::new(Fraction::zero()));
+        let cash: &'static Fraction = Box::leak(Box::new(Fraction::from_u64(1_000_000)));
+        BarContext {
+            bar,
+            open: close.clone(),
+            high: close.clone(),
+            low: close.clone(),
+            close: close.clone(),
+            position_qty: qty,
+            position_avg: None,
+            cash,
+            mark: close,
+            signal_ok: None,
+            regime: None,
+            deal_open_blocked: false,
+        }
+    }
+
+    fn fill(id: &str, role: &str, side: Side, kind: OrderKind, price: &str, qty: &str, ts: i64) -> FillRecord {
+        FillRecord {
+            fill_key: format!("{id}-{ts}"),
+            order_id: id.to_string(),
+            role: role.to_string(),
+            side,
+            kind,
+            price: Fraction::from_decimal_str(price).unwrap(),
+            qty: Fraction::from_decimal_str(qty).unwrap(),
+            fee: Fraction::zero(),
+            fee_role: dca_kernel::FeeRole::Maker,
+            realism: FillRealism::MarketableTaker,
+            ts,
+        }
+    }
+
+    /// Bir deal'i uçtan uca yürüt: BASE fill + request_close_all + MANUAL reduce fill.
+    fn run_deal(e: &mut DcaEngine, base_px: &str, close_px: &str, qty: &str, t: i64) {
+        let acts = e.on_bar(&ctx(&bar(t, base_px), Fraction::from_decimal_str(base_px).unwrap()));
+        let base_id = acts
+            .iter()
+            .find_map(|a| match a {
+                Action::PlaceMarket { id, role: "BASE", .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("base order");
+        let (side, kind) = match e.direction {
+            Direction::Long => (Side::Buy, OrderKind::Add),
+            Direction::Short => (Side::Sell, OrderKind::Add),
+        };
+        e.on_fill(&fill(&base_id, "BASE", side, kind, base_px, qty, t));
+        assert_eq!(e.phase, DcaPhase::Open);
+        e.request_close_all();
+        let acts = e.on_bar(&ctx(&bar(t + 1, close_px), Fraction::from_decimal_str(close_px).unwrap()));
+        // close_px TP eşiğinin üstündeyse motor TP, altındaysa MANUAL rolüyle kapatır.
+        let (close_id, close_role) = acts
+            .iter()
+            .find_map(|a| match a {
+                Action::PlaceMarket { id, role, .. } if matches!(*role, "MANUAL" | "TP") => {
+                    Some((id.clone(), *role))
+                }
+                _ => None,
+            })
+            .expect("close order (MANUAL/TP)");
+        let (side, kind) = match e.direction {
+            Direction::Long => (Side::Sell, OrderKind::Reduce),
+            Direction::Short => (Side::Buy, OrderKind::Reduce),
+        };
+        e.on_fill(&fill(&close_id, close_role, side, kind, close_px, qty, t + 1));
+        assert_eq!(e.phase, DcaPhase::Cooldown);
+    }
+
+    #[test]
+    fn realized_gross_is_cumulative_across_deals() {
+        let mut e = DcaEngine::new("m17", BotConfig::default(), Instrument::default()).unwrap();
+        // Deal 1: 100'te aç, 90'da kapat → realized = (90-100)*1 = -10
+        run_deal(&mut e, "100", "90", "1", 1_000);
+        assert_eq!(e.deals_closed, 1);
+        assert_eq!(e.losses, 1);
+        assert_eq!(e.snapshot().realized_gross, "-10.00000000");
+
+        // Deal 2: mirror sıfırlandı ama kümülatif korundu (M-17 bulgusu).
+        run_deal(&mut e, "90", "95", "1", 2_000);
+        assert_eq!(e.deals_closed, 2);
+        assert_eq!(e.wins, 1);
+        // -10 + (95-90)*1 = -5
+        assert_eq!(e.snapshot().realized_gross, "-5.00000000");
+    }
+
+    #[test]
+    fn force_liquidate_carries_mirror_realized_to_cumulative() {
+        let mut e = DcaEngine::new("m17l", BotConfig::default(), Instrument::default()).unwrap();
+        let acts = e.on_bar(&ctx(&bar(1_000, "100"), Fraction::from_u64(100)));
+        let base_id = acts
+            .iter()
+            .find_map(|a| match a {
+                Action::PlaceMarket { id, role: "BASE", .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("base order");
+        e.on_fill(&fill(&base_id, "BASE", Side::Buy, OrderKind::Add, "100", "1", 1_000));
+        // Kısmi bir realizasyon oluşmuş olsun (reduce ile mirror'da birikmiş).
+        e.on_fill(&fill("seed-reduce", "SAFETY", Side::Sell, OrderKind::Reduce, "110", "1", 1_001));
+        assert_eq!(e.mirror.realized_gross.to_string(), "10");
+        assert!(e.mirror.qty.is_zero(), "tam kapanış mirror'ı flat bırakır");
+        e.cum_realized_gross = Fraction::zero();
+        e.force_liquidate();
+        assert_eq!(e.snapshot().realized_gross, "10.00000000");
+        assert_eq!(e.deals_closed, 1);
+    }
+
+    #[test]
+    fn funding_is_cumulative_across_deals() {
+        let mut e = DcaEngine::new("m17f", BotConfig::default(), Instrument::default()).unwrap();
+        e.apply_funding(&Fraction::from_decimal_str("1.5").unwrap());
+        run_deal(&mut e, "100", "95", "1", 1_000);
+        // Yeni deal açıldı; funding sıfırlanmamalı (M-17: kümülatif sözleşme).
+        assert_eq!(e.snapshot().cumulative_funding, "1.50000000");
+    }
+
+    #[test]
+    fn legacy_runtime_state_without_cum_field_deserializes() {
+        let e = DcaEngine::new("m17s", BotConfig::default(), Instrument::default()).unwrap();
+        let mut v = serde_json::to_value(&e).unwrap();
+        v.as_object_mut().unwrap().remove("cum_realized_gross");
+        let e2: DcaEngine = serde_json::from_value(v).unwrap();
+        assert!(e2.cum_realized_gross.is_zero(), "eski persist kayıtları default 0 ile açılmalı");
     }
 }

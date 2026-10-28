@@ -130,6 +130,8 @@ export interface Bot {
   leverage?: string;
   imUsed?: string;
   liqPrice?: string | null;
+  /** Açık pozisyonun son bar kapanış mark'ı üzerindeki unrealized gross PnL (ana + hedge bacak; mark yoksa null). */
+  unrealizedNow?: string | null;
   /** TradingView webhook secret — present when the bot accepts external START_DEAL signals. */
   webhookSecret?: string | null;
   /** BotConfig snapshot as stored by the engine (present since 15-a wire update; optional for older snapshots). */

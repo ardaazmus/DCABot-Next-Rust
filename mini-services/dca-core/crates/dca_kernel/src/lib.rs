@@ -522,6 +522,13 @@ impl SimulationStepper {
             self.cash = self.cash.add(&notional.sub(&fee).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         }
         self.cumulative_fees = self.cumulative_fees.add(&fee).map_err(|e| e.to_string())?;
+        // M-17: `realized_net` kalıcı alan — net_realized() ile aynı tanımda
+        // tutulur; eski davranışta hiç güncellenmiyor, persist hep 0 yazıyordu.
+        self.realized_net = self
+            .position
+            .realized_gross
+            .sub(&self.cumulative_fees)
+            .unwrap_or_else(|_| self.realized_net.clone());
         self.filled_qty_this_bar = self.filled_qty_this_bar.add(&order.qty).unwrap_or_else(|_| self.filled_qty_this_bar.clone());
         let rec = FillRecord {
             fill_key,
