@@ -1661,6 +1661,14 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
             }
         }
 
+        "RESET_KERNEL" => {
+            // P0-2: sticky kernel halt'ın AÇIK kurtarma ucu — GATE1 Halt
+            // (gerçek veri bozulması) sonrası operatör buradan açar.
+            rt.stepper.halted = None;
+            rt.stepper.prev_bar_ts = None;
+            rt.stepper.bar_interval_ms = 0;
+            state::persist_event(&app, &id, "WARN", "RESET_KERNEL", "kernel halt temizlendi — imleç sıfırlandı, bir sonraki kapalı bardan warmup ile devam").await;
+        }
         other => return Err(err422(format!("unknown action: {other}"))),
     }
     // Task 18 N-4: kritik status yazımı retry + stderr ile (sessiz yutma yok).

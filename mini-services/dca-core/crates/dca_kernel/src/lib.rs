@@ -130,8 +130,8 @@ pub struct SimulationStepper {
     pub fills: Vec<FillRecord>,
     pub gate_logs: Vec<GateLog>,
     pub halted: Option<String>,
-    prev_bar_ts: Option<i64>,
-    bar_interval_ms: i64,
+    pub prev_bar_ts: Option<i64>,
+    pub bar_interval_ms: i64,
     filled_qty_this_bar: Fraction,
     current_bar_ts: i64,
     pub last_close: Option<String>,
@@ -217,7 +217,23 @@ impl SimulationStepper {
         let verdict = gate1_bar_integrity(self.prev_bar_ts, bar.t, &o, &h, &l, &c, &v, self.bar_interval_ms);
         self.log_gate(ts_ms, "GATE1", &verdict);
         match &verdict {
-            GateVerdict::Halt(reason) | GateVerdict::Reject(reason) => {
+            GateVerdict::Halt(reason) => {
+                // P0-2: Halt yalnız GERÇEK veri bozulmasına (OHLC/negatif/monotonik)
+                // ayrıldı — kalıcıdır, RESET_KERNEL action ile açılır.
+                self.halted = Some(reason.clone());
+                return Err(reason.clone());
+            }
+            GateVerdict::Reject(reason) if reason.contains("interval gap") => {
+                // P0-2: veri boşluğu (PAUSE→START, borsa bakımı, uzun kesinti)
+                // artık sticky halt DEĞİL — "skip & resync": imleç son kapanmış
+                // bara hizalanır, interval yeniden öğrenilir, bu bar işlenir
+                // (Freqtrade startup/resync yaklaşımı). Uygulama GATE1 resync'i
+                // kendisi loglar (WARN advisory).
+                self.log_gate(ts_ms, "GATE1", &GateVerdict::Pass);
+                self.log_advisory(ts_ms, "GATE1", "INTERVAL_RESYNC", &format!(
+                    "veri boşluğu saptandı ({}) — imleç son kapanmış bara hizalandı, işlem sürüyor", reason));
+            }
+            GateVerdict::Reject(reason) => {
                 self.halted = Some(reason.clone());
                 return Err(reason.clone());
             }
