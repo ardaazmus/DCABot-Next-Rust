@@ -751,19 +751,27 @@ mod tests {
     /// (panic/unwind yolunda da) anahtar baytlarını sıfırlar.
     #[test]
     fn signing_key_scrubbed_after_use() {
-        use zeroize::Zeroizing;
-        let ptr: *const u8;
-        let len: usize;
-        {
-            let guard = Zeroizing::new(vec![0xABu8; 32]);
-            ptr = guard.as_ptr();
-            len = guard.len();
-            // guard burada drop olur → önce zeroize, sonra free.
-        }
-        // Best-effort okuma: allocator sayfayı geri almadıysa son yazılan
-        // (sıfırlar) görülür; sıfır değilse zarf çalışmıyor demektir.
-        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-        assert!(bytes.iter().all(|&b| b == 0), "imza anahtarı drop sonrası sıfırlanmalı");
+        // Faz 21 (CI düzeltmesi): ESKİ test drop SONRASI serbest belleği
+        // `from_raw_parts` ile okuyordu — use-after-free okuma = UB; Windows
+        // allocator'ı tesadüfen sıfır bıraktığından geçer, Linux glibc ezince
+        // CI'da kırıldı. Yeni hali UB'siz ve deterministiktir: Zeroizing'in
+        // (1) `zeroize()` çağrısının canlı tamponu sıfırladığını doğrular;
+        // (2) drop yolundaki sıfırlama, Zeroizing tipinin belgelenmiş
+        // sözleşmesidir (zeroize crate'inin kendi testleriyle kanıtlı —
+        // P3-4'ün fiili mekanizması budur; serbest bellek okumak değil).
+        use zeroize::{Zeroize, Zeroizing};
+        // (1) zeroize() canlı tamponu sıfırlar — sabit-uzunluk dizi üzerinde
+        // (Vec impl'i sıfırlama sonrası length'i de sıfırlar; imza anahtarı
+        // gerçek dünyada [u8; N] taşınır, uzunluk korunumu dizi impl'idir).
+        let mut key: [u8; 32] = [0xAB; 32];
+        key.zeroize();
+        assert!(key.iter().all(|&b| b == 0), "zeroize() çağrısı anahtar baytlarını sıfırlamalı");
+        // (2) Zeroizing zarfı drop yolunda aynı impl'i çağırır — zarf tipi
+        // derleme-zamanı sözleşme testi; crate'in kendi testleri drop
+        // davranışını kanıtlar.
+        let guard = Zeroizing::new([0xCDu8; 32]);
+        assert_eq!(guard.len(), 32);
+        drop(guard);
     }
 
     /// Faz 2.7 kilit test: CANLI Bybit `risk-limit` yanıtından doğrulanmış

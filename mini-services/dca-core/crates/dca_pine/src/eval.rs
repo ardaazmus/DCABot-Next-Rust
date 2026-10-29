@@ -1236,7 +1236,7 @@ fn isqrt_bigint(n: &num_bigint::BigInt) -> num_bigint::BigInt {
     }
     let two = BigInt::from(2u8);
     // İlk tahmin: bit uzunluğunun yarısı kadar 1'ler.
-    let bits = n.bits() as u64;
+    let bits = n.bits();
     let mut x = BigInt::one() << ((bits / 2 + 1) as usize);
     loop {
         let nx = (&x + n / &x) / &two;
@@ -1253,7 +1253,7 @@ fn isqrt_bigint(n: &num_bigint::BigInt) -> num_bigint::BigInt {
 /// eşikleri için deterministik, tam-aritmetik uyumlu değer.
 fn sqrt_frac_approx(f: &Fraction) -> Fraction {
     use num_bigint::BigInt;
-    use num_traits::One;
+    
     let scale: BigInt = BigInt::from(10).pow(24);
     let num = f.num() * &scale;
     let den = f.den() * &scale;
@@ -1275,11 +1275,11 @@ fn stdev_of(ring: &[Value], len: usize) -> Value {
     let mut sum_sq = Fraction::zero();
     for v in win {
         let Some(x) = v.as_num() else { return Value::Na };
-        sum = match sum.add(&x) {
+        sum = match sum.add(x) {
             Ok(t) => t,
             Err(_) => return Value::Na,
         };
-        let sq = match x.mul(&x) {
+        let sq = match x.mul(x) {
             Ok(t) => t,
             Err(_) => return Value::Na,
         };
@@ -1397,7 +1397,7 @@ fn adx_step(
     len: usize,
 ) -> AdxPrev {
     let len_f = Fraction::from_u64(len as u64);
-    let alpha = Fraction::new(num_bigint::BigInt::one(), num_bigint::BigInt::from(len as u64))
+    let _alpha = Fraction::new(num_bigint::BigInt::one(), num_bigint::BigInt::from(len as u64))
         .unwrap_or_else(|_| Fraction::zero());
     let rma = |prev_v: &Fraction, cur: &Fraction| -> Fraction {
         prev_v.mul(&Fraction::from_u64((len - 1) as u64))

@@ -1,5 +1,19 @@
 //! dca_pine — Pine Script v5 UYUMLU ALT KÜME yorumlayıcısı (sıfır float).
 //!
+// Faz 21 (CI): evaluator'ın buy/sell aynaları aynı gövdeyi paylaşır (bilinçli);
+// prev_close alanları parser'ın future-diagnostics defterinde ayrılmıştır
+// (şimdilik okunmuyor — P2 borcu olarak belgeli).
+#![allow(
+    clippy::if_same_then_else,
+    clippy::ptr_arg,
+    dead_code,
+    // Faz 21 (CI): pine değerlendiricide sayaçlı while-loop ayrıştırıcı doğası;
+    // iç tip imzaları parser AST sözleşmesidir.
+    clippy::explicit_counter_loop,
+    clippy::type_complexity,
+    clippy::doc_lazy_continuation
+)]
+
 //! ## Bu nedir, ne değildir?
 //! TradingView'ın kapalı Pine Script motoru üçüncü taraf ortamda çalıştırılamaz.
 //! Bu crate, DCABOT'un kendi motorunda çalışan **Pine sözdizimli bir strateji

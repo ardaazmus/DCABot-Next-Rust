@@ -1,5 +1,18 @@
 //! dca_signals — deterministic technical-indicator + signal-condition engine.
 //!
+// Faz 21 (CI): indikatör formülleri (ADX/ATR/RSI/stoch) klasik index-loop
+// gösterimiyle yazıldı — iter zincirleri formül okunabilirliğini bozar;
+// enum varyant boyut farkı tip sözleşmesinden (Signal vs Regime payload).
+#![allow(
+    clippy::needless_range_loop,
+    clippy::large_enum_variant,
+    // Faz 21 (CI): hata mesajında enum debug adı biçimlenir (tek kullanım);
+    // LCG seed sabiti bitwise okunurluk için gruplanmıştır.
+    clippy::format_in_format_args,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation
+)]
+
 //! This crate is a FILTERING/METRICS crate: it deliberately uses `f64` for indicator
 //! math (per customer specification). Money accounting stays in `dca_math` rationals.
 //!

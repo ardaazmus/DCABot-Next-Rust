@@ -1,5 +1,9 @@
 //! dca_math — canonical zero-float quantitative library (M01–M20 normative specs).
 
+// Faz 21 (CI): M02/M03/M07/M15 matematik imzaları normatif speç sözleşmesidir —
+// parametre sayısı domain dilini yansıtır; sarmalama struct'ı API kırıcı olur.
+#![allow(clippy::too_many_arguments)]
+
 pub mod fraction;
 pub mod instrument;
 pub mod m02;

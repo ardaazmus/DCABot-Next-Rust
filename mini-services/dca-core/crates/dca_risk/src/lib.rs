@@ -2,6 +2,11 @@
 //! Pure, deterministic gate functions consumed by dca_kernel's SimulationStepper.
 //! No gate may be bypassed; any FAIL halts the cycle or rejects the order intent.
 
+
+// Faz 21 (CI): gate fonksiyonları side-mirror aynalarıdır (Buy/Sell koşulları
+// simetrik, gövdeler ortak) ve kapı imzaları 8-10 parametreli normatif speç
+// sözleşmesidir — sarmalama API kırıcı olur.
+#![allow(clippy::too_many_arguments, clippy::if_same_then_else)]
 use dca_math::fraction::Fraction;
 use dca_math::sessions::{in_opening_salvo_buffer, is_market_open, SessionType};
 use serde::{Deserialize, Serialize};
@@ -116,8 +121,8 @@ pub fn gate4_no_lookahead(order_eligible_ts: i64, current_bar_close_ts: i64) -> 
 ///   Teğet dokunuş (low == limit) DOLMAZ — dokümanlanmış RESTING_TOUCH semantiği.
 /// - `optimistic_touch = true` (OPTIMISTIC/legacy): teğet dokunuş (low == limit)
 ///   dolmuş sayılır; canlı borsada bu emirlerin çoğu dolmaz.
-/// OpenGapBetter (open zaten limitin ötesinde/üstünde açıldı) her iki modda da
-/// açılış fiyatından dolar — borsa açılışında emir zaten piyasa fiyatındadır.
+/// - OpenGapBetter (open zaten limitin ötesinde/üstünde açıldı) her iki modda da
+///   açılış fiyatından dolar — borsa açılışında emir zaten piyasa fiyatındadır.
 #[allow(clippy::too_many_arguments)]
 pub fn gate5_limit_realism(
     side: dca_math::Side,
@@ -235,7 +240,7 @@ pub enum CapitalShortfallMode {
 /// Gate 7 — Session & macro blackout: new risk intents rejected when closed;
 /// risk-reducing exits stay protected.
 pub fn gate7_session_guard(session: SessionType, ts_ms: i64, macro_blackout: bool, is_risk_reducing: bool) -> GateVerdict {
-    let ts = chrono::DateTime::from_timestamp_millis(ts_ms).unwrap_or_else(|| chrono::Utc::now());
+    let ts = chrono::DateTime::from_timestamp_millis(ts_ms).unwrap_or_else(chrono::Utc::now);
     if is_risk_reducing {
         return GateVerdict::Pass; // TP/SL/reduce always protected
     }
@@ -277,11 +282,10 @@ pub fn daily_dd_breaker_threshold(pct_str: &str) -> Fraction {
 }
 
 pub fn gate8_gap_protection(is_safety_order: bool, ts_ms: i64) -> Gate8Outcome {
-    if in_opening_salvo_buffer(chrono::DateTime::from_timestamp_millis(ts_ms).unwrap_or_else(|| chrono::Utc::now())) {
-        if is_safety_order {
+    if in_opening_salvo_buffer(chrono::DateTime::from_timestamp_millis(ts_ms).unwrap_or_else(chrono::Utc::now))
+        && is_safety_order {
             return Gate8Outcome::DeferOpeningSalvo;
         }
-    }
     Gate8Outcome::Clear
 }
 

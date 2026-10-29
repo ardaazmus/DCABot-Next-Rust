@@ -2,6 +2,24 @@
 //! driving the single-event kernel. Strategies cannot distinguish simulation
 //! from live except through explicit port injection (ADR-001).
 
+// Faz 21 (CI): i8 yön sabitleri kasıtlı i8->i8 cast (sign sözleşmesi);
+// BacktestResult varyant boyut farkı rapor payload'ından; certify'in
+// next_f64/total_return alanları diagnostic API yüzeyi (şimdilik okunmuyor).
+#![allow(
+    clippy::unnecessary_cast,
+    clippy::large_enum_variant,
+    dead_code,
+    // Faz 21 (CI): test kurulumlarında Default + alan-ataması okunabilirliği
+    // (13 test builder'ı); aralık kontrolü açık `x >= a && x <= b` biçiminde
+    // kalır (clamp'in max<min panik sözleşmesi devreye girmez); certify
+    // sabitlerinde tam f64 hassasiyeti bilinçlidir.
+    clippy::field_reassign_with_default,
+    clippy::manual_range_contains,
+    clippy::excessive_precision,
+    clippy::empty_line_after_doc_comments,
+    clippy::unnecessary_lazy_evaluations,
+)]
+
 pub mod advisory;
 pub mod backtest;
 pub mod certify;

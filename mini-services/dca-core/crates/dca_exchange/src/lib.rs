@@ -2,6 +2,10 @@
 //! Binance secondary, Paper venue for simulation. Includes M16 reconciliation
 //! helpers and the Zero-Withdrawal hard gate validation.
 
+// Faz 21 (CI): limit.min(1000).max(1) min<max sabitlerle güvenlidir; clamp
+// geçişi clamp(max<min) panik sözleşmesini tartışmaya açar — bu biçim kalır.
+#![allow(clippy::manual_clamp)]
+
 pub mod binance;
 pub mod bybit;
 pub mod okx;

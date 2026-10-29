@@ -63,7 +63,7 @@ pub fn qty_down(q: &Fraction, step: &Fraction) -> Result<Fraction, MathError> {
 #[allow(clippy::too_many_arguments)]
 pub fn build_dca_plan(
     anchor_p0: &Fraction,
-    base_qty: &Fraction,
+    _base_qty: &Fraction,
     safety_quote_size_or_qty: &Fraction,
     deviation_pct: &Fraction,
     step_scale: &Fraction,

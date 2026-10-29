@@ -3,7 +3,7 @@
 //! M20 — Stop-loss to safety-ladder conflict detector.
 
 use crate::fraction::{Fraction, MathError};
-use crate::m02::{tick_down, tick_up, Direction};
+use crate::m02::Direction;
 
 /// M15 — Arithmetic mesh: P_j = lower + j * (upper - lower)/n, exact rational.
 pub fn arithmetic_mesh(lower: &Fraction, upper: &Fraction, n: usize) -> Result<Vec<Fraction>, MathError> {

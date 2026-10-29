@@ -1,3 +1,6 @@
+// Faz 21 (CI): test builder'ları Default + alan-ataması ile kurulur (okunabilirlik).
+#![cfg_attr(test, allow(clippy::field_reassign_with_default))]
+
 //! dca_kernel — Single Event Kernel (Backtest = Paper = Live, ADR-001).
 //! SimulationStepper drives bar-by-bar execution through the 8 fail-closed gates.
 //! Task 16: korumalar UserRiskPolicy ile ZORUNLU veya UYARI+İZİN modunda çalışır
@@ -495,22 +498,19 @@ impl SimulationStepper {
             // Gate 8 — opening salvo tamponu (policy-aware). Faz 18 (P1-14):
             // gap-through birleştirme kaldırıldı; gerçek birleştirme aşağıdaki
             // Gate 8b gap_batch yolunda gerçek adet + sentetik VWAP ile yapılır.
-            match gate8_gap_protection(order.role == "SAFETY", ts_ms) {
-                dca_risk::Gate8Outcome::DeferOpeningSalvo => {
-                    if order.role == "SAFETY" && self.cfg.policy.opening_salvo_buffer.is_permissive() {
-                        self.log_advisory(
-                            ts_ms,
-                            "GATE8",
-                            "OPENING_SALVO_BYPASS",
-                            "Açılış salvo tamponu kullanıcı tarafından devre dışı — ilk 5 dakika (09:30–09:35 ET, spread 550 bps'e kadar) içinde emir gönderiliyor; sahte fitil riski üstlenildi",
-                        );
-                        // proceed
-                    } else {
-                        self.pending.push(order);
-                        continue;
-                    }
+            if let dca_risk::Gate8Outcome::DeferOpeningSalvo = gate8_gap_protection(order.role == "SAFETY", ts_ms) {
+                if order.role == "SAFETY" && self.cfg.policy.opening_salvo_buffer.is_permissive() {
+                    self.log_advisory(
+                        ts_ms,
+                        "GATE8",
+                        "OPENING_SALVO_BYPASS",
+                        "Açılış salvo tamponu kullanıcı tarafından devre dışı — ilk 5 dakika (09:30–09:35 ET, spread 550 bps'e kadar) içinde emir gönderiliyor; sahte fitil riski üstlenildi",
+                    );
+                    // proceed
+                } else {
+                    self.pending.push(order);
+                    continue;
                 }
-                _ => {}
             }
             // Task 16 Gate 8b — gap-through SAFETY adds batch (aynı bar, aynı açılış fiyatı)
             if realism == FillRealism::OpenGapBetter && order.kind == OrderKind::Add && order.role == "SAFETY" {
@@ -821,9 +821,7 @@ impl SimulationStepper {
         self.position
             .realized_gross
             .sub(&self.realized_fees)
-            .and_then(|x| x.sub(&self.cumulative_funding))
-            .map_err(Into::into)
-    }
+            .and_then(|x| x.sub(&self.cumulative_funding))}
 
     pub fn equity(&self, mark: &Fraction) -> Result<Fraction, MathError> {
         if self.cfg.is_spot {
@@ -835,8 +833,7 @@ impl SimulationStepper {
         } else {
             let u = self.position.unrealized_gross(mark)?;
             // margin mode: cash excludes committed IM — add it back
-            self.cash.add(&self.im_used).and_then(|x| x.add(&u)).map_err(Into::into)
-        }
+            self.cash.add(&self.im_used).and_then(|x| x.add(&u))}
     }
 
     /// Free collateral = cash (margin mode) — what G6 checks against new IM.

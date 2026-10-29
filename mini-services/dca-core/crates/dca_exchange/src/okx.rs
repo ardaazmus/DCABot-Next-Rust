@@ -136,7 +136,7 @@ fn sign_base64(secret: &str, prehash: &str) -> String {
 
 fn base64_encode(bytes: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
@@ -646,7 +646,7 @@ impl VenueAdapter for OkxAdapter {
             if ct.is_zero() {
                 (raw_qty, raw_fill)
             } else {
-                (raw_qty.div(&ct).unwrap_or_else(|_| raw_qty), raw_fill.div(&ct).unwrap_or_else(|_| raw_fill))
+                (raw_qty.div(&ct).unwrap_or(raw_qty), raw_fill.div(&ct).unwrap_or(raw_fill))
             }
         } else {
             (raw_qty, raw_fill)

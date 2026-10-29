@@ -9,6 +9,8 @@ use dca_math::fraction::Fraction;
 use dca_math::Instrument;
 use serde::{Deserialize, Serialize};
 
+// Euler–Mascheroni sabiti std::f64::consts'ta YOK — değer referans kaynaklidir.
+#[allow(clippy::approx_constant)]
 const EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

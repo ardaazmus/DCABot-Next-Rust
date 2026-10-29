@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn stoch_bounds_on_random_walk() {
         // Seeded LCG (no rand crate) → deterministic pseudo-random walk.
-        let mut seed = 0x2B_992D_DF_A5u64;
+        let mut seed = 0x2B_992D_FA5u64;
         let mut next = || {
             seed = seed
                 .wrapping_mul(6364136223846793005)

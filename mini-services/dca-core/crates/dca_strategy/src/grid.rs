@@ -540,7 +540,6 @@ mod start_condition_tests {
         cfg.grid_trail = true;
         let mut g = GridEngine::new("g", cfg, Instrument::default(), &Fraction::from_u64(100)).expect("grid");
         g.bootstrap(&Fraction::from_u64(100));
-        let old_bottom = g.mesh[0].clone();
         let old_top = g.mesh[g.mesh.len() - 1].clone();
         let placed = g.placed_ids.len();
         assert!(placed > 0, "bootstrap must register placed ids");

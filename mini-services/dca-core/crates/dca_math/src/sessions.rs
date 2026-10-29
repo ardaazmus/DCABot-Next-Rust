@@ -3,7 +3,7 @@
 //! daily 22:00–23:00 UTC pause), 24_7_CRYPTO. NYSE holidays computed via Meeus/Jones/Butcher
 //! Easter algorithm — no hardcoded year tables. TradFi daily borrow interest: N * rate / 360.
 
-use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,7 +116,7 @@ pub fn is_market_open(session: SessionType, ts: DateTime<Utc>) -> bool {
             let wd = ts.weekday().num_days_from_monday(); // Mon=0..Sun=6
             let (h, m) = (ts.hour(), ts.minute());
             let mins = h * 60 + m;
-            let daily_pause = mins >= 22 * 60 && mins < 23 * 60;
+            let daily_pause = (22 * 60..23 * 60).contains(&mins);
             // Opens Sun 23:00 UTC (wd=6) → Fri 22:00 UTC (wd=4)
             match wd {
                 5 => false, // Saturday closed
@@ -138,7 +138,7 @@ pub fn is_market_open(session: SessionType, ts: DateTime<Utc>) -> bool {
             let off = us_eastern_utc_offset_seconds(date);
             let local = ts + Duration::seconds(off);
             let mins = local.hour() * 60 + local.minute();
-            (9 * 60 + 30) <= mins && mins < 16 * 60
+            ((9 * 60 + 30)..16 * 60).contains(&mins)
         }
     }
 }
@@ -149,7 +149,7 @@ pub fn in_opening_salvo_buffer(ts: DateTime<Utc>) -> bool {
     let off = us_eastern_utc_offset_seconds(date);
     let local = ts + Duration::seconds(off);
     let mins = local.hour() * 60 + local.minute();
-    mins >= 9 * 60 + 30 && mins < 9 * 60 + 35
+    (9 * 60 + 30..9 * 60 + 35).contains(&mins)
 }
 
 /// TradFi daily borrow interest: N * annual_rate / 360 (exact).

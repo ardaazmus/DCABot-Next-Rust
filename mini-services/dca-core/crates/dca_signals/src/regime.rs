@@ -9,7 +9,7 @@
 //!   `CRASH_DRAWDOWN` (varsayılan %10) veya daha fazla düşükse.
 //! - YÜKSEK VOLATİLİTE: pencere içindeki bar-getirilerinin örneklem standart
 //!   sapması `VOL_STD_PER_BAR` (varsayılan %3/bar) üzeriyse.
-//! İkisinden biri tetiklenirse rejim o isimle döner; ikisi de yoksa NORMAL.
+//!   İkisinden biri tetiklenirse rejim o isimle döner; ikisi de yoksa NORMAL.
 
 use serde::{Deserialize, Serialize};
 
@@ -111,7 +111,7 @@ mod tests {
     #[test]
     fn too_little_data_is_normal() {
         assert_eq!(classify(&[100.0, 50.0]), MarketRegime::Normal);
-        assert!(classify(&[]).is_risky() == false);
+        assert!(!classify(&[]).is_risky());
     }
 
     #[test]

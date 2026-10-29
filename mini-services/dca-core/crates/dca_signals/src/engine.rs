@@ -561,7 +561,7 @@ mod tests {
         let bars = bars_from_closes(&closes, 1, 1);
         let rsi = spec(IndicatorKey::Rsi, Timeframe::M1, Some(14), None);
         let node = cond(rsi.clone(), CompareOp::Lt, SignalValue::Number(100.0));
-        let engine = SignalEngine::new(&[(Timeframe::M1, bars)], &[rsi.clone()]);
+        let engine = SignalEngine::new(&[(Timeframe::M1, bars)], std::slice::from_ref(&rsi));
         for ts in 1..=10i64 {
             assert!(!engine.evaluate_at_time(&node, ts), "warm-up must fail closed");
         }
@@ -578,7 +578,7 @@ mod tests {
             CompareOp::CrossUp,
             SignalValue::Number(0.0),
         );
-        let engine2 = SignalEngine::new(&[(Timeframe::M1, bars2)], &[price.clone()]);
+        let engine2 = SignalEngine::new(&[(Timeframe::M1, bars2)], std::slice::from_ref(&price));
         assert!(!engine2.evaluate_at_time(&cross0, 1), "idx==0 → false");
         assert!(!engine2.evaluate_at_time(&cross0, 2), "prev(10) <= 0 is false");
 
@@ -857,7 +857,7 @@ mod tests {
         let closes: Vec<f64> = (0..30).map(|i| 100.0 + i as f64 * 0.7).collect();
         let bars = bars_from_closes(&closes, 1, 1);
         let rsi_spec = spec(IndicatorKey::Rsi, Timeframe::M1, Some(14), None);
-        let engine = SignalEngine::new(&[(Timeframe::M1, bars.clone())], &[rsi_spec.clone()]);
+        let engine = SignalEngine::new(&[(Timeframe::M1, bars.clone())], std::slice::from_ref(&rsi_spec));
         let expected = compute_rsi(&bars, 14);
         for ts in 1..=30i64 {
             let idx = (ts - 1) as usize;
