@@ -110,6 +110,13 @@ impl Fraction {
         let frac_len = frac_part.len() as i64;
         let mut den = BigInt::from(10u32).pow(frac_len.max(0) as u32);
 
+        // Faz 23 (derin inceleme): üs i64→u32 cast'i wrap yapıyordu —
+        // "1e4294967297" sessizce 10'a düşüyordu (exactness sözleşmesi ihlali)
+        // ve aşırı büyük üs parse anında ~GB'lık BigInt ayırıyordu (DoS).
+        // 4096-bit sınır için |üs| > 1233 yeterli; aşılırsa dürüst hata.
+        if exp_val.abs() > 1233 {
+            return Err(MathError::InvalidDecimalString(s.to_string()));
+        }
         if exp_val > 0 {
             num *= BigInt::from(10u32).pow(exp_val as u32);
         } else if exp_val < 0 {

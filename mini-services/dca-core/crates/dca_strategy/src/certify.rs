@@ -320,13 +320,20 @@ pub fn certify(
                 .max_by(|&a, &b| trial_is_sr[a].partial_cmp(&trial_is_sr[b]).unwrap_or(std::cmp::Ordering::Equal))
                 .unwrap_or(0);
             // OOS relative rank of the IS-best trial → overfit occurrence if below median
+            // Faz 23 (derin inceleme): SIRALAMA DÜZELTİLDİ — oos_rank DESCENDING
+            // sıralı; position 0 = OOS-EN İYİ. Eski kod `rel <= 0.5`'i overfit
+            // sayıyordu, yani IS-kazananının OOS'ta İYİ performans göstermesi
+            // overfit işaretleniyor ve gerçek overfit (alt yarı) geçiyordu:
+            // raporlanan pbo = 100 − gerçek PBO, kapı tam tersine çalışıyordu
+            // (Bailey–López de Prado CSCV: overfit ⇔ IS-kazananı OOS alt
+            // yarısında ⇔ bu sıralamada rel > 0.5).
             let mut oos_rank: Vec<usize> = (0..trials.len()).collect();
             oos_rank.sort_by(|&a, &b| {
                 trial_oos_sr[b].partial_cmp(&trial_oos_sr[a]).unwrap_or(std::cmp::Ordering::Equal)
             });
             let rank = oos_rank.iter().position(|&ti| ti == best).unwrap_or(0);
             let rel = (rank as f64 + 1.0) / (trials.len() as f64 + 1.0);
-            if rel <= 0.5 {
+            if rel > 0.5 {
                 overfit += 1;
             }
             // Faz 18 (P0-10) + Faz 21 (N-5): WFE fold katkısı — negatif fold
@@ -373,7 +380,11 @@ pub fn certify(
     // sertleşir (Bailey–López de Prado tanımı).
     let trials_n = (srs.len()).max(attempts) as f64;
     let sr_var = if srs.len() > 1 {
-        let m = srs.iter().sum::<f64>() / trials_n;
+        // Faz 23 (derin inceleme): gözlenen örneklem ortalaması srs.len()
+        // ile bölünür — trials_n (kullanıcı deneme sayısı) YALNIZ expected-max
+        // terimlerinde (em/e2) ölçekler; aksi halde 9 örneklem / 500 = ortalama
+        // sıfıra söner, varyans şişer, DSR haksız düşer.
+        let m = srs.iter().sum::<f64>() / srs.len() as f64;
         srs.iter().map(|s| (s - m) * (s - m)).sum::<f64>() / (srs.len() - 1) as f64
     } else {
         0.0

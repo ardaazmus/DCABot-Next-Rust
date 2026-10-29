@@ -219,6 +219,26 @@ impl HedgeEngine {
     /// Combined exit check (M18): Pi_main + Pi_hedge >= T → close both legs.
     pub fn combined_exit_check(&mut self, pnl_main: &Fraction, pnl_hedge: &Fraction) -> Vec<Action> {
         let mut acts = Vec::new();
+        // Faz 23 (derin inceleme): Closing artık ÖLÜM DEĞİL — her iki bacak
+        // düzleşip deal döngüleri Cooldown'a düşünce faz geri açılır. Eski
+        // davranışta Closing kalıcıydı: ikinci döngüde combined exit hiç
+        // çalışmaz, bacaklar birleşik kâr hedefi OLMADAN işlemeye devam
+        // ederdi (bot ömrü boyunca tek çıkış).
+        if self.phase == HedgePhase::Closing {
+            let main_flat = self.main.mirror.qty.is_zero() && self.main.phase == crate::dca::DcaPhase::Cooldown;
+            let hedge_flat = match &self.hedge {
+                Some(h) => h.mirror.qty.is_zero() && h.phase == crate::dca::DcaPhase::Cooldown,
+                None => true,
+            };
+            if main_flat && hedge_flat {
+                self.phase = if self.cfg.kind == StrategyKind::HedgeDual {
+                    HedgePhase::HedgeActive
+                } else {
+                    HedgePhase::MainOnly
+                };
+                self.push_event("COMBINED EXIT complete — cycle re-armed".into());
+            }
+        }
         if self.phase != HedgePhase::HedgeActive {
             return acts;
         }

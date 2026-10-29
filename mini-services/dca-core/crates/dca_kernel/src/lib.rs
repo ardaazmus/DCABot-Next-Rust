@@ -494,7 +494,7 @@ impl SimulationStepper {
                         _ => continue,
                     }
                 }
-                if let Some(f) = self.execute_fill(&order, &fill_price, FeeRole::Taker, FillRealism::MarketableTaker, bar.t)? {
+                if let Some(f) = self.execute_fill(&order, &fill_price, FeeRole::Taker, FillRealism::MarketableTaker, bar.t, None)? {
                     new_fills.push(f);
                 }
                 continue;
@@ -606,7 +606,7 @@ impl SimulationStepper {
                 gap_batch.push(order);
                 continue;
             }
-            if let Some(f) = self.execute_fill(&order, &fill_price, fee_role, realism, bar.t)? {
+            if let Some(f) = self.execute_fill(&order, &fill_price, fee_role, realism, bar.t, None)? {
                 new_fills.push(f);
             }
         }
@@ -658,7 +658,7 @@ impl SimulationStepper {
                 self.log_gate(ts_ms, "GATE6", &g6);
                 match g6 {
                     GateVerdict::Pass => {
-                        if let Some(f) = self.execute_fill(&merged, &o, FeeRole::Maker, FillRealism::OpenGapBetter, bar.t)? {
+                        if let Some(f) = self.execute_fill(&merged, &o, FeeRole::Maker, FillRealism::OpenGapBetter, bar.t, None)? {
                             new_fills.push(f);
                         }
                     }
@@ -698,7 +698,7 @@ impl SimulationStepper {
                     self.log_gate(ts_ms, "GATE6", &g6);
                     match g6 {
                         GateVerdict::Pass => {
-                            if let Some(f) = self.execute_fill(&order, &o, FeeRole::Maker, FillRealism::OpenGapBetter, bar.t)? {
+                            if let Some(f) = self.execute_fill(&order, &o, FeeRole::Maker, FillRealism::OpenGapBetter, bar.t, None)? {
                                 new_fills.push(f);
                             }
                         }
@@ -718,14 +718,16 @@ impl SimulationStepper {
         fee_role: FeeRole,
         realism: FillRealism,
         ts: i64,
+        fill_key_override: Option<&str>,
     ) -> Result<Option<FillRecord>, String> {
-        self.execute_fill_inner(order, price, fee_role, realism, ts, None)
+        self.execute_fill_inner(order, price, fee_role, realism, ts, None, fill_key_override)
     }
 
     /// Faz 3 (H-4): `fee_override` — venue execution kaydından gelen GERÇEK
     /// ücret. None → yerel instrument oranı (mevcut sözleşme). Venue ücreti
     /// doğrulanmış bir kayıtsa G2 yerel-oran kontrolünden muaftır (sıfır
     /// ücretli dolum — voucher/promosyon — gerçek olabilir).
+    #[allow(clippy::too_many_arguments)]
     fn execute_fill_inner(
         &mut self,
         order: &OrderIntent,
@@ -734,6 +736,11 @@ impl SimulationStepper {
         realism: FillRealism,
         ts: i64,
         fee_override: Option<&Fraction>,
+        // Faz 23 (derin inceleme): LIVE dış-dolumlar için borsa execId bazlı
+        // anahtar — olmadan kernel `{order_id}-{ts}` yeniden üretir, execId
+        // hiç muhasebe defterine ulaşmaz; sweep yeniden sorgulayınca aynı
+        // dolum İKİ KEZ sayılır (m04 seen_fill_keys farklı anahtar görür).
+        fill_key_override: Option<&str>,
     ) -> Result<Option<FillRecord>, String> {
         let rate = match fee_role {
             FeeRole::Maker => self.instrument.maker_fee_rate.clone(),
@@ -751,7 +758,10 @@ impl SimulationStepper {
             None => notional.mul(&rate).map_err(|e| e.to_string())?,
         };
         let is_add = order.kind == OrderKind::Add;
-        let fill_key = format!("{}-{}", order.id, ts);
+        let fill_key = match fill_key_override {
+            Some(k) => k.to_string(),
+            None => format!("{}-{}", order.id, ts),
+        };
         let margin_mode = !self.cfg.is_spot;
         let lev = if self.cfg.leverage.is_zero() { Fraction::one() } else { self.cfg.leverage.clone() };
         let realized_before = self.position.realized_gross.clone();
@@ -799,7 +809,17 @@ impl SimulationStepper {
             // Cash movement: buy adds cost+fee, sell adds proceeds-fee
             self.cash = self.cash.sub(&notional.add(&fee).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         } else {
-            self.cash = self.cash.add(&notional.sub(&fee).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+            // Faz 23 (derin inceleme): SPOT reduce'da kredi CLAMP'li — m04
+            // azaltmayı min(qty, açık) ile kırpar ama eski kod TAM order
+            // notional'ı nakde yazıyordu; bayat reduce 5 birimlik emir, 1
+            // birimlik pozisyona +439 hayali nakit ekliyordu. Marjin kolu
+            // zaten closed=min kullanıyordu; spot kolu da aynı sözleşmede.
+            let closed = Fraction::max(&Fraction::min(&order.qty, &qty_before), &Fraction::zero());
+            let credit_notional = closed.mul(price).map_err(|e| e.to_string())?;
+            self.cash = self
+                .cash
+                .add(&credit_notional.sub(&fee).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
         }
         self.cumulative_fees = self.cumulative_fees.add(&fee).map_err(|e| e.to_string())?;
         // Faz 18 (P1-1): realized_fees — yalnız kapanış (reduce) dolumlarının
@@ -870,13 +890,14 @@ impl SimulationStepper {
         realism: FillRealism,
         ts: i64,
     ) -> Result<Option<FillRecord>, String> {
-        self.ingest_external_fill_with_fee(order_id, role, side, kind, qty, price, fee_role, realism, ts, None)
+        self.ingest_external_fill_with_fee(order_id, role, side, kind, qty, price, fee_role, realism, ts, None, None)
     }
 
     /// Faz 3 (C-3/H-4): fill kanıtı venue execution kaydıysa ücret de oradan
     /// gelir. `venue_fee = None` → yerel instrument oranı (eski sözleşme).
     /// Not: ücretin quote cinsinde olduğu varsayımı belgelidir (Bybit linear /
     /// USDT-quote spot); farklı fee-coin (H-4 kalanı) Faz 4'te ayrıştırılacak.
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn ingest_external_fill_with_fee(
         &mut self,
@@ -890,6 +911,7 @@ impl SimulationStepper {
         realism: FillRealism,
         ts: i64,
         venue_fee: Option<&Fraction>,
+        fill_key_override: Option<&str>,
     ) -> Result<Option<FillRecord>, String> {
         let order = OrderIntent {
             id: order_id.to_string(),
@@ -902,7 +924,7 @@ impl SimulationStepper {
             placement_ref_price: Some(price.clone()),
             quote_notional: None,
         };
-        self.execute_fill_inner(&order, price, fee_role, realism, ts, venue_fee)
+        self.execute_fill_inner(&order, price, fee_role, realism, ts, venue_fee, fill_key_override)
     }
 
     pub fn net_realized(&self) -> Result<Fraction, MathError> {
@@ -982,7 +1004,7 @@ impl SimulationStepper {
             placement_ref_price: Some(price.clone()),
             quote_notional: None,
         };
-        self.execute_fill(&order, price, FeeRole::Taker, FillRealism::MarketableTaker, ts)
+        self.execute_fill(&order, price, FeeRole::Taker, FillRealism::MarketableTaker, ts, None)
     }
 }
 
@@ -1503,7 +1525,7 @@ mod tests {
         // instrument oranı 0.001 → yerel fee 0.099 olurdu; venue 0.02 bildiriyor.
         let venue = f("0.02");
         let rec = st
-            .ingest_external_fill_with_fee("v1", "BASE", Side::Buy, OrderKind::Add, &f("1"), &f("99"), FeeRole::Taker, FillRealism::MarketableTaker, 1200, Some(&venue))
+            .ingest_external_fill_with_fee("v1", "BASE", Side::Buy, OrderKind::Add, &f("1"), &f("99"), FeeRole::Taker, FillRealism::MarketableTaker, 1200, Some(&venue), None)
             .unwrap()
             .expect("fill");
         assert_eq!(rec.fee.to_string(), "1/50", "venue fee (0.02) kullanılmalı");
@@ -1520,7 +1542,7 @@ mod tests {
         st.set_position_direction(1);
         let zero = f("0");
         let rec = st
-            .ingest_external_fill_with_fee("v2", "BASE", Side::Buy, OrderKind::Add, &f("1"), &f("50"), FeeRole::Maker, FillRealism::RestingTouch, 1300, Some(&zero))
+            .ingest_external_fill_with_fee("v2", "BASE", Side::Buy, OrderKind::Add, &f("1"), &f("50"), FeeRole::Maker, FillRealism::RestingTouch, 1300, Some(&zero), None)
             .unwrap()
             .expect("zero-fee fill must pass (venue-verified)");
         assert!(rec.fee.is_zero());
@@ -1534,9 +1556,11 @@ mod tests {
         let mut st = SimulationStepper::new(inst(), f("1000"), StepperConfig::default());
         st.set_position_direction(1);
         let venue = f("0.01");
-        let one = st.ingest_external_fill_with_fee("v3", "SAFETY", Side::Buy, OrderKind::Add, &f("1"), &f("10"), FeeRole::Maker, FillRealism::RestingTouch, 1400, Some(&venue)).unwrap();
+        let one = st.ingest_external_fill_with_fee("v3", "SAFETY", Side::Buy, OrderKind::Add, &f("1"), &f("10"), FeeRole::Maker, FillRealism::RestingTouch, 1400, Some(&venue), Some("v3-1400")).unwrap();
         assert!(one.is_some());
-        let two = st.ingest_external_fill_with_fee("v3", "SAFETY", Side::Buy, OrderKind::Add, &f("1"), &f("10"), FeeRole::Maker, FillRealism::RestingTouch, 1400, Some(&venue)).unwrap();
+        // Faz 23: execId anahtarı artık kernel'e taşınıyor — aynı anahtarla
+        // gelen ikinci dolum idempotent yoksayılır (test bu sözleşmeyi tutar).
+        let two = st.ingest_external_fill_with_fee("v3", "SAFETY", Side::Buy, OrderKind::Add, &f("1"), &f("10"), FeeRole::Maker, FillRealism::RestingTouch, 1400, Some(&venue), Some("v3-1400")).unwrap();
         assert!(two.is_none(), "duplicate fill_key (order+ts) yoksayılmalı");
         assert_eq!(st.position.qty.to_string(), "1");
         assert_eq!(st.cumulative_fees.to_string(), "1/100");

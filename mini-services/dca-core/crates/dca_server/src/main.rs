@@ -1667,7 +1667,16 @@ async fn delete_bot(State(app): State<Arc<AppState>>, Path(id): Path<String>) ->
         if let (Some(creds), Some(adapter)) = (creds_opt, app.adapter(&venue_str)) {
             match adapter.open_orders(&creds, &category_str, &symbol_str).await {
                 Ok(orders) => {
+                    // Faz 23 (derin inceleme): yalnız SİLİNEN botun emirleri
+                    // iptal edilir — eski kod aynı hesapta aynı sembolde işlem
+                    // yapan DİĞER botların mesh/safety/TP emirlerini de
+                    // iptal ediyordu; o botlar takip ettikleri emirlerin
+                    // kaybolmasını "fail-closed kayıp" olarak görüyordu.
+                    let prefix = format!("{id}-");
                     for o in &orders {
+                        if !o.order_link_id.starts_with(&prefix) {
+                            continue;
+                        }
                         let _ = adapter.cancel_order(&creds, &category_str, &symbol_str, &o.order_link_id).await;
                     }
                 }

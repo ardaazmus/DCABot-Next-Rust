@@ -494,6 +494,24 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
                       <Snowflake className="h-3.5 w-3.5" aria-hidden />
                       Çöz
                     </Button>
+                  ) : b.status === "STOPPED" ? (
+                    // Faz 23 (UI derin inceleme #8): STOPPED bot ölü uçtu —
+                    // UI'da START yolu hiç yoktu (yalnız apiStopAllBots bunları
+                    // üretiyordu). Devam = patch status RUNNING.
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="min-h-9 border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10"
+                      disabled={busyId === b.id}
+                      onClick={() =>
+                        void apiPatchBot(b.id, { status: "RUNNING" })
+                          .then(() => toast({ title: `${b.name} devam ettirildi`, description: "RUNNING" }))
+                          .catch((e) => toast({ title: "Devam ettirilemedi", description: String(e) }))
+                      }
+                    >
+                      <Play className="h-3.5 w-3.5" aria-hidden />
+                      Devam
+                    </Button>
                   ) : null}
                   {b.status === "RUNNING" ? (
                     <Button

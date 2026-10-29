@@ -250,6 +250,7 @@ export function Wizard({ onCreated }: WizardProps) {
     setMode("PAPER");
     setSymbol(c.symbol);
     setSymbolQuery(c.symbol);
+    carriedSymbolRef.current = c.symbol;
     setIntervalSel(c.interval as Interval);
     setStartCash(c.startCash);
     // Motor fraksiyon sözleşmesi: 0.02 = %2 → arayüz yüzde gösterir (×100).
@@ -280,7 +281,18 @@ export function Wizard({ onCreated }: WizardProps) {
     setMarketsBusy(true);
     apiMarkets(category, undefined, venue)
       .then((r) => {
-        if (alive) setInstruments(r.instruments);
+        if (alive) {
+          setInstruments(r.instruments);
+          // Faz 23 (UI derin inceleme #5): Lab taşıma prefili sembolü yazar
+          // ama enstrümanı seçmezdi — sec2Valid false kalır, launch sessiz
+          // kilitli kalırdı. Taşınan sembol listede varsa otomatik seçilir.
+          const carried = carriedSymbolRef.current;
+          if (carried) {
+            const found = r.instruments.find((i) => i.symbol === carried);
+            if (found) setInstrument(found);
+            carriedSymbolRef.current = null;
+          }
+        }
       })
       .catch(() => {
         if (alive) setInstruments([]);
@@ -356,10 +368,17 @@ export function Wizard({ onCreated }: WizardProps) {
 
   /* ---- live calc (debounced) ---- */
   const calcTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const carriedSymbolRef = useRef<string | null>(null);
+  // Faz 23 (UI derin inceleme #4): hesap-yanıtı yarışı — debounce sonrası
+  // isteklerin dönüş SIRASI garanti değil; eski parametrenin cevabı yeni
+  // cevabı ezmişti (ladder/G6 rozetleri yanlış veriyle). seq guard: yalnız
+  // en son tetiklenen koşu state yazabilir.
+  const calcSeq = useRef(0);
   useEffect(() => {
     if (!kind) return;
     if (calcTimer.current) clearTimeout(calcTimer.current);
     setCalcBusy(true);
+    const mySeq = ++calcSeq.current;
     calcTimer.current = setTimeout(async () => {
       try {
         setCalcError(null);
@@ -389,7 +408,7 @@ export function Wizard({ onCreated }: WizardProps) {
             leverage: String(leverage),
             market: marketType,
           });
-          setCalcDca(r);
+          if (calcSeq.current === mySeq) setCalcDca(r);
           setCalcGrid(null);
         } else {
           const lo = fracToNum(gridLower);
@@ -410,7 +429,7 @@ export function Wizard({ onCreated }: WizardProps) {
             maker_fee: instrument ? String(fracToNum(instrument.maker_fee_rate) ?? 0.001) : "0.001",
             taker_fee: instrument ? String(fracToNum(instrument.taker_fee_rate) ?? 0.001) : "0.001",
           });
-          setCalcGrid(r);
+          if (calcSeq.current === mySeq) setCalcGrid(r);
           setCalcDca(null);
         }
       } catch (e) {
@@ -1052,6 +1071,12 @@ export function Wizard({ onCreated }: WizardProps) {
                     setCardKey(s.key);
                     if (s.kind === "FUTURES_DCA") setLeverage(5);
                     else if (s.presetLeverage) setLeverage(s.presetLeverage);
+                    // Faz 23 (UI derin inceleme): spot türüne geçişte kaldıraç
+                    // 1'e RESET — eski kod FUTURES_DCA'dan kalan 5x'i DCA_LONG'a
+                    // taşıyor, marketType "leverage>1 → linear" kuralıyla
+                    // kullanıcının spot sandığı stratejiyi izole marjinle
+                    // açıyordu (LIVE'da gerçek para etkisi).
+                    else setLeverage(1);
                     // Signal Bot havuzu: sinyal agaci on-yukle (yoksa); Pine sablonu oner (uzerine yazma).
                     if (s.signalPreset !== undefined && !signalCfg) {
                       const preset = SIGNAL_PRESETS[s.signalPreset];

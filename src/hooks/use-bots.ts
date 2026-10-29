@@ -81,10 +81,15 @@ export function useBotDetail(id: string | null): {
   return { bot: poll.data, error: poll.error, loading: poll.loading, refetch: poll.refetch };
 }
 
-export function useFills(id: string | null): { fills: Fill[]; error: string | null; loading: boolean; refetch: () => void } {
+export function useFills(id: string | null, opts?: { live?: boolean }): { fills: Fill[]; error: string | null; loading: boolean; refetch: () => void } {
   const { dataVer } = useEventStream();
   const ver = useDebouncedValue(dataVer, 900);
-  const poll = usePoll<{ fills: Fill[] }>(id ? `/api/bots/${id}/fills` : null, 5000, [ver]);
+  // Faz 23 (UI derin inceleme #9): dashboard N+1 amplifikasyonu — filodaki
+  // HER bot kartı useFills açıyordu ve her FILL SSE olayı N paralel istek
+  // tetikliyordu (15 bot ≈ 18 istek/dolum). Varsayılan canlı-değil modu:
+  // yalnız 5 sn poll (Studio kendi canlı useFills'ini live:true ile açar).
+  const live = opts?.live ?? false;
+  const poll = usePoll<{ fills: Fill[] }>(id ? `/api/bots/${id}/fills` : null, 5000, live ? [ver] : []);
   return { fills: poll.data?.fills ?? [], error: poll.error, loading: poll.loading, refetch: poll.refetch };
 }
 

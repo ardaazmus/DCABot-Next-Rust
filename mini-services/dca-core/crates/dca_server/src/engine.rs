@@ -853,6 +853,11 @@ async fn apply_intent_outcomes(
                         FillRealism::MarketableTaker,
                         ts2,
                         fee.as_ref(),
+                        // Faz 23 (derin inceleme): execId anahtarı KERNEL'e kadar
+                        // taşınır — eski kod anahtarı yalnız ön-kontrolde kullanıp
+                        // kernel'in {order_id}-{ts} anahtarına düşürüyordu; sweep
+                        // yeniden sorgulayınca aynı dolum iki kez sayılıyordu.
+                        Some(&fill_key),
                     );
                 match ingest {
                     Ok(maybe_f) => {
@@ -984,7 +989,9 @@ async fn apply_intent_outcomes(
             crate::state::IntentOutcome::GateBlocked { id, reason } => {
                 let msg = format!("LIVE emir gönderilmedi ({id}): {reason} — faz geri alındı, koşul düzelince yeniden denenecek");
                 crate::state::persist_event(app, &rt.bot_id, "WARN", "ORDER_GATE", &msg).await;
-                rollback_pending_phase_after_gate_reject(app, rt);
+                for a in rollback_pending_phase_after_gate_reject(app, rt) {
+                    Box::pin(dispatch_action(app, rt, a, crate::state::now_ms(), sse)).await?;
+                }
             }
             crate::state::IntentOutcome::PlaceFailed { id, err } => {
                 let msg = format!("LIVE emir yerleştirilemedi ({id}): {err} — faz geri alındı, koşul düzelince yeniden denenecek (P0-6 kalanı)");
@@ -1003,7 +1010,9 @@ async fn apply_intent_outcomes(
                     .map(|o| o.kind == OrderKind::Reduce)
                     .unwrap_or(false);
                 if !is_reduce {
-                    rollback_pending_phase_after_gate_reject(app, rt);
+                    for a in rollback_pending_phase_after_gate_reject(app, rt) {
+                        Box::pin(dispatch_action(app, rt, a, crate::state::now_ms(), sse)).await?;
+                    }
                 } else {
                     crate::state::persist_event(app, &rt.bot_id, "INFO", "ORDER", &format!("kapanış emri reddi ({id}) — Closing retry döngüsünde yeniden gönderilecek")).await;
                 }
@@ -1092,7 +1101,8 @@ async fn run_intent_cascade(
 /// fazını "emir verildi" varsayımından geri alıp yeni karara izin ver.
 /// Dca: BasePending→Idle (yeni deal denenebilir); Grid: bootstrap geri alınır
 /// (mesh yeniden kurulur); Hedge ana bacak Dca ile aynı.
-pub fn rollback_pending_phase_after_gate_reject(app: &AppState, rt: &mut BotRuntime) {
+pub fn rollback_pending_phase_after_gate_reject(app: &AppState, rt: &mut BotRuntime) -> Vec<dca_strategy::Action> {
+    let mut out: Vec<dca_strategy::Action> = Vec::new();
     match &mut rt.engine_kind {
         dca_strategy::EngineTag::Dca(e) => {
             if e.phase == dca_strategy::dca::DcaPhase::BasePending {
@@ -1104,11 +1114,18 @@ pub fn rollback_pending_phase_after_gate_reject(app: &AppState, rt: &mut BotRunt
                 h.main.phase = dca_strategy::dca::DcaPhase::Idle;
             }
         }
-        dca_strategy::EngineTag::Grid(_) => {
+        dca_strategy::EngineTag::Grid(g) => {
+            // Faz 23 (derin inceleme): rollback mesh'i DURDURUR — eski davranış
+            // yalnız `grid_bootstrapped = false` yapıyordu; tahtada kalan N−1
+            // emir dururken sonraki poll aynı seviyelere YENİ mesh kuruyordu
+            // (çift pozisyon + çift closer). halt_mesh resting emirleri
+            // idempotent iptal eder, haritayı temizler, kapıyı kapatır.
+            out.extend(g.halt_mesh());
             rt.grid_bootstrapped = false;
         }
     }
     let _ = app; // event çağıran yazar
+    out
 }
 
 /// Faz 4 (C-6): tek gerçek-emir geçidi — LIVE place öncesi (1) enstrüman
@@ -1462,7 +1479,7 @@ async fn persist_equity(app: &AppState, bot_id: &str, ts: i64, eq: &Fraction) ->
     // Task 20 L6 — sınırsız büyüme kapandı: bot başına son 5000 nokta saklanır
     // (tablo write-only'ydi; 1m bot ≈ 1440 satır/gün şişmeye yol açıyordu).
     conn.execute(
-        "DELETE FROM equity_points WHERE bot_id=?1 AND id NOT IN (SELECT id FROM equity_points WHERE bot_id=?1 ORDER BY id DESC LIMIT 5000)",
+        "DELETE FROM equity_points WHERE bot_id=?1 AND id < (SELECT MIN(id) FROM (SELECT id FROM equity_points WHERE bot_id=?1 ORDER BY id DESC LIMIT 5000))",
         rusqlite::params![bot_id],
     )
     .map_err(|e| e.to_string())?;
@@ -2054,7 +2071,21 @@ async fn live_fill_sweep(
         return Ok(0);
     }
     let category = if rt.cfg.kind.is_futures() { "linear" } else { "spot" };
-    let tracked: Vec<crate::state::LiveTrackedOrder> = rt.live_open_orders.clone();
+    // Faz 23 (derin inceleme): poll başına en fazla SWEEP_MAX_ORDERS emir —
+    // runtimes kilidi bu fonksiyon boyunca tutulur (ağ çağrıları dâhil);
+    // sınırsız grid mesh'i kilidi dakikalarca tutabilirdi. Dönen pencere
+    // kalan emirleri sonraki poll'larda tarar.
+    const SWEEP_MAX_ORDERS: usize = 20;
+    let all_tracked = rt.live_open_orders.clone();
+    let tracked: Vec<crate::state::LiveTrackedOrder> = if all_tracked.len() <= SWEEP_MAX_ORDERS {
+        all_tracked
+    } else {
+        let start = rt.sweep_cursor % all_tracked.len();
+        (0..SWEEP_MAX_ORDERS)
+            .map(|i| all_tracked[(start + i) % all_tracked.len()].clone())
+            .collect()
+    };
+    rt.sweep_cursor = rt.sweep_cursor.wrapping_add(tracked.len());
     let mut n = 0usize;
     for order in &tracked {
         // (1) Venue execution kayıtları — artımlı, idempotent.
@@ -2085,7 +2116,7 @@ async fn live_fill_sweep(
             };
             match ingest_target
                 .ok_or("hedge stepper yok")?
-                .ingest_external_fill_with_fee(&order.id, &order.role, order.side, order.kind.clone(), &ex.exec_qty, &ex.exec_price, fee_role, realism, ts, ex.exec_fee.as_ref())
+                .ingest_external_fill_with_fee(&order.id, &order.role, order.side, order.kind.clone(), &ex.exec_qty, &ex.exec_price, fee_role, realism, ts, ex.exec_fee.as_ref(), Some(&fill_key))
             {
                 Ok(Some(f)) => {
                     let acts = rt.engine_kind.on_fill(&f);
@@ -2174,7 +2205,7 @@ async fn live_fill_sweep(
                                 };
                                 let fb_ingest = fb_target
                                     .ok_or("hedge stepper yok")?
-                                    .ingest_external_fill_with_fee(&order.id, &order.role, order.side, order.kind.clone(), &remaining, &px, fee_role, FillRealism::MarketableTaker, ts, st.cum_exec_fee.as_ref());
+                                    .ingest_external_fill_with_fee(&order.id, &order.role, order.side, order.kind.clone(), &remaining, &px, fee_role, FillRealism::MarketableTaker, ts, st.cum_exec_fee.as_ref(), None);
                                 match fb_ingest {
                                     Ok(Some(f)) => {
                                         let acts = rt.engine_kind.on_fill(&f);

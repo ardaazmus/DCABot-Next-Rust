@@ -49,10 +49,15 @@ export function NumField({ label, value, onChange }: { label: string; value: str
   return (
     <div className="space-y-1.5">
       <Label className="text-xs text-slate-400">{label}</Label>
+      {/* Faz 23 (UI derin inceleme #6): type="number" Türkçe ondalık
+          virgülünü (1,5 / 1.500,5 yapıştırma) badInput olarak yutup alanı
+          sessizce boşaltıyordu. inputMode="decimal" + virgül→nokta
+          normalizasyonu — TR kullanıcının doğal girişi artık korunur. */}
       <Input
-        type="number"
+        type="text"
+        inputMode="decimal"
         value={value}
-        onChange={(e) => onChange(e.target.value)}
+        onChange={(e) => onChange(e.target.value.replace(/,/g, "."))}
         className="num min-h-11 border-border-strong bg-surface text-slate-100"
       />
     </div>

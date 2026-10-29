@@ -120,7 +120,7 @@ function sessionLabel(v: UserRiskPolicy["session_type"]): string {
 
 export function Studio({ botId, onBack }: { botId: string; onBack: () => void }) {
   const { bot, loading } = useBotDetail(botId);
-  const { fills, loading: fillsLoading } = useFills(botId);
+  const { fills, loading: fillsLoading } = useFills(botId, { live: true });
   const { events, loading: eventsLoading } = useBotEvents(botId);
   // Wizard-created bots stash their config in sessionStorage; read lazily per mount.
   const [configHint] = useState<BotConfig | null>(() => {
@@ -323,7 +323,12 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
     return () => {
       dead = true;
     };
-  }, [bot, configHint]);
+    // Faz 23 (UI derin inceleme #7): efekt ilkel girdilere bağlı — eski kod
+    // tüm `bot` nesnesine bağlıydı; her 5 sn poll + her SSE dataVer'da yeni
+    // nesne kimliği efektin TEKRAR TEKRAR ateşlenmesi demekti (poll başına
+    // markets+calc istek çifti motoru gereksiz yoruyordu).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bot?.kind, bot?.symbol, bot?.ladder, bot?.stats.avg_price, configHint]);
 
   if (loading && !bot) {
     return (

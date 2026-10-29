@@ -439,6 +439,12 @@ export function TvChart({
           <span className="font-semibold text-slate-200">{symbol}</span>
           <span aria-hidden>·</span>
           <span>{interval}</span>
+          {/* Faz 23 (UI derin inceleme #10): grafik ekseni UTC'dir, tablolar
+              yerel saat (tr-TR) — kullanıcı UTC+3'te 3 saat kayma görüyordu.
+              lightweight-charts UTC timestamp şart koşar; dürüst çözüm ekseni
+              AÇIKÇA etiketlemek (TZ kaydırma her günü taşırma hataları üretir). */}
+          <span aria-hidden>·</span>
+          <span className="text-slate-400">UTC</span>
           {lastClose !== null && (
             <>
               <span aria-hidden>·</span>

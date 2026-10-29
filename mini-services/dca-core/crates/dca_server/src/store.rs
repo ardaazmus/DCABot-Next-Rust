@@ -48,6 +48,7 @@ impl Db {
                 ts INTEGER,
                 UNIQUE(bot_id, fill_key)
             );
+                        CREATE INDEX IF NOT EXISTS idx_fills_bot_order ON fills(bot_id, order_id);
             CREATE INDEX IF NOT EXISTS idx_fills_bot_fillkey ON fills(bot_id, fill_key);
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,6 +87,7 @@ impl Db {
                 ts INTEGER NOT NULL,
                 equity TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_equity_bot ON equity_points(bot_id, id);
             CREATE TABLE IF NOT EXISTS settings (
                 k TEXT PRIMARY KEY,
                 v TEXT NOT NULL

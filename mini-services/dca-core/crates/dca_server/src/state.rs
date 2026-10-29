@@ -72,6 +72,13 @@ pub struct BotRuntime {
     pub funding_history_ok_at: i64,
     /// Son fetch DENEMESİ (başarısızlıkta retry throttle'ı).
     pub funding_history_tried_at: i64,
+    /// Faz 23: boş-geçmiş uyarısı yalnız bir kez (spam koruması).
+    pub funding_empty_warned: bool,
+    /// Faz 23 (derin inceleme): sweep dönen-pencere imleci — poll başına en
+    /// fazla SWEEP_MAX_ORDERS emir taranır; runtimes kilidi ağ çağrılarıyla
+    /// tutulduğundan (bilinen mimari borç, H-1 tam yeniden yapılandırma
+    /// sonraki faz) en kötü durumda kilitleme süresi sınırlıdır.
+    pub sweep_cursor: usize,
     /// Faz 13B: hedge bacağı için AYRI kernel stepper (direction=-1) —
     /// EX-06'nın kalıcı çözümü: iki bacak artık tek kernel pozisyonunda
     /// birleşmez; her bacak kendi cash/IM/fee/pozisyon defterini tutar.
@@ -594,6 +601,11 @@ pub struct HedgeKernelSnap {
     pub cumulative_funding: Fraction,
     pub realized_net: Fraction,
     pub position: dca_math::m04::PositionState,
+    /// Faz 23 (derin inceleme): hedge bacağının BEKLEYEN emirleri — eski
+    /// snapshot atıyordu; restart sonrası resting_safety sayaçları emirleri
+    /// kitapta sanıp ladder sessizce tıkanıyordu.
+    #[serde(default)]
+    pub pending: Vec<dca_kernel::OrderIntent>,
 }
 
 /// Faz 3 (C-4): runtime snapshot'i bots.runtime_state'a yazar (UPSERT).
@@ -618,6 +630,7 @@ pub fn save_runtime_state(app: &AppState, bot_id: &str, rt: &BotRuntime) {
             cumulative_funding: hs.cumulative_funding.clone(),
             realized_net: hs.realized_net.clone(),
             position: hs.position.clone(),
+            pending: hs.pending.clone(),
         }),
         position: Some(rt.stepper.position.clone()),
         kernel_prev_bar_ts: rt.stepper.prev_bar_ts,
@@ -861,6 +874,8 @@ pub async fn create_runtime(
         funding_history: Vec::new(),
         funding_history_ok_at: 0,
         funding_history_tried_at: 0,
+        funding_empty_warned: false,
+        sweep_cursor: 0,
         hedge_stepper,
         pos_mode_hedge: false,
         mmr_brackets: None,
@@ -898,6 +913,9 @@ pub async fn create_runtime(
                     hs.cumulative_funding = hk.cumulative_funding;
                     hs.realized_net = hk.realized_net;
                     hs.position = hk.position;
+                    // Faz 23 (derin inceleme): hedge bacağının bekleyen emirleri
+                    // de geri yüklenir — ladder tıkanması kapandı.
+                    hs.pending = hk.pending;
                 }
                 // P0-3: ANA kernel pozisyonu + bekleyen emirler geri yüklenir —
                 // restart sonrası kernel/engine ayrışması (hayalet pozisyon) kapanır.

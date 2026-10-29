@@ -264,6 +264,26 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
   // Faz 22 (P0-10 kalanı): kullanıcının gerçek deneme sayısı — DSR söndürmesi
   // bunu kullanır (dahili 9 varyant alt sınır; sertleştirme buradan).
   const [certAttempts, setCertAttempts] = useState(0);
+
+  // Faz 23 (UI derin inceleme #2/#3): parametre değişince eski sonuç ve
+  // sertifika hükmü GEÇERSİZ — eski kod BTCUSDT'de alınan "GECTI ✓" rozetini
+  // sembol/parametre değişse de gösteriyordu (LIVE kararı yanlış temele
+  // dayanırdı); ayrıca unmount'ta koşu iptal edilmiyor, faz-interval sızıyordu.
+  const resultInvalidator = `${kind}|${symbol}|${interval}|${bars}|${venue}|${startCash}|${deviation}|${maxSafety}|${tp}|${baseSize}|${leverage}|${fillModel}`;
+  const resultRef = useRef(resultInvalidator);
+  useEffect(() => {
+    if (resultRef.current !== resultInvalidator) {
+      resultRef.current = resultInvalidator;
+      setResult(null);
+      setCert(null);
+    }
+  }, [resultInvalidator]);
+  useEffect(
+    () => () => {
+      abortRef.current?.abort();
+    },
+    [],
+  );
   const [certError, setCertError] = useState<string | null>(null);
   const [cert, setCert] = useState<BacktestCertResult | null>(null);
 
@@ -645,7 +665,7 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
             />
           </div>
           <div className="flex items-end gap-2 lg:col-span-2">
-            <Button onClick={() => void run()} disabled={busy} className="min-h-11 flex-1 bg-cyan-500/90 font-bold text-[#02171b] hover:bg-cyan-500 lg:w-36">
+            <Button onClick={() => void run()} disabled={busy || certBusy} className="min-h-11 flex-1 bg-cyan-500/90 font-bold text-[#02171b] hover:bg-cyan-500 lg:w-36">
               {busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Play className="h-4 w-4" aria-hidden />}
               {busy ? "Koşuyor…" : "BACKTEST"}
             </Button>
@@ -665,7 +685,7 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
             </div>
             <Button
               onClick={() => void runCert()}
-              disabled={certBusy}
+              disabled={certBusy || busy}
               variant="outline"
               className="min-h-11 flex-1 border-amber-500/50 bg-amber-500/10 font-bold text-amber-300 hover:bg-amber-500/20 hover:text-amber-200 lg:w-44"
             >
