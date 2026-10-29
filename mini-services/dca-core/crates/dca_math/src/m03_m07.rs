@@ -252,7 +252,9 @@ pub fn liquidation_price(
             }
         }
     }
-    Ok(Some(candidate.deduction.mul(&Fraction::zero()).unwrap_or_else(|_| Fraction::zero())))
+    // Faz 17 (P1-17): yakınsamama artık sahte 0 döndürmez (likidasyon hiç
+    // tetiklenmezdi — fail-open) — dürüst Err döner; çağıran WARN üretir.
+    Err(crate::fraction::MathError::DomainViolation("M07: bracket iteration did not converge".into()))
 }
 
 #[cfg(test)]

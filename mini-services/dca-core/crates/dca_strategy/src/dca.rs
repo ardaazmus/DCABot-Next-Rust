@@ -51,6 +51,15 @@ pub struct DcaEngine {
     pub trailing: TrailingState,
     pub trailing_peak: Option<Fraction>,
     pub funding: Fraction,
+    /// Faz 17 (P1-5): DEAL-bazlı funding — TP hesabı bunu kullanır; `funding`
+    /// bot ömrü kümülatifi olarak raporlamada kalır. Deal açılışında sıfırlanır.
+    pub funding_deal: Fraction,
+    /// Faz 17 (P1-16): yerleştirme imleci — `filled_safety` yalnız dolum sayacı;
+    /// top-up artık `ladder[next_level_to_place]`'dan devam eder (çift yerleştirme yok).
+    pub next_level_to_place: usize,
+    /// Faz 17 (P0-6): Closing fazında beklenen bar sayısı — 3 barı aşarsa
+    /// kapanış emri yeniden gönderilir (pozisyon korumasız kalmaz).
+    pub closing_bars_waited: usize,
     pub cooldown_remaining: usize,
     pub close_orders_out: usize,
     pub closes_seen: usize,
@@ -123,6 +132,9 @@ impl DcaEngine {
             trailing: TrailingState::Off,
             trailing_peak: None,
             funding: Fraction::zero(),
+            funding_deal: Fraction::zero(),
+            next_level_to_place: 0,
+            closing_bars_waited: 0,
             cooldown_remaining: 0,
             close_orders_out: 0,
             closes_seen: 0,
@@ -178,7 +190,7 @@ impl DcaEngine {
                 self.direction.sign() as i8,
                 qty,
                 avg,
-                &self.funding,
+                &self.funding_deal,
                 &exit_rate,
                 &target_quote,
                 &self.inst.tick_size,
@@ -434,7 +446,13 @@ impl DcaEngine {
             }
         }
         // Task 16 (spec 2.8): ilk N güvenlik emrini tahtaya yaz (single-active yerine).
+        // Faz 17: yeni deal — deal-bazlı funding sıfırlanır (P1-5), yerleştirme
+        // imleci N'e ayarlanır (P1-16: top-up L(N+1)'den devam eder, çift yok).
+        self.funding_deal = Fraction::zero();
         let n = self.cfg.risk_policy.active_safety_orders.max(1) as usize;
+        // Faz 17 (P1-16): yerleştirme imleci = yerleştirilen seviye sayısı;
+        // top-up bundan SONRAKI seviyeye yazar (çift yerleştirme imkansız).
+        self.next_level_to_place = n;
         let levels: Vec<DcaLevel> = self.ladder.iter().take(n).cloned().collect();
         for lvl in levels {
             let act = self.place_safety_order(&lvl);
@@ -713,7 +731,28 @@ impl DcaEngine {
                     return acts;
                 }
             }
-            DcaPhase::Closing => { /* awaiting close fill */ }
+            DcaPhase::Closing => {
+                // Faz 17 (P0-6): kapanış emri 3 bar dolmadıysa yeniden gönder —
+                // pozisyon korumasız kalmaz (bakım/reddetme senaryoları).
+                self.closing_bars_waited += 1;
+                if self.closing_bars_waited > 3 && !self.mirror.qty.is_zero() {
+                    acts.push(Action::PlaceMarket {
+                        id: order_id(&self.next_seq_id(), "MANUAL", 0),
+                        side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
+                        qty: self.mirror.qty.clone(),
+                        role: "MANUAL",
+                    });
+                    self.close_orders_out += 1;
+                    self.closing_bars_waited = 0;
+                    acts.push(Action::Log {
+                        level: "WARN",
+                        message: format!(
+                            "kapanış emri 3 barda dolmadı — kalan {} için MANUAL kapanış yeniden gönderildi (P0-6)",
+                            self.mirror.qty.to_half_even_display(8)
+                        ),
+                    });
+                }
+            }
         }
         acts
     }
@@ -754,14 +793,16 @@ impl DcaEngine {
             self.resting_safety = self.resting_safety.saturating_sub(merged_levels);
             // Top-up: bekleyen sayısını policy.active_safety_orders'a tamamla.
             let want = self.cfg.risk_policy.active_safety_orders.max(1) as usize;
-            while self.resting_safety < want && self.filled_safety < self.ladder.len() {
-                let lvl = self.ladder[self.filled_safety].clone();
+            // Faz 17 (P1-16): top-up YERLEŞTİRME imleciyle —  yalnız
+            // dolum sayacı; böylece L2 tahtadayken L2 tekrar yazılmaz (çift emir yok).
+            while self.resting_safety < want && self.next_level_to_place < self.ladder.len() {
+                let lvl = self.ladder[self.next_level_to_place].clone();
                 let act = self.place_safety_order(&lvl);
                 if matches!(act, Action::PlaceLimit { .. }) {
                     self.resting_safety += 1;
                 }
                 acts.push(act);
-                self.filled_safety += 1;
+                self.next_level_to_place += 1;
             }
             // TP recomputation after each fill (WAC changed)
             let q = self.mirror.qty.clone();
@@ -791,6 +832,7 @@ impl DcaEngine {
             self.close_orders_out = 0;
             self.closes_seen = 0;
             self.closed_qty_accum = Fraction::zero();
+            self.closing_bars_waited = 0;
             acts.push(Action::Log {
                 level: "INFO",
                 message: format!(
@@ -806,6 +848,7 @@ impl DcaEngine {
 
     pub fn apply_funding(&mut self, expense: &Fraction) {
         self.funding = self.funding.add(expense).unwrap_or_else(|_| self.funding.clone());
+        self.funding_deal = self.funding_deal.add(expense).unwrap_or_else(|_| self.funding_deal.clone());
     }
 
     /// Margin call: the position was force-closed at the liquidation boundary.
@@ -1136,7 +1179,16 @@ mod signal_gate_tests {
         let new_safety = acts.iter().filter(|a| matches!(a, Action::PlaceLimit { role: "SAFETY", .. })).count();
         assert_eq!(new_safety, 1, "top-up: bekleyen sayısı 3'e tamamlanmalı");
         assert_eq!(e.resting_safety, 3);
-        assert_eq!(e.filled_safety, 2);
+        // Faz 17 (P1-16): filled_safety yalnız DOLUM sayacı; yerleştirme imleci
+        // ayrı — L1 dolunca top-up L2'yi TEKRAR yazmaz, L4'ü yazar (fiyat kanıtı).
+        assert_eq!(e.filled_safety, 1, "filled_safety yalnız dolum sayacı");
+        assert_eq!(e.next_level_to_place, 4, "yerleştirme imleci L4'ü göstermeli");
+        let l4_price = e.ladder[3].price.to_string();
+        let placed_price = acts.iter().find_map(|a| match a {
+            Action::PlaceLimit { price, .. } => Some(price.to_string()),
+            _ => None,
+        }).expect("top-up emri");
+        assert_eq!(placed_price, l4_price, "top-up çift fiyat yerleştirmemeli (eski bug: L2 tekrar)");
     }
 
     /// spec 2.7: CRASH rejiminde ENFORCE bloklar, PERMISSIVE uyarıyla geçirir.

@@ -62,6 +62,13 @@ pub fn gate1_bar_integrity(
 
 /// Gate 2 — Universal fee deduction. Zero-fee fills rejected unless verified promo.
 pub fn gate2_fee_guard(fee_rate: &Fraction, is_verified_zero_fee_promo: bool) -> GateVerdict {
+    // Faz 17 (P1-12): oran aralığı denetimi — negatif ve saçma değerler reddedilir.
+    if fee_rate.is_negative() {
+        return GateVerdict::Reject("GATE2: negative fee rate rejected".into());
+    }
+    if *fee_rate > Fraction::from_decimal_str("0.01").unwrap_or_else(|_| Fraction::zero()) {
+        return GateVerdict::Reject("GATE2: absurd fee rate (>1%) rejected".into());
+    }
     if fee_rate.is_zero() && !is_verified_zero_fee_promo {
         return GateVerdict::Reject("GATE2: zero-fee fill rejected (no verified promo pair)".into());
     }
@@ -165,12 +172,23 @@ pub fn gate6_capital_guard(
     available: &Fraction,
     mode: &CapitalShortfallMode,
 ) -> GateVerdict {
-    let notional = qty.mul(price).unwrap_or_else(|_| Fraction::zero());
+    // Faz 17 (P1-9): aritmetik hata fail-open DEĞİL — Halt döner (required=0
+    // sahte PASS üretirdi). Kernel Halt'ı "GERÇEK veri bozulması" olarak işler.
+    let notional = match qty.mul(price) {
+        Ok(n) => n,
+        Err(e) => return GateVerdict::Halt(format!("GATE6: notional hesap hatası: {e}")),
+    };
     let required = if is_spot {
-        notional.add(fee).unwrap_or_else(|_| Fraction::zero())
+        match notional.add(fee) {
+            Ok(x) => x,
+            Err(e) => return GateVerdict::Halt(format!("GATE6: required hesap hatası: {e}")),
+        }
     } else {
         let lev = if leverage.is_zero() { Fraction::one() } else { leverage.clone() };
-        notional.div(&lev).unwrap_or_else(|_| Fraction::zero()).add(fee).unwrap_or_else(|_| Fraction::zero())
+        match notional.div(&lev).and_then(|x| x.add(fee)) {
+            Ok(x) => x,
+            Err(e) => return GateVerdict::Halt(format!("GATE6: required hesap hatası: {e}")),
+        }
     };
     if required <= *available {
         GateVerdict::Pass

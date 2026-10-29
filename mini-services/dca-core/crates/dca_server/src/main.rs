@@ -709,7 +709,19 @@ async fn auth_middleware(
     let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) else {
         return Err(StatusCode::UNAUTHORIZED);
     };
-    if !auth.starts_with("Bearer ") || &auth[7..] != api_key.as_str() {
+    if !auth.starts_with("Bearer ") {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    // Faz 17 (P2-3): sabit-zamanlı karşılaştırma — early-exit yan kanalı kapalı
+    // (webhook handler'daki desenle aynı).
+    let provided = &auth[7..];
+    let mismatch = provided.len() != api_key.len()
+        || provided
+            .bytes()
+            .zip(api_key.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            != 0;
+    if mismatch {
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(next.run(req).await)
@@ -1534,6 +1546,16 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
     // Faz 13A (IEA, handler ölçeği): LIVE ADD_FUNDS — plan kısa kilitte, AĞ
     // ÇAĞRISI kilit dışında, uygulama yeni kilitte. PAPER normal akışa düşer.
     if req.action == "ADD_FUNDS" {
+        // Faz 17 (P0-7): ADD_FUNDS da yürütme şalterlerine saygılı — şalter
+        // devredeyken borsaya emir gitmez (şalterin anlamı korunur).
+        if app.kill_engaged().await {
+            state::persist_event(&*app, &id, "WARN", "KILL_SWITCH", "ADD_FUNDS reddedildi — KILL_SWITCH devrede").await;
+            return Err(err422("KILL_SWITCH devrede — ADD_FUNDS reddedildi"));
+        }
+        if app.freeze_engaged().await {
+            state::persist_event(&*app, &id, "WARN", "FREEZE", "ADD_FUNDS reddedildi — FREEZE devrede").await;
+            return Err(err422("FREEZE devrede — ADD_FUNDS reddedildi"));
+        }
         let (mode, venue, mark, step_size, planned) = {
             let rts = app.runtimes.lock().await;
             let rt = rts.get(&id).ok_or_else(|| err422("bot not found"))?;
@@ -1552,16 +1574,22 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
                     return Err(err422("amount too small for one unit"));
                 }
                 let order_id = format!("{}-MANUAL-{}", rt.bot_id, state::now_ms());
+                // Faz 17 (P0-7): yön POZİSYON yönünden — short bot fon eklerken
+                // Sell gider (short derinleşir); eski sabit Buy, short pozisyonu
+                // azaltıp ters pozisyon açıyordu.
+                let add_side = if rt.stepper.position.direction == -1 { dca_math::Side::Sell } else { dca_math::Side::Buy };
                 let req_o = dca_exchange::OrderRequest {
                     category: if rt.cfg.kind.is_futures() { "linear".to_string() } else { "spot".to_string() },
                     symbol: rt.cfg.symbol.clone(),
-                    side: dca_math::Side::Buy,
+                    side: add_side,
                     is_market: true,
                     qty: qty.clone(),
                     price: None,
                     reduce_only: false,
                     order_link_id: order_id.clone(),
-                    position_idx: if rt.cfg.kind.is_futures() && rt.pos_mode_hedge { 1 } else { 0 },
+                    position_idx: if rt.cfg.kind.is_futures() && rt.pos_mode_hedge {
+                        if rt.stepper.position.direction == 1 { 1 } else { 2 }
+                    } else { 0 },
                 };
                 Some((req_o, order_id, qty, mark_v))
             } else {
