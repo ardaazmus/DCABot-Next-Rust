@@ -138,6 +138,11 @@ async fn main() {
 
     // SEC-01: /api/health kimlik doğrulaması iSTEMEN (load balancer / monitoring açık erişim).
     let health_routes = Router::new().route("/api/health", get(health));
+    // P0-8: TradingView webhook'u auth middleware DIŞINDA — TradingView alert'i
+    // Bearer başlığı ekleyemez. Uç kendi savunma katmanlarıyla korunur:
+    // sabit-zamanlı per-bot secret + ±60sn replay penceresi + DUPLICATE dedup
+    // + pair eşleşmesi (hepsi canlı doğrulanmış).
+    let webhook_routes = Router::new().route("/api/webhooks/tradingview", post(tradingview_webhook));
 
     // Tüm yönetim routes'ları kimlik doğrulama altına alınır.
     let api_routes = Router::new()
@@ -158,7 +163,6 @@ async fn main() {
     .route("/api/pine/backtest", post(pine_backtest))
     .route("/api/pine/scripts", get(list_pine_scripts).post(save_pine_script))
     .route("/api/pine/scripts/:id", patch(patch_pine_script).delete(delete_pine_script))
-        .route("/api/webhooks/tradingview", post(tradingview_webhook))
         .route("/api/markets", get(markets))
         .route("/api/tickers", get(tickers))
         .route("/api/klines", get(klines))
@@ -209,6 +213,7 @@ async fn main() {
 
     let app = health_routes
         .merge(api_routes)
+        .merge(webhook_routes)
         // SEC-01: CORS çok permisive değil — yalnız erlaubed origin.
         // M-8: başlatıcı UI'ı 127.0.0.1 üzerinde servis eder; tarayıcı origin'i
         // "http://127.0.0.1:3000" olur — localhost alias'ı ile birlikte ikisi

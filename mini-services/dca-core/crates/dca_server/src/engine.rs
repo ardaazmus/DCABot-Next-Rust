@@ -1049,7 +1049,10 @@ pub async fn dispatch_action(
                         order_link_id: id.clone(),
                         // Faz 5 (C-5): hedge modda yön eşlemesi (Buy→1/Sell→2)
                         position_idx: if rt.cfg.kind.is_futures() && rt.pos_mode_hedge {
-                            if side == dca_math::Side::Buy { 1 } else { 2 }
+                            // P0-1: bacak POZİSYON yönüne göre eşlenir — reduce
+                            // kapanış emirleri de ait olduğu bacağın idx'ini kullanır
+                            // (long bacağı Sell kapanışı = idx 1, yanlışlıkla 2 değil).
+                            if rt.stepper.position.direction == 1 { 1 } else { 2 }
                         } else { 0 },
                     };
                     rt.pending_live_intents.push(crate::state::LiveIntent::Place {
@@ -1118,7 +1121,10 @@ pub async fn dispatch_action(
                         order_link_id: id.clone(),
                         // Faz 5 (C-5): hedge modda yön eşlemesi (Buy→1/Sell→2)
                         position_idx: if rt.cfg.kind.is_futures() && rt.pos_mode_hedge {
-                            if side == dca_math::Side::Buy { 1 } else { 2 }
+                            // P0-1: bacak POZİSYON yönüne göre eşlenir — reduce
+                            // kapanış emirleri de ait olduğu bacağın idx'ini kullanır
+                            // (long bacağı Sell kapanışı = idx 1, yanlışlıkla 2 değil).
+                            if rt.stepper.position.direction == 1 { 1 } else { 2 }
                         } else { 0 },
                     };
                     let is_close_m = kind_m == OrderKind::Reduce;
