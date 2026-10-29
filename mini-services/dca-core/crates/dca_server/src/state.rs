@@ -534,6 +534,15 @@ pub struct RuntimeSnapshot {
     /// Faz 13B: hedge bacağı kernel snapshot'ı (EX-06 kalıcı çözüm).
     #[serde(default)]
     pub hedge_kernel: Option<HedgeKernelSnap>,
+    /// P0-3: ANA kernel pozisyonu — restore sonrası kernel/mirror ayrışması
+    /// (hayalet pozisyon + Closing kilidi) tam olarak bu eksikten doğuyordu.
+    #[serde(default)]
+    pub position: Option<dca_math::m04::PositionState>,
+    #[serde(default)]
+    pub kernel_prev_bar_ts: Option<i64>,
+    /// P0-3: bekleyen emirler de snapshot'a girer (kapanış emri kaybı olmasın).
+    #[serde(default)]
+    pub pending: Vec<dca_kernel::OrderIntent>,
 }
 
 /// Faz 13B: hedge bacağı kernel defteri — ana bacaktan bağımsız restore.
@@ -569,6 +578,9 @@ pub fn save_runtime_state(app: &AppState, bot_id: &str, rt: &BotRuntime) {
             realized_net: hs.realized_net.clone(),
             position: hs.position.clone(),
         }),
+        position: Some(rt.stepper.position.clone()),
+        kernel_prev_bar_ts: rt.stepper.prev_bar_ts,
+        pending: rt.stepper.pending.clone(),
     };
     let json = match serde_json::to_string(&snap) {
         Ok(j) => j,
@@ -799,6 +811,13 @@ pub async fn create_runtime(
                     hs.realized_net = hk.realized_net;
                     hs.position = hk.position;
                 }
+                // P0-3: ANA kernel pozisyonu + bekleyen emirler geri yüklenir —
+                // restart sonrası kernel/engine ayrışması (hayalet pozisyon) kapanır.
+                if let Some(pos) = snap.position {
+                    rt.stepper.position = pos;
+                }
+                rt.stepper.prev_bar_ts = snap.kernel_prev_bar_ts.or(Some(snap.last_bar_ts));
+                rt.stepper.pending = snap.pending.clone();
             }
             Err(e) => {
                 let _ = persist_event(app, id, "WARN", "RESTORE", &format!("runtime snapshot cozulemedi ({e}) — bot taze durumla baslatildi")).await;
