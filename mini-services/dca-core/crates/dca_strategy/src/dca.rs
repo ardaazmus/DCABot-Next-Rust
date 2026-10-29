@@ -30,6 +30,16 @@ pub enum TrailingState {
     Triggered,
 }
 
+/// Faz 19 (P1-4 kalıcı): dinlenen TP reduce-only limit emrinin motor tarafı
+/// kaydı — replace kararı (fiyat/adet sapması) ve kapanışta iptal bunun
+/// üzerinden yürür.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RestingTp {
+    pub order_id: String,
+    pub price: Fraction,
+    pub qty: Fraction,
+}
+
 /// Faz 3 (C-4): kalıcı runtime snapshot için serde.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DcaEngine {
@@ -47,6 +57,11 @@ pub struct DcaEngine {
     pub resting_safety: usize,
     pub mirror: PositionState,
     pub tp_price: Option<Fraction>,
+    /// Faz 19 (P1-4 kalıcı): dinlenen TP reduce-only LIMIT emrinin motor
+    /// tarafı kaydı — replace kararı (fiyat/adet sapması) ve kapanışta iptal
+    /// bunun üzerinden yürür. Eski snapshot'larda alan yok → default None.
+    #[serde(default)]
+    pub resting_tp: Option<RestingTp>,
     pub sl_price: Option<Fraction>,
     pub trailing: TrailingState,
     pub trailing_peak: Option<Fraction>,
@@ -133,6 +148,7 @@ impl DcaEngine {
             resting_safety: 0,
             mirror: PositionState::new(direction.sign() as i8),
             tp_price: None,
+            resting_tp: None,
             sl_price: None,
             trailing: TrailingState::Off,
             trailing_peak: None,
@@ -191,12 +207,11 @@ impl DcaEngine {
         let target_pct = Fraction::from_decimal_str(&self.cfg.target_profit_pct).map_err(|e| e.to_string())?;
         if self.cfg.use_net_tp {
             let target_quote = qty.mul(avg).map_err(|e| e.to_string())?.mul(&target_pct).map_err(|e| e.to_string())?;
-            // Faz 18 (P1-4): TP tetiklendiğinde PlaceMarket ile TAKER çıkılır —
-            // net TP hesabı da GERÇEK çıkış maliyetini (taker) kullanmalı;
-            // maker oranı hedefi sistematik olarak yukarı şişirirdi.
-            // (Beklenen slippage strateji seviyesinde konfigüre edilmediğinden
-            // hesaba katılmaz; dolum bir sonraki bar açılışındadır.)
-            let exit_rate = self.inst.taker_fee_rate.clone();
+            // Faz 19 (P1-4 kalıcı): TP artık dinlenen reduce-only LIMIT olarak
+            // icra edilir — çıkış MAKER'dır; net TP hesabı da maker ücretle
+            // tutarlıdır. (Faz 18'deki taker düzeltmesi piyasa-çıkış dönemine
+            // aitti; resting limit mimarisinde gerçek çıkış maliyeti maker.)
+            let exit_rate = self.inst.maker_fee_rate.clone();
             let p = calculate_net_take_profit(
                 self.direction.sign() as i8,
                 qty,
@@ -460,8 +475,13 @@ impl DcaEngine {
         // Faz 17: yeni deal — deal-bazlı funding sıfırlanır (P1-5), yerleştirme
         // imleci N'e ayarlanır (P1-16: top-up L(N+1)'den devam eder, çift yok).
         // Faz 18 (P1-2): deal-bazlı komisyon defteri de yeni deal'da sıfırlanır.
+        // Faz 19 (P1-4): yeni deal önceki deal'in dinlenen TP'sini taşımaz —
+        // eski emir rölanti tahtada kalmasın diye iptal niyeti yayılır.
         self.funding_deal = Fraction::zero();
         self.deal_fees = Fraction::zero();
+        if let Some(rt) = self.resting_tp.take() {
+            acts.push(Action::CancelResting { id: rt.order_id });
+        }
         let n = self.cfg.risk_policy.active_safety_orders.max(1) as usize;
         // Faz 17 (P1-16): yerleştirme imleci = yerleştirilen seviye sayısı;
         // top-up bundan SONRAKI seviyeye yazar (çift yerleştirme imkansız).
@@ -636,6 +656,11 @@ impl DcaEngine {
                         dca_math::Fraction::cmp(mark, sl) != std::cmp::Ordering::Less
                     };
                     if hit {
+                        // Faz 19 (P1-4): SL piyasa ile kapanır — dinlenen TP emri
+                        // geride kalmamalı (bayat TP yeni pozisyonu kapatabilir).
+                        if let Some(rt) = self.resting_tp.take() {
+                            acts.push(Action::CancelResting { id: rt.order_id });
+                        }
                         acts.push(Action::PlaceMarket {
                             id: order_id(&self.next_seq_id(), "SL", 0),
                             side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
@@ -693,6 +718,10 @@ impl DcaEngine {
                                             dca_math::Fraction::cmp(mark, &drop.unwrap_or_else(|_| peak.clone())) != std::cmp::Ordering::Less
                                         };
                                         if exit {
+                                            // Faz 19 (P1-4): trailing kapanışı — dinlenen TP iptal.
+                                            if let Some(rt) = self.resting_tp.take() {
+                                                acts.push(Action::CancelResting { id: rt.order_id });
+                                            }
                                             acts.push(Action::PlaceMarket {
                                                 id: order_id(&self.next_seq_id(), "TRAIL", 0),
                                                 side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
@@ -711,27 +740,52 @@ impl DcaEngine {
                         }
                     }
                 }
-                // TP check (mark-based; resting reduce limit handled by live adapter in live mode)
-                if let Some(tp) = &self.tp_price {
-                    let hit = if self.direction == Direction::Long {
-                        dca_math::Fraction::cmp(mark, tp) != std::cmp::Ordering::Less
+                // Faz 19 (P1-4 kalıcı): TP ARTIK RESTING reduce-only LIMIT'tir.
+                // Eski akış mark TP'ye değince piyasa emri açıyordu: gerçek dolum
+                // bir sonraki bar açılışı ± slippage olur, "net TP" hedefi
+                // sistematik olarak tutmazdı. Yeni akış: hedef fiyat borsada
+                // reduce-only LIMIT olarak bekler; dolum gerçekçi modelden gelir
+                // (Maker, 1-tick penetrasyon + hacim payı). WAC değişince
+                // (safety dolumu → yeni TP/adet) iptal + yeniden yazılır.
+                if let Some(tp) = self.tp_price.clone() {
+                    if self.mirror.qty.is_zero() {
+                        if let Some(rt) = self.resting_tp.take() {
+                            acts.push(Action::CancelResting { id: rt.order_id });
+                        }
                     } else {
-                        dca_math::Fraction::cmp(mark, tp) != std::cmp::Ordering::Greater
-                    };
-                    if hit && !self.mirror.qty.is_zero() {
-                        acts.push(Action::PlaceMarket {
-                            id: order_id(&self.next_seq_id(), "TP", 0),
-                            side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
-                            qty: self.mirror.qty.clone(),
-                            role: "TP",
-                        });
-                        self.phase = DcaPhase::Closing;
-                        self.close_orders_out += 1;
-                        return acts;
+                        let needs_replace = match &self.resting_tp {
+                            None => true,
+                            Some(rt) => rt.price != tp || rt.qty != self.mirror.qty,
+                        };
+                        if needs_replace {
+                            if let Some(old) = self.resting_tp.take() {
+                                acts.push(Action::CancelResting { id: old.order_id });
+                            }
+                            let id = order_id(&self.next_seq_id(), "TPL", 0);
+                            acts.push(Action::PlaceLimit {
+                                id: id.clone(),
+                                side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
+                                price: tp.clone(),
+                                qty: self.mirror.qty.clone(),
+                                role: "TP",
+                            });
+                            self.resting_tp = Some(RestingTp {
+                                order_id: id,
+                                price: tp.clone(),
+                                qty: self.mirror.qty.clone(),
+                            });
+                        }
                     }
+                } else if let Some(rt) = self.resting_tp.take() {
+                    // TP hedefi kalktı (config/patch değişimi) — dinlenen emri çek.
+                    acts.push(Action::CancelResting { id: rt.order_id });
                 }
                 // Manual close
                 if self.manual_close_requested && !self.mirror.qty.is_zero() {
+                    // Faz 19 (P1-4): manuel kapanış — dinlenen TP iptal edilir.
+                    if let Some(rt) = self.resting_tp.take() {
+                        acts.push(Action::CancelResting { id: rt.order_id });
+                    }
                     acts.push(Action::PlaceMarket {
                         id: order_id(&self.next_seq_id(), "MANUAL", 0),
                         side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
@@ -749,6 +803,11 @@ impl DcaEngine {
                 // pozisyon korumasız kalmaz (bakım/reddetme senaryoları).
                 self.closing_bars_waited += 1;
                 if self.closing_bars_waited > 3 && !self.mirror.qty.is_zero() {
+                    // Faz 19 (P1-4): savunmacı — Closing'e giren yollar TP'yi
+                    // iptal eder; kalan bir kayıt varsa burada da düşülür.
+                    if let Some(rt) = self.resting_tp.take() {
+                        acts.push(Action::CancelResting { id: rt.order_id });
+                    }
                     acts.push(Action::PlaceMarket {
                         id: order_id(&self.next_seq_id(), "MANUAL", 0),
                         side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
@@ -832,7 +891,14 @@ impl DcaEngine {
             }
         }
         // Deal fully closed?
-        if !is_add && self.mirror.qty.is_zero() && self.phase == DcaPhase::Closing {
+        // Faz 19 (P1-4): dinlenen TP dolumu fazı Closing'e ALMADAN flat yapar
+        // (resting TP iken faz Open kalır) — kapanış tespiti her iki fazı görür.
+        if !is_add && self.mirror.qty.is_zero() && matches!(self.phase, DcaPhase::Closing | DcaPhase::Open) {
+            // Faz 19 (P1-4): pozisyon kapandı — dinlenen TP (kısmi dolum
+            // artığı olabilir) mutlaka geri çekilir.
+            if let Some(rt) = self.resting_tp.take() {
+                acts.push(Action::CancelResting { id: rt.order_id });
+            }
             let realized = self.mirror.realized_gross.clone();
             // M-17: mirror bir sonraki deal'da sıfırlanır — kapanış realizasyonunu
             // kümülatif deftere devretmeden kaybedilmez.
@@ -898,6 +964,9 @@ impl DcaEngine {
         self.closed_qty_accum = Fraction::zero();
         self.filled_safety = 0;
         self.resting_safety = 0;
+        // Faz 19 (P1-4): likidasyonda dinlenen TP kaydı düşülür — borsa tarafı
+        // iptali çağıran (engine.rs) CancelResting ile yayılır.
+        self.resting_tp = None;
         self.tp_price = None;
         self.sl_price = None;
         self.trailing = TrailingState::Off;
@@ -1478,14 +1547,80 @@ mod m17_realized_ledger_tests {
             })
             .expect("base order");
         e.on_fill(&fill(&base_id, "BASE", Side::Buy, OrderKind::Add, "100", "1", 1_000));
-        // Kısmi bir realizasyon oluşmuş olsun (reduce ile mirror'da birikmiş).
-        e.on_fill(&fill("seed-reduce", "SAFETY", Side::Sell, OrderKind::Reduce, "110", "1", 1_001));
-        assert_eq!(e.mirror.realized_gross.to_string(), "10");
-        assert!(e.mirror.qty.is_zero(), "tam kapanış mirror'ı flat bırakır");
+        // Faz 19: flat'a indiren reduce artık Open fazında da deal'i kapatır
+        // (resting TP dolumu) — force_liquidate'in taşıma sözleşmesi KISMİ
+        // realizasyonla test edilir: 0.5 @ 110 → gross 5, pozisyon 0.5 kalır.
+        e.on_fill(&fill("seed-reduce", "TP", Side::Sell, OrderKind::Reduce, "110", "0.5", 1_001));
+        assert_eq!(e.mirror.realized_gross.to_string(), "5");
+        assert_eq!(e.mirror.qty.to_half_even_display(8), "0.50000000");
         e.cum_realized_gross = Fraction::zero();
         e.force_liquidate();
-        assert_eq!(e.snapshot().realized_gross, "10.00000000");
+        assert_eq!(e.snapshot().realized_gross, "5.00000000");
         assert_eq!(e.deals_closed, 1);
+    }
+
+    #[test]
+    fn resting_tp_limit_replaces_and_fills_realistically() {
+        // Faz 19 (P1-4 kalıcı): TP artık dinlenen reduce-only LIMIT'tir.
+        // 1) Deal açılır açılmaz mark TP'ye değse bile PİYASA emri AÇILMAZ;
+        //    TPL limit emri tahtaya yazılır.
+        // 2) Safety dolumu WAC'ı değiştirir → eski TPL iptal + yeni TPL.
+        // 3) Yüksek penetrasyonlu barda dolum MAKER rolüyle gelir, deal kapanır
+        //    ve dinlenen TP kaydı düşülür.
+        let mut e = DcaEngine::new("p114", BotConfig::default(), Instrument::default()).unwrap();
+        let acts = e.on_bar(&ctx(&bar(1_000, "100"), Fraction::from_decimal_str("100").unwrap()));
+        let base_id = acts
+            .iter()
+            .find_map(|a| match a {
+                Action::PlaceMarket { id, role: "BASE", .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("base order");
+        e.on_fill(&fill(&base_id, "BASE", Side::Buy, OrderKind::Add, "100", "1", 1_000));
+        assert!(e.tp_price.is_some());
+
+        // TP üstünde bir bar: piyasa emri YOK, TPL yerleşir (bir sonraki on_bar'da).
+        let acts = e.on_bar(&ctx(&bar(1_001, "105"), Fraction::from_decimal_str("105").unwrap()));
+        let tpl = acts
+            .iter()
+            .find_map(|a| match a {
+                Action::PlaceLimit { id, price, role: "TP", .. } => Some((id.clone(), price.clone())),
+                _ => None,
+            })
+            .expect("TPL reduce-only limit yerleşmeli");
+        assert!(matches!(e.resting_tp, Some(RestingTp { .. })));
+        let _ = tpl;
+
+        // Safety dolumu WAC'ı düşürür → TP değişir → CancelResting + yeni TPL.
+        e.on_fill(&fill("s1", "SAFETY", Side::Buy, OrderKind::Add, "95", "1", 1_002));
+        let acts = e.on_bar(&ctx(&bar(1_003, "96"), Fraction::from_decimal_str("96").unwrap()));
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::CancelResting { .. })),
+            "WAC değişince eski TPL iptal edilmeli"
+        );
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::PlaceLimit { role: "TP", .. })),
+            "yeni TPL yeniden yazılmalı"
+        );
+
+        // Yüksek TP'yi 1-tick aşıyor (Maker penetrasyon dolumu) → deal kapanır.
+        let tp_now = e.tp_price.clone().expect("tp var");
+        let touch = tp_now.add(&Fraction::from_decimal_str("0.01").unwrap_or_else(|_| Fraction::one())).unwrap_or_else(|_| tp_now.clone());
+        let close_id = e
+            .resting_tp
+            .as_ref()
+            .map(|rt| rt.order_id.clone())
+            .expect("resting tp kayıtlı");
+        let cf = fill(&close_id, "TP", Side::Sell, OrderKind::Reduce, &touch.to_half_even_display(8), "2", 1_004);
+        let acts = e.on_fill(&cf);
+        assert_eq!(e.phase, DcaPhase::Cooldown, "dinlenen TP dolumu deal'i kapatmalı");
+        assert!(e.mirror.qty.is_zero());
+        assert!(e.resting_tp.is_none(), "deal kapanınca TP kaydı düşülmeli");
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::CancelResting { .. })),
+            "kapanışta artık TPL iptal niyeti yayılmalı"
+        );
+        assert_eq!(e.wins, 1, "net pozitif deal kazanç");
     }
 
     #[test]

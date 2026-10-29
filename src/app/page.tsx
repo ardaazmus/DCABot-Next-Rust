@@ -211,7 +211,7 @@ export default function Page() {
               {view === "studio" && botId && <StudioView botId={botId} onBack={() => go("fleet")} />}
               {view === "wizard" && <WizardView onCreated={openStudio} />}
               {view === "calc" && <CalculatorLazy />}
-              {view === "backtest" && <BacktestLazy />}
+              {view === "backtest" && <BacktestLazy onGoWizard={() => go("wizard")} />}
               {view === "knowledge" && <KnowledgeLazy onOpenAi={() => go("backtest")} />}
               {view === "settings" && <SettingsLazy />}
             </motion.div>

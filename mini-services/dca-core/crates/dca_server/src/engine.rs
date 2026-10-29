@@ -485,7 +485,7 @@ async fn check_liquidation(
     let cancelled = rt.stepper.cancel_pending();
     let bot_id = rt.bot_id.clone();
     if let Some(fill) = rt.stepper.force_close(&liq_px, bar.t, "LIQ").map_err(|e| e.to_string())? {
-        let acts = rt.engine_kind.on_fill(&fill);
+        let mut acts = rt.engine_kind.on_fill(&fill);
         persist_fill(app, &bot_id, &fill).await?;
         let _ = sse.send(SseEvent {
             event: "FILL".into(),
@@ -525,11 +525,18 @@ async fn check_liquidation(
         )
         .await;
         if let dca_strategy::EngineTag::Dca(e) = &mut rt.engine_kind {
+            // Faz 19 (P1-4): likidasyonda dinlenen TP emri borsadan da çekilir.
+            if let Some(rt_tp) = e.resting_tp.take() {
+                acts.push(dca_strategy::Action::CancelResting { id: rt_tp.order_id });
+            }
             e.force_liquidate();
         }
         if let dca_strategy::EngineTag::Hedge(h) = &mut rt.engine_kind {
             // Faz 13B: ANA bacak likide oldu — yalnız ana bacak force_liquidate;
             // hedge bacağı kendi stepper'ıyla izlenmeye devam eder.
+            if let Some(rt_tp) = h.main.resting_tp.take() {
+                acts.push(dca_strategy::Action::CancelResting { id: rt_tp.order_id });
+            }
             h.main.force_liquidate();
         }
         for a in acts {
@@ -1036,7 +1043,10 @@ pub async fn dispatch_action(
 ) -> Result<(), String> {
     match action {
         Action::PlaceLimit { id, side, price, qty, role } => {
-            let is_close = role == "GRID_CLOSE";
+            // Faz 19 (P1-4): TP de resting reduce-only limit — GRID_CLOSE ile
+            // aynı kapanış muafiyetleri (GATE6 yok, reduce_only, positionIdx
+            // bacak yönü) TP için de geçerlidir.
+            let is_close = role == "GRID_CLOSE" || role == "TP";
             match rt.mode.as_str() {
                 "PAPER" => {
                     // Faz 13B: hedge-prefix'li emirler hedge bacak stepper'ına.

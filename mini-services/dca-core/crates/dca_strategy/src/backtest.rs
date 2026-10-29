@@ -801,9 +801,10 @@ fn dispatch_leg(
 fn dispatch(stepper: &mut SimulationStepper, action: Action, ts: i64) -> Result<(), String> {
     match action {
         Action::PlaceLimit { id, side, price, qty, role } => {
-            // GRID_CLOSE pairs are closing orders (Reduce) — they book the grid
-            // step profit when filled; plain GRID openers expand inventory.
-            let kind = if role == "GRID_CLOSE" { OrderKind::Reduce } else { OrderKind::Add };
+            // GRID_CLOSE ve Faz 19 TP (resting reduce-only limit) kapanış
+            // emirleridir (Reduce) — GRID step kârını, TP deal kârını kitalar;
+            // diğerleri envanter açar.
+            let kind = if matches!(role, "GRID_CLOSE" | "TP") { OrderKind::Reduce } else { OrderKind::Add };
             let placement_ref = stepper.last_close.clone().unwrap_or_else(|| price.to_string());
             stepper.submit_intent(
                 OrderIntent {

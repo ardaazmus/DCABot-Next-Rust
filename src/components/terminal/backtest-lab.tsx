@@ -19,6 +19,7 @@ import { BacktestResultView, defaultDcaConfig } from "@/components/terminal/back
 import { apiAiDiagnose, apiAiProviders, apiBacktest, apiBacktestCert, apiCalibration, apiFuturesState, apiMarkets, apiNews, apiNewsAi, apiOrderbook, apiRegime, useBots } from "@/hooks/use-engine";
 import { cn } from "@/lib/utils";
 import { DEFAULT_RISK_POLICY } from "@/lib/engine-types";
+import { saveCarriedConfig } from "@/lib/carry-config";
 import type { AiCallConfig, AiProvider, AiResult, BacktestCertResult, BacktestResult, BotKind, CalibrationResult, FillModel, FuturesStateResult, Instrument, Interval, NewsAiResult, NewsResult, OrderBookResult, RegimeResult, Venue } from "@/lib/engine-types";
 
 const INTERVALS: Interval[] = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"];
@@ -45,7 +46,7 @@ function certBadge(label: string, value: string, tone: "good" | "warn" | "bad" |
   );
 }
 
-export function BacktestLab() {
+export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
   const [kind, setKind] = useState<BotKind>("DCA_LONG");
   const [symbol, setSymbol] = useState("BTCUSDT");
   const [interval, setInterval] = useState<Interval>("1h");
@@ -653,6 +654,31 @@ export function BacktestLab() {
               {certBusy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <BadgeCheck className="h-4 w-4" aria-hidden />}
               {certBusy ? "Sertifikalanıyor…" : "SERTİFİKALA"}
             </Button>
+            {/* Faz 19 (UIX-11): Lab'de beğenilen koşuyu tek tıkla Sihirbaz'a taşı —
+                config session-storage'a yazılır, Sihirbaz mount'ta tüketip
+                alanları prefill eder (tek seferlik, 10 dk tazelik penceresi). */}
+            {onGoWizard && (
+              <Button
+                onClick={() => {
+                  const ok = saveCarriedConfig({
+                    source: "lab",
+                    kind,
+                    symbol: symbol.trim().toUpperCase() || "BTCUSDT",
+                    interval,
+                    venue,
+                    startCash: startCash || "100000",
+                    config: buildConfig() as unknown as Record<string, unknown>,
+                  });
+                  if (ok) onGoWizard();
+                }}
+                variant="outline"
+                title="Bu ayarlarla Sihirbaz'ı aç (alanlar otomatik doldurulur)"
+                className="min-h-11 flex-1 border-violet-500/50 bg-violet-500/10 font-bold text-violet-300 hover:bg-violet-500/20 hover:text-violet-200 lg:w-44"
+              >
+                <Send className="h-4 w-4" aria-hidden />
+                SİHİRBAZA TAŞI
+              </Button>
+            )}
           </div>
         </div>
 

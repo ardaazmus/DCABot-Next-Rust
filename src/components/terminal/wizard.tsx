@@ -62,6 +62,7 @@ import {
 } from "@/components/ui/select";
 import { LadderTable, MeshTable } from "@/components/terminal/ladder";
 import { Panel, PassChip, Spinner } from "@/components/terminal/bits";
+import { consumeCarriedConfig } from "@/lib/carry-config";
 import { TvChart, type TvMarker, type TvPlotSeries, type TvPriceLine } from "@/components/terminal/tv-chart";
 import { SignalBuilder } from "@/components/terminal/signal-builder";
 import {
@@ -233,6 +234,43 @@ export function Wizard({ onCreated }: WizardProps) {
   const isHedgeKind = kind === "HEDGE_PROTECTIVE" || kind === "HEDGE_DUAL";
   const marketType: "spot" | "linear" = isShort || kind === "FUTURES_GRID" || isFuturesDca || leverage > 1 ? "linear" : "spot";
   const category: "spot" | "linear" = isShort || kind === "FUTURES_GRID" || isFuturesDca ? "linear" : "spot";
+
+  /* ---- Faz 19 (UIX-11): Lab'den taşınan config'i tek seferlik prefill ---- */
+  useEffect(() => {
+    const c = consumeCarriedConfig();
+    if (!c) return;
+    const cfg = (c.config ?? {}) as Record<string, unknown>;
+    const num = (v: unknown, fallback: number): number => {
+      const n = Number(v);
+      return Number.isFinite(n) && n > 0 ? n : fallback;
+    };
+    setKind(c.kind as BotKind);
+    setVenue((c.venue as Venue) ?? "BYBIT");
+    setMode("PAPER");
+    setSymbol(c.symbol);
+    setSymbolQuery(c.symbol);
+    setIntervalSel(c.interval as Interval);
+    setStartCash(c.startCash);
+    // Motor fraksiyon sözleşmesi: 0.02 = %2 → arayüz yüzde gösterir (×100).
+    setDeviationPct(Math.round(num(cfg.deviation_pct, 0.02) * 10000) / 100);
+    setTargetProfitPct(Math.round(num(cfg.target_profit_pct, 0.02) * 10000) / 100);
+    if (typeof cfg.max_safety_orders === "number" && cfg.max_safety_orders >= 0) {
+      setMaxSafety(Math.min(100, Math.floor(cfg.max_safety_orders)));
+    }
+    if (cfg.base_order_size != null && cfg.base_order_size !== "") setBaseSize(String(cfg.base_order_size));
+    if (cfg.safety_order_size != null && cfg.safety_order_size !== "") setSafetySize(String(cfg.safety_order_size));
+    if (cfg.step_scale != null && cfg.step_scale !== "") setStepScale(String(cfg.step_scale));
+    if (cfg.volume_scale != null && cfg.volume_scale !== "") setVolumeScale(String(cfg.volume_scale));
+    if (cfg.leverage != null && cfg.leverage !== "") {
+      const lev = Math.floor(num(cfg.leverage, 1));
+      if (lev >= 1 && lev <= 50) setLeverage(lev);
+    }
+    toast({
+      title: "Lab konfigürasyonu yüklendi",
+      description: `${c.symbol} · ${c.interval} — sapma, hedef kâr ve kademeler Lab koşusundan dolduruldu.`,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   /* ---- markets fetch once strategy kind or venue is selected ---- */
   useEffect(() => {
