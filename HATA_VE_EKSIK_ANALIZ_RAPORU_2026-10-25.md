@@ -781,6 +781,36 @@ Motor sözleşmeleri (health/auth/calc/backtest/pine/vault/halt/webhook korumas�
 
 ---
 
+
+## 4.13 Faz 17 — Dış denetim P0/P1 dalga 1 uygulaması (28 Ekim gece)
+
+Dış denetim raporunun (DENETIM_RAPORU_2026-10-28.md) en kritik kalemlerinden ilk dalga uygulandı:
+
+| Dış bulgu | Düzeltme | Kanıt |
+|---|---|---|
+| P1-16: SAFETY top-up `filled_safety`'yi hem dolum hem yerleştirme imleci olarak kullanıp aynı fiyata ikinci emir yazıyordu (pozisyon 2× büyüyordu; test fiyatı kontrol etmediği için kaçmıştı) | Yerleştirme imleci ayrıldı (`next_level_to_place`); test yeni semantiğe + fiyat doğrulamasına güncellendi (L1 dolunca L2 tekrar DEĞİL, L4 yazılır) | birim test PASS (fiyat kanıtlı) |
+| P1-5: TP hesabı bot-ömrü kümülatif funding kullanıyordu → 10. deal'de TP ulaşılamaz | `funding_deal` alanı: deal açılışında sıfırlanır, `compute_tp` bunu kullanır; `funding` kümülatif raporlama alanı olarak kaldı. Not: diğer oturumun "deal-bazı sıfırlama kaldırıldı" kararı denetçi gerekçesiyle tersine çevrildi (denetçi haklı) | kod |
+| P0-6 kısmen: TP/MANUAL kapanış emri 3 barda dolmazsa yeniden gönderilir (`closing_bars_waited`); deal kapanışında sayaç sıfırlanır | kod | |
+| P1-9: GATE6 aritmetik hata `unwrap_or(0)` ile sahte PASS üretiyordu | Halt döner (fail-closed) | kod |
+| P1-12: GATE2 negatif/%1 üstü oranları kabul ediyordu | Reddedilir | kod |
+| P1-17: M07 yakınsamama sahte `Some(0)` döndürüyordu (likidasyon hiç tetiklenmezdi) | `Err(DomainViolation)` — çağıranlar WARN üretir | kod |
+| P2-3: API anahtar karşılaştırması early-exit'liydi | Sabit-zamanlı (webhook deseni) | kod |
+| P0-7: ADD_FUNDS şalterleri atlıyor + sabit Buy (short botu ters pozisyona itiyordu) | kill/freeze denetimi + yön pozisyon yönünden + positionIdx eşlemesi | kod |
+
+Testler: workspace 276/276 PASS (P1-16 fiyat doğrulamalı yeni test dâhil); motor yeniden başlatıldı, 12 bot restore; push 1e4584f.
+
+### Kalan (denetim sırası — sonraki oturumlara)
+
+- P0-2 kalanı: GATE1 gap resync canlı doğrulandı (PAUSE→START kabul) — TAMAM
+- P0-3 kalanı: kernel position snapshot TAMAM; restore tutarlılık assert'i (uyumsuzsa HALTED_RESTORE) — küçük
+- P0-4/P0-5: market dolumu tamamen sweep'e devir + execId anahtar (orta iş)
+- P0-10: WFE negatif-fold cezası + bileşik getiri + ortak maliyet tabanı (certify.rs, orta iş)
+- P0-7 kalanı: ADD_FUNDS sonrası TP/ladder yeniden hesap
+- P1-16 kalıntısı: `safety_triggered` UI sayısının düzeltilmesi
+- P2-4/P2-5: Argon2id + periyodik izin taraması
+- UIX-1/2/3: SSE olay listesi genişletme + Pine TP/SL yüzde/kesir dönüşümü
+
+---
 ## 5. AÇIK BULGULAR (güncel kaynakla doğrulanmış)
 
 Önem sırası: **C (Kritik) → H (Yüksek) → M (Orta)**. Her bulguda kanıt `dosya:satır`, etki ve gereken iş verilir.
