@@ -80,7 +80,10 @@ export function BacktestResultView({ result, symbol, interval }: { result: Backt
         <MetricTile label="Toplam Getiri" value={fmtPctNum(m.total_return_pct)} tone={ret >= 0 ? "emerald" : "rose"} />
         <MetricTile label="Max DD" value={fmtPctNum(m.max_drawdown_pct)} tone="rose" />
         <MetricTile label="Win Rate" value={fmtPctNum(m.win_rate_pct)} tone="cyan" />
-        <MetricTile label="Sharpe" value={String(m.sharpe_display)} tone="slate" />
+        {/* Faz 18 (P1-3): değer per-bar SR × 100'dür — yıllıklandırılmamış,
+            okunabilirlik ölçekli; "Sharpe" etiketi kullanıcıyı yıllık
+            Sharpe sanmaya itiyordu. Dürüst etiket. */}
+        <MetricTile label="Per-bar SR (×100)" value={String(m.sharpe_display)} tone="slate" />
         <MetricTile label="Deal" value={String(m.deals)} tone="slate" mono={false} />
         <MetricTile label="Fill" value={String(result.fills)} tone="slate" mono={false} />
         <MetricTile label="Ücret" value={fmtUsd(m.total_fees)} tone="amber" />

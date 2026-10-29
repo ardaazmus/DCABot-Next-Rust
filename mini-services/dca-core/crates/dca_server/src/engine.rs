@@ -573,45 +573,50 @@ async fn execute_live_intents(
                 match adapter.place_order(creds, &req).await {
                     Ok(_) => {
                         if req.is_market {
-                            // market dolum yakalama (Task 20 L3) — 3 deneme, kilitsiz
-                            let mut outcome_done = false;
+                            // Faz 18 (P0-4/P0-5): market dolum yakalama TEK YOL —
+                            // executions(): dolum kimliği borsa execId'sidir (yerel
+                            // now_ms anahtarı retry/çift cascade turunda çift sayıma
+                            // açıktı), her execution AYRI MarketFilled taşır (kısmi
+                            // dolum taneli muhasebe). Kalan miktar MarketOpen ile
+                            // kitapta tutulur; sweep order-history ile tamamlar —
+                            // "st.price None → sessiz kayıp" deliği kapanmıştır.
+                            let mut captured = Fraction::zero();
+                            let mut exec_err: Option<String> = None;
                             for attempt in 0..3u32 {
-                                match adapter.query_order(creds, &req.category, &req.symbol, &id).await {
-                                    Ok(Some(st)) => {
-                                        if !st.cum_exec_qty.is_zero() {
-                                            if let Some(px) = &st.price {
-                                                let filled = if st.cum_exec_qty < qty { st.cum_exec_qty.clone() } else { qty.clone() };
-                                                out.push(crate::state::IntentOutcome::MarketFilled {
-                                                    id: id.clone(), side, kind, role: role.clone(),
-                                                    qty_filled: filled, price: px.clone(),
-                                                    fee: st.cum_exec_fee.clone(),
-                                                });
-                                                outcome_done = true;
-                                            }
-                                            break;
-                                        }
-                                        if matches!(st.status.as_str(), "New" | "PartiallyFilled" | "Created") {
-                                            out.push(crate::state::IntentOutcome::MarketOpen {
-                                                id: id.clone(), side, kind, role: role.clone(),
-                                                price: st.price.clone().unwrap_or_else(Fraction::zero),
-                                                qty,
+                                match adapter.executions(creds, &req.category, &req.symbol, &id).await {
+                                    Ok(v) => {
+                                        for ex in v.into_iter().filter(|e| !e.exec_qty.is_zero()) {
+                                            captured = captured.add(&ex.exec_qty).unwrap_or_else(|_| captured.clone());
+                                            out.push(crate::state::IntentOutcome::MarketFilled {
+                                                id: id.clone(), side, kind: kind.clone(), role: role.clone(),
+                                                qty_filled: ex.exec_qty, price: ex.exec_price, fee: ex.exec_fee,
+                                                fill_key: format!("{}-{}", ex.order_link_id, ex.exec_id),
                                             });
-                                            outcome_done = true;
                                         }
+                                        exec_err = None;
                                         break;
                                     }
-                                    Ok(None) => break, // bulunamadı — dürüst: görünmez
                                     Err(e) => {
-                                        if attempt == 2 {
-                                            out.push(crate::state::IntentOutcome::MarketQueryFailed { id: id.clone(), err: e });
-                                        } else {
+                                        exec_err = Some(e);
+                                        if attempt < 2 {
                                             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                                         }
                                     }
                                 }
                             }
-                            if !outcome_done {
-                                out.push(crate::state::IntentOutcome::MarketNoTrace { id });
+                            // Kısmi/hiç dolum: kalan kitaba girer (sweep tamamlar).
+                            // Sorgu tamamen başarısızsa bile emir KİTAPTA kalır —
+                            // görünmez dolum artık imkansız (fail-closed).
+                            let remaining = qty.sub(&captured).unwrap_or_else(|_| Fraction::zero());
+                            if let Some(e) = exec_err {
+                                out.push(crate::state::IntentOutcome::MarketQueryFailed { id: id.clone(), err: e });
+                            }
+                            if !remaining.is_zero() && !remaining.is_negative() {
+                                out.push(crate::state::IntentOutcome::MarketOpen {
+                                    id, side, kind, role,
+                                    price: Fraction::zero(),
+                                    qty: remaining,
+                                });
                             }
                         } else {
                             out.push(crate::state::IntentOutcome::Placed { id, side, kind, price, qty, role });
@@ -697,10 +702,11 @@ async fn apply_intent_outcomes(
                     role,
                 });
             }
-            crate::state::IntentOutcome::MarketFilled { id, side, kind, role, qty_filled, price, fee } => {
+            crate::state::IntentOutcome::MarketFilled { id, side, kind, role, qty_filled, price, fee, fill_key } => {
+                // Faz 18 (P0-4): anahtar borsa execId'si — retry/çift cascade
+                // turunda aynı dolum iki kez muhasebeleştirilemez.
                 let ts2 = crate::state::now_ms();
-                let fk = format!("{}-{}", id, ts2);
-                if fill_exists(app, &rt.bot_id, &fk).await.unwrap_or(false) {
+                if fill_exists(app, &rt.bot_id, &fill_key).await.unwrap_or(false) {
                     continue;
                 }
                 // Faz 13B: dolum, order-id prefix'ine göre DOĞRU bacak kernel'ine.
@@ -710,7 +716,7 @@ async fn apply_intent_outcomes(
                 } else {
                     Some(&mut rt.stepper)
                 };
-                if let Ok(Some(f)) = mf_target
+                let ingest = mf_target
                     .ok_or("hedge stepper yok")?
                     .ingest_external_fill_with_fee(
                         &id,
@@ -723,24 +729,62 @@ async fn apply_intent_outcomes(
                         FillRealism::MarketableTaker,
                         ts2,
                         fee.as_ref(),
-                    )
-                {
-                    let _ = persist_fill(app, &rt.bot_id, &f).await;
-                    let acts = rt.engine_kind.on_fill(&f);
-                    let _ = sse.send(SseEvent {
-                        event: "FILL".into(),
-                        data: json!({
-                            "botId": rt.bot_id, "fillKey": f.fill_key, "orderId": f.order_id,
-                            "role": f.role, "side": format!("{:?}", f.side), "kind": format!("{:?}", f.kind),
-                            "price": f.price.to_string(), "qty": f.qty.to_string(), "fee": f.fee.to_string(),
-                            "feeRole": format!("{}", f.fee_role), "fillModel": format!("{:?}", f.realism), "ts": f.ts,
-                        })
-                        .to_string(),
-                    });
-                    crate::state::remove_live_order(app, &rt.bot_id, &id);
-                    rt.live_open_orders.retain(|o| o.id != id);
-                    for a in acts {
-                        Box::pin(dispatch_action(app, rt, a, ts2, sse)).await?;
+                    );
+                match ingest {
+                    Ok(maybe_f) => {
+                        if let Some(f) = maybe_f {
+                            let _ = persist_fill(app, &rt.bot_id, &f).await;
+                            let acts = rt.engine_kind.on_fill(&f);
+                            let _ = sse.send(SseEvent {
+                                event: "FILL".into(),
+                                data: json!({
+                                    "botId": rt.bot_id, "fillKey": f.fill_key, "orderId": f.order_id,
+                                    "role": f.role, "side": format!("{:?}", f.side), "kind": format!("{:?}", f.kind),
+                                    "price": f.price.to_string(), "qty": f.qty.to_string(), "fee": f.fee.to_string(),
+                                    "feeRole": format!("{}", f.fee_role), "fillModel": format!("{:?}", f.realism), "ts": f.ts,
+                                })
+                                .to_string(),
+                            });
+                            for a in acts {
+                                Box::pin(dispatch_action(app, rt, a, ts2, sse)).await?;
+                            }
+                        }
+                        // Faz 18 (P0-5): bu dolum emrin TÜM kitap miktarını
+                        // karşılamıyorsa emir kitapta KALIR — kalan miktar
+                        // sweep'te tamamlanır (kısmi dolum takibi).
+                        let book = rt.live_open_orders.iter().find(|o| o.id == id);
+                        let covers_all = book.map(|o| qty_filled >= o.qty).unwrap_or(true);
+                        let cost = book.map(|o| {
+                            let n = o.qty.mul(&o.price).unwrap_or_else(|_| Fraction::zero());
+                            if o.kind == OrderKind::Add && !rt.stepper.cfg.is_spot {
+                                let lev = if rt.stepper.cfg.leverage.is_zero() { Fraction::one() } else { rt.stepper.cfg.leverage.clone() };
+                                n.div(&lev).unwrap_or(n)
+                            } else {
+                                n
+                            }
+                        });
+                        if covers_all {
+                            rt.live_open_orders.retain(|o| o.id != id);
+                            crate::state::remove_live_order(app, &rt.bot_id, &id);
+                            if let Some(c) = cost {
+                                if !c.is_zero() {
+                                    crate::state::bump_venue_live_load(app, &rt.venue, &c, false).await;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Faz 18 (P0-4): yutulan dolum yok — CRITICAL olay yazılır,
+                        // emir kitapta tutulur; sweep aynı execId anahtarıyla
+                        // yeniden dener (kitap = kalıcı pending-fill kuyruğu).
+                        let msg = format!(
+                            "LIVE dolum işlenemedi ({id} / {fill_key}): {e} — emir kitapta tutuldu, sweep yeniden deneyecek"
+                        );
+                        crate::state::persist_event(app, &rt.bot_id, "CRITICAL", "FILL_INGEST", &msg).await;
+                        let _ = sse.send(SseEvent {
+                            event: "RISK".into(),
+                            data: json!({"botId": rt.bot_id, "code": "FILL_INGEST_FAILED", "message": msg, "ts": ts2}).to_string(),
+                        });
                     }
                 }
             }
@@ -771,12 +815,6 @@ async fn apply_intent_outcomes(
                 if !rt.live_open_orders.iter().any(|o| o.id == id) {
                     rt.live_open_orders.push(crate::state::LiveTrackedOrder { id, side, kind, price, qty, role });
                 }
-            }
-            crate::state::IntentOutcome::MarketNoTrace { id } => {
-                let _ = sse.send(SseEvent {
-                    event: "ORDER".into(),
-                    data: json!({"botId": rt.bot_id, "id": id, "result": {"placed": true, "trace": "none"}}).to_string(),
-                });
             }
             crate::state::IntentOutcome::MarketQueryFailed { id, err } => {
                 let msg = format!("LIVE market fill sorgusu başarısız ({id}): {err} — dolum sweep'te order-history ile doğrulanmalı");

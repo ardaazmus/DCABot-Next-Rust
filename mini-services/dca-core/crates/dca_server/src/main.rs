@@ -1283,7 +1283,9 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
         let gate_cash = start_cash.clone();
         let (gate_cert, gate_base) = tokio::task::spawn_blocking(move || {
             let base = run_backtest(&bars_n, &inst, &gate_cfg, gate_cash.clone(), dca_math::sessions::SessionType::Crypto24_7, &funding).ok();
-            let cert = certify(&bars_n, &inst, &gate_cfg, gate_cash, dca_math::sessions::SessionType::Crypto24_7, 100);
+            // Faz 18 (P0-10): denemeler de base ile aynı funding takviminde —
+            // ortak maliyet tabanı.
+            let cert = certify(&bars_n, &inst, &gate_cfg, gate_cash, dca_math::sessions::SessionType::Crypto24_7, 100, &funding);
             (cert, base)
         })
         .await
@@ -2173,7 +2175,8 @@ async fn backtest_cert(
         .collect();
     let (cert, base_metrics) = tokio::task::spawn_blocking(move || {
         let base = run_backtest(&bars_n, &inst, &cfg, start.clone(), session, &funding).ok();
-        let cert = certify(&bars_n, &inst, &cfg, start, session, req.mc_runs);
+        // Faz 18 (P0-10): denemeler de base ile aynı funding takviminde.
+        let cert = certify(&bars_n, &inst, &cfg, start, session, req.mc_runs, &funding);
         (cert, base)
     })
     .await

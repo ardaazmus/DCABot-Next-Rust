@@ -972,7 +972,7 @@ export function BacktestLab() {
                   <div className="flex flex-wrap gap-2 text-[11px] text-slate-400">
                     <span className="rounded bg-surface px-2 py-1">Temel: getiri {cert.base.totalReturnPct}%</span>
                     <span className="rounded bg-surface px-2 py-1">MDD {cert.base.maxDrawdownPct}%</span>
-                    <span className="rounded bg-surface px-2 py-1">Sharpe {cert.base.sharpeDisplay}</span>
+                    <span className="rounded bg-surface px-2 py-1">Per-bar SR (×100) {cert.base.sharpeDisplay}</span>
                     <span className="rounded bg-surface px-2 py-1">Deal {cert.base.deals}</span>
                   </div>
                 )}

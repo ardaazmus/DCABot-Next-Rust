@@ -67,6 +67,11 @@ pub struct DcaEngine {
     pub deals_closed: usize,
     pub wins: usize,
     pub losses: usize,
+    /// Faz 18 (P1-2): DEAL-bazlı komisyon toplamı — win/loss kararı net
+    /// bilanço üzerinden verilir (realized_gross − deal_fees − funding_deal).
+    /// Deal açılışında sıfırlanır.
+    #[serde(default)]
+    pub deal_fees: Fraction,
     /// M-17: bot ömrü boyunca gerçekleşen brüt PnL. Mirror deal-başı WAC
     /// defteridir ve her yeni deal'da sıfırlanır; kümülatif realizasyon
     /// burada devredilir (deals_closed ile aynı pencere).
@@ -142,6 +147,7 @@ impl DcaEngine {
             deals_closed: 0,
             wins: 0,
             losses: 0,
+            deal_fees: Fraction::zero(),
             cum_realized_gross: Fraction::zero(),
             rsi_window: Vec::new(),
             manual_close_requested: false,
@@ -185,7 +191,12 @@ impl DcaEngine {
         let target_pct = Fraction::from_decimal_str(&self.cfg.target_profit_pct).map_err(|e| e.to_string())?;
         if self.cfg.use_net_tp {
             let target_quote = qty.mul(avg).map_err(|e| e.to_string())?.mul(&target_pct).map_err(|e| e.to_string())?;
-            let exit_rate = self.inst.maker_fee_rate.clone();
+            // Faz 18 (P1-4): TP tetiklendiğinde PlaceMarket ile TAKER çıkılır —
+            // net TP hesabı da GERÇEK çıkış maliyetini (taker) kullanmalı;
+            // maker oranı hedefi sistematik olarak yukarı şişirirdi.
+            // (Beklenen slippage strateji seviyesinde konfigüre edilmediğinden
+            // hesaba katılmaz; dolum bir sonraki bar açılışındadır.)
+            let exit_rate = self.inst.taker_fee_rate.clone();
             let p = calculate_net_take_profit(
                 self.direction.sign() as i8,
                 qty,
@@ -448,7 +459,9 @@ impl DcaEngine {
         // Task 16 (spec 2.8): ilk N güvenlik emrini tahtaya yaz (single-active yerine).
         // Faz 17: yeni deal — deal-bazlı funding sıfırlanır (P1-5), yerleştirme
         // imleci N'e ayarlanır (P1-16: top-up L(N+1)'den devam eder, çift yok).
+        // Faz 18 (P1-2): deal-bazlı komisyon defteri de yeni deal'da sıfırlanır.
         self.funding_deal = Fraction::zero();
+        self.deal_fees = Fraction::zero();
         let n = self.cfg.risk_policy.active_safety_orders.max(1) as usize;
         // Faz 17 (P1-16): yerleştirme imleci = yerleştirilen seviye sayısı;
         // top-up bundan SONRAKI seviyeye yazar (çift yerleştirme imkansız).
@@ -766,6 +779,12 @@ impl DcaEngine {
             // burada yalnız ham fill sayacı tutulur.
             self.filled_safety += 1;
         }
+        // Faz 18 (P1-2): deal komisyon defteri — her dolumun ücreti deal
+        // bazında birikir; win/loss kararı net bilanço üzerinden verilir.
+        self.deal_fees = self
+            .deal_fees
+            .add(&fill.fee)
+            .unwrap_or_else(|_| self.deal_fees.clone());
         let before_qty = self.mirror.qty.clone();
         let _ = self.mirror.apply_fill(&fill.fill_key, &fill.price, &fill.qty, is_add);
 
@@ -821,7 +840,14 @@ impl DcaEngine {
                 .cum_realized_gross
                 .add(&realized)
                 .unwrap_or_else(|_| self.cum_realized_gross.clone());
-            if dca_math::Fraction::cmp(&realized, &Fraction::zero()) == std::cmp::Ordering::Greater {
+            // Faz 18 (P1-2): net bilanço — deal komisyonları ve deal funding
+            // düşülerek kazanma/kaybetme kararı verilir (brüt PnL değil).
+            // Aritmetik hatada brüt değerle devam edilir (karar yine kaydedilir).
+            let net = realized
+                .sub(&self.deal_fees)
+                .and_then(|x| x.sub(&self.funding_deal))
+                .unwrap_or_else(|_| realized.clone());
+            if dca_math::Fraction::cmp(&net, &Fraction::zero()) == std::cmp::Ordering::Greater {
                 self.wins += 1;
             } else {
                 self.losses += 1;
@@ -836,8 +862,11 @@ impl DcaEngine {
             acts.push(Action::Log {
                 level: "INFO",
                 message: format!(
-                    "deal closed net_gross={} wins={} losses={}",
+                    "deal closed gross={} fees={} funding={} net={} wins={} losses={}",
                     realized.to_half_even_display(8),
+                    self.deal_fees.to_half_even_display(8),
+                    self.funding_deal.to_half_even_display(8),
+                    net.to_half_even_display(8),
                     self.wins,
                     self.losses
                 ),
@@ -886,8 +915,14 @@ impl DcaEngine {
             },
             position_qty: self.mirror.qty.to_half_even_display(8),
             avg_price: self.mirror.avg_price.as_ref().map(|a| self.close_str(a, 8)),
-            next_safety_price: self.ladder.get(self.filled_safety).map(|l| self.close_str(&l.price, 8)),
-            next_safety_level: self.ladder.get(self.filled_safety).map(|l| l.level_index),
+            // Faz 18 (P1-16 kalıntı): "sıradaki güvenlik" gösterimi yerleştirme
+            // imlecini izler — dolum sayacı (filled_safety) top-up sonrası
+            // merdiven imlecinden sapabilir (çoklu resting + konsolide dolum).
+            next_safety_price: self
+                .ladder
+                .get(self.next_level_to_place)
+                .map(|l| self.close_str(&l.price, 8)),
+            next_safety_level: self.ladder.get(self.next_level_to_place).map(|l| l.level_index),
             tp_price: self.tp_price.as_ref().map(|p| self.close_str(p, 8)),
             sl_price: self.sl_price.as_ref().map(|p| self.close_str(p, 8)),
             trailing_state: Some(format!("{:?}", self.trailing)),
@@ -1393,6 +1428,42 @@ mod m17_realized_ledger_tests {
         assert_eq!(e.wins, 1);
         // -10 + (95-90)*1 = -5
         assert_eq!(e.snapshot().realized_gross, "-5.00000000");
+    }
+
+    #[test]
+    fn deal_win_decision_is_net_of_fees_and_funding() {
+        // Faz 18 (P1-2): brüt +0.5 ancak komisyon 1.2 + funding 0.1 →
+        // NET kayıp. Win/loss kararı brüt PnL'e göre verilemezdi.
+        let mut e = DcaEngine::new("p12", BotConfig::default(), Instrument::default()).unwrap();
+        let acts = e.on_bar(&ctx(&bar(1_000, "100"), Fraction::from_decimal_str("100").unwrap()));
+        let base_id = acts
+            .iter()
+            .find_map(|a| match a {
+                Action::PlaceMarket { id, role: "BASE", .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("base order");
+        let mut bf = fill(&base_id, "BASE", Side::Buy, OrderKind::Add, "100", "1", 1_000);
+        bf.fee = Fraction::from_decimal_str("0.6").unwrap();
+        e.on_fill(&bf);
+        e.apply_funding(&Fraction::from_decimal_str("0.1").unwrap());
+        e.request_close_all();
+        let acts = e.on_bar(&ctx(&bar(1_001, "100.5"), Fraction::from_decimal_str("100.5").unwrap()));
+        let (close_id, close_role) = acts
+            .iter()
+            .find_map(|a| match a {
+                Action::PlaceMarket { id, role, .. } if matches!(*role, "MANUAL" | "TP") => Some((id.clone(), *role)),
+                _ => None,
+            })
+            .expect("close order (MANUAL/TP)");
+        let mut cf = fill(&close_id, close_role, Side::Sell, OrderKind::Reduce, "100.5", "1", 1_001);
+        cf.fee = Fraction::from_decimal_str("0.6").unwrap();
+        e.on_fill(&cf);
+        assert_eq!(e.deals_closed, 1);
+        assert_eq!(e.losses, 1, "net = +0.5 brüt − 1.2 komisyon − 0.1 funding = −0.8 → kayıp");
+        assert_eq!(e.wins, 0);
+        // Kümülatif realizasyon brüt olarak raporlanmaya devam eder (M-17).
+        assert_eq!(e.snapshot().realized_gross, "0.50000000");
     }
 
     #[test]

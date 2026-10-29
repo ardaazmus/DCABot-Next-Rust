@@ -165,9 +165,10 @@ pub struct GateCtx {
 /// Faz 13A-POLL: execute fazının ürettiği sonuç — apply fazı kilit altında tüketir.
 pub enum IntentOutcome {
     Placed { id: String, side: dca_math::Side, kind: dca_kernel::OrderKind, price: Option<Fraction>, qty: Fraction, role: String },
-    MarketFilled { id: String, side: dca_math::Side, kind: dca_kernel::OrderKind, role: String, qty_filled: Fraction, price: Fraction, fee: Option<Fraction> },
+    /// Faz 18 (P0-4): dolum kimliği borsa execId'sidir (`fill_key`) — yerel
+    /// `now_ms` anahtarı retry/çift cascade turunda çift sayıma açıktı.
+    MarketFilled { id: String, side: dca_math::Side, kind: dca_kernel::OrderKind, role: String, qty_filled: Fraction, price: Fraction, fee: Option<Fraction>, fill_key: String },
     MarketOpen { id: String, side: dca_math::Side, kind: dca_kernel::OrderKind, role: String, price: Fraction, qty: Fraction },
-    MarketNoTrace { id: String },
     MarketQueryFailed { id: String, err: String },
     GateBlocked { id: String, reason: String },
     PlaceFailed { id: String, err: String },
@@ -522,6 +523,10 @@ pub struct RuntimeSnapshot {
     pub im_used: Fraction,
     pub cumulative_fees: Fraction,
     pub cumulative_funding: Fraction,
+    /// Faz 18 (P1-1): kapanış komisyonları defteri — realized_net tanımının
+    /// bileşeni; eski snapshot'larla uyum için default.
+    #[serde(default)]
+    pub realized_fees: Fraction,
     pub realized_net: Fraction,
     pub last_bar_ts: i64,
     pub grid_bootstrapped: bool,
@@ -565,6 +570,7 @@ pub fn save_runtime_state(app: &AppState, bot_id: &str, rt: &BotRuntime) {
         im_used: rt.stepper.im_used.clone(),
         cumulative_fees: rt.stepper.cumulative_fees.clone(),
         cumulative_funding: rt.stepper.cumulative_funding.clone(),
+        realized_fees: rt.stepper.realized_fees.clone(),
         realized_net: rt.stepper.realized_net.clone(),
         last_bar_ts: rt.last_bar_ts,
         grid_bootstrapped: rt.grid_bootstrapped,
@@ -793,6 +799,8 @@ pub async fn create_runtime(
                 rt.stepper.im_used = snap.im_used;
                 rt.stepper.cumulative_fees = snap.cumulative_fees;
                 rt.stepper.cumulative_funding = snap.cumulative_funding;
+                // Faz 18 (P1-1): eski snapshot'larda alan yok → default 0.
+                rt.stepper.realized_fees = snap.realized_fees;
                 rt.stepper.realized_net = snap.realized_net;
                 rt.last_bar_ts = snap.last_bar_ts;
                 rt.grid_bootstrapped = snap.grid_bootstrapped;
@@ -818,6 +826,24 @@ pub async fn create_runtime(
                 }
                 rt.stepper.prev_bar_ts = snap.kernel_prev_bar_ts.or(Some(snap.last_bar_ts));
                 rt.stepper.pending = snap.pending.clone();
+                // Faz 18 (P0-3 kalanı): restore TUTARLILIK KAPISI — kernel
+                // pozisyonu ile engine mirror'ı uyuşmuyorsa sessiz devam ETME:
+                // kernel fail-closed HALT ile durdurulur (step() Err döner, UI
+                // 'halted' gösterir), CRITICAL olay kullanıcıya yazılır. Kararı
+                // (uzlaştırma/RESET) bot sahibi verir.
+                if let EngineTag::Dca(e) = &rt.engine_kind {
+                    let engine_qty = e.mirror.qty.clone();
+                    let kernel_qty = rt.stepper.position.qty.clone();
+                    if dca_math::Fraction::cmp(&engine_qty, &kernel_qty) != std::cmp::Ordering::Equal {
+                        let reason = format!(
+                            "HALTED_RESTORE: kernel pozisyonu ({}) ile engine mirror ({}) uyuşmuyor — manuel uzlaştırma gerekli (kernel RESET action ile açılır)",
+                            kernel_qty.to_half_even_display(8),
+                            engine_qty.to_half_even_display(8)
+                        );
+                        rt.stepper.halted = Some(reason.clone());
+                        persist_event(app, id, "CRITICAL", "RESTORE", &reason).await;
+                    }
+                }
             }
             Err(e) => {
                 let _ = persist_event(app, id, "WARN", "RESTORE", &format!("runtime snapshot cozulemedi ({e}) — bot taze durumla baslatildi")).await;

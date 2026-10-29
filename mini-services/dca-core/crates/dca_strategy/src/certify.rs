@@ -170,11 +170,19 @@ pub fn variant_configs(base: &BotConfig) -> Vec<BotConfig> {
     trials
 }
 
-fn run_trial(bars: &[dca_kernel::Bar], inst: &Instrument, cfg: &BotConfig, start: &Fraction, session: dca_math::sessions::SessionType) -> Result<TrialSeries, String> {
-    // Certifier trials compare *relative* stability across bar splits; funding is
-    // a near-uniform overlay within a split window and does not change split
-    // ranking, so trials run without per-event funding (base run includes it).
-    let res = run_backtest(bars, inst, cfg, start.clone(), session, &[])?;
+fn run_trial(
+    bars: &[dca_kernel::Bar],
+    inst: &Instrument,
+    cfg: &BotConfig,
+    start: &Fraction,
+    session: dca_math::sessions::SessionType,
+    funding: &[(i64, String)],
+) -> Result<TrialSeries, String> {
+    // Faz 18 (P0-10): ORTAK MALİYET TABANI — denemeler artık base koşuyla
+    // AYNI funding takviminde koşar. Eski kod trials'ı funding'siz koşturuyor
+    // (base funding'liydi): vadeli stratejilerde denemeler sistematik olarak
+    // iyimser olur, WFE/DSR karşılaştırması aynı tabanda olmazdı.
+    let res = run_backtest(bars, inst, cfg, start.clone(), session, funding)?;
     let curve = &res.equity_curve;
     let mut rets = Vec::with_capacity(curve.len());
     let mut prev: Option<f64> = None;
@@ -198,6 +206,14 @@ fn run_trial(bars: &[dca_kernel::Bar], inst: &Instrument, cfg: &BotConfig, start
 }
 
 /// CSCV split indices for S blocks → all C(S, S/2) combinations (IS block set).
+///
+/// Faz 18 (P0-10): bileşik getiri yardımcısı — ∏(1+r) − 1. Aritmetik toplam
+/// fold uzunluklarına göre ölçek değiştirdiği için WFE pay/payda artık bunu
+/// kullanır.
+fn compound_return(rets: &[f64]) -> f64 {
+    rets.iter().fold(1.0f64, |acc, r| acc * (1.0 + r)) - 1.0
+}
+
 fn cscv_combos(s: usize) -> Vec<Vec<usize>> {
     let half = s / 2;
     let mut out = Vec::new();
@@ -224,6 +240,9 @@ fn block_slice_lengths(n: usize, s: usize) -> Vec<usize> {
 }
 
 /// Certification entry point. `mc_runs` clamped to [50, 500].
+///
+/// Faz 18 (P0-10): `funding` — denemelerin base koşuyla aynı maliyet tabanında
+/// koşması için gerçek funding takvimi (vadeli türlerde); spot'ta boş geçilir.
 pub fn certify(
     bars: &[dca_kernel::Bar],
     inst: &Instrument,
@@ -231,6 +250,7 @@ pub fn certify(
     start_cash: Fraction,
     session: dca_math::sessions::SessionType,
     mc_runs: usize,
+    funding: &[(i64, String)],
 ) -> Result<CertifyOutput, String> {
     if bars.len() < 20 {
         return Err("certify: need at least 20 bars".into());
@@ -240,7 +260,7 @@ pub fn certify(
     let configs = variant_configs(cfg);
     let mut trials: Vec<TrialSeries> = Vec::new();
     for (i, c) in configs.iter().enumerate() {
-        match run_trial(bars, inst, c, &start_cash, session) {
+        match run_trial(bars, inst, c, &start_cash, session, funding) {
             Ok(t) => trials.push(t),
             Err(e) => warnings.push(format!("trial {i} skipped: {e}")),
         }
@@ -263,6 +283,7 @@ pub fn certify(
         let mut overfit = 0usize;
         let mut wfe_sum = 0.0f64;
         let mut wfe_cnt = 0usize;
+        let mut wfe_is_losing = 0usize;
         let starts: Vec<usize> = {
             let mut acc = 0usize;
             lens.iter().map(|l| { let st = acc; acc += l; st }).collect()
@@ -285,8 +306,11 @@ pub fn certify(
                 }
                 trial_is_sr.push(series_sharpe(&is_rets));
                 trial_oos_sr.push(series_sharpe(&oos_rets));
-                trial_is_tot.push(is_rets.iter().sum::<f64>());
-                trial_oos_tot.push(oos_rets.iter().sum::<f64>());
+                // Faz 18 (P0-10): bileşik getiri — per-bar getirilerin aritmetik
+                // toplamı farklı uzunluk/kırılım oranlarında anlamsızdı;
+                // ∏(1+r) − 1 kullanılır.
+                trial_is_tot.push(compound_return(&is_rets));
+                trial_oos_tot.push(compound_return(&oos_rets));
             }
             // In-sample winner (Walk-Forward Optimizer selection)
             let best = (0..trials.len())
@@ -302,11 +326,20 @@ pub fn certify(
             if rel <= 0.5 {
                 overfit += 1;
             }
-            // WFE: best trial's OOS total return / IS total return
-            if trial_is_tot[best] > 1e-12 {
-                wfe_sum += trial_oos_tot[best] / trial_is_tot[best];
-                wfe_cnt += 1;
-            }
+            // Faz 18 (P0-10): WFE fold katkısı — negatif fold cezası.
+            // Eski kod "IS bileşik ≤ 0" fold'ları ortalamadan DÜŞÜYORDU:
+            // çoğu fold'da zarar eden bir strateji iki şanslı fold ile WFE ≥ %50
+            // alabiliyordu. Yeni kural: IS'i zarar eden fold, OOS'i kazansa bile
+            // ortalamayı yukarı ÇEKEMEZ (katkı en fazla 0); OOS de negatifse
+            // negatif katkıyla cezalandırır. Tüm fold'lar payda sayılır.
+            let contrib = if trial_is_tot[best] > 1e-12 {
+                trial_oos_tot[best] / trial_is_tot[best]
+            } else {
+                wfe_is_losing += 1;
+                trial_oos_tot[best].min(0.0)
+            };
+            wfe_sum += contrib;
+            wfe_cnt += 1;
             combos_done += 1;
         }
         if combos_done > 0 {
@@ -314,8 +347,11 @@ pub fn certify(
         }
         if wfe_cnt > 0 {
             wfe = wfe_sum / wfe_cnt as f64 * 100.0;
-        } else {
-            warnings.push("WFE: no fold with positive in-sample return".into());
+        }
+        if wfe_is_losing > 0 {
+            warnings.push(format!(
+                "WFE: {wfe_is_losing} fold'da IS bileşik getiri ≤ 0 — bu fold'lar ortalamayı yukarı çekemedi (negatif fold cezası uygulandı)"
+            ));
         }
     } else {
         warnings.push("CSCV skipped: fewer than 40 return observations".into());
@@ -613,7 +649,7 @@ mod tests {
         let inst = Instrument::default();
         let cfg = base_cfg();
         let start = Fraction::from_decimal_str("10000").unwrap();
-        let out = certify(&bars, &inst, &cfg, start, dca_math::sessions::SessionType::Crypto24_7, 120).expect("certify ok");
+        let out = certify(&bars, &inst, &cfg, start, dca_math::sessions::SessionType::Crypto24_7, 120, &[]).expect("certify ok");
         assert!(out.trials >= 5, "expected >= 5 trials, got {}", out.trials);
         let pbo: f64 = out.pbo_pct.trim_end_matches('%').parse().unwrap_or(f64::NAN);
         assert!(pbo >= 0.0 && pbo <= 100.0, "pbo out of range: {pbo}");
@@ -638,8 +674,8 @@ mod tests {
         let inst = Instrument::default();
         let cfg = base_cfg();
         let start = Fraction::from_decimal_str("10000").unwrap();
-        let a = certify(&bars, &inst, &cfg, start.clone(), dca_math::sessions::SessionType::Crypto24_7, 80).unwrap();
-        let b = certify(&bars, &inst, &cfg, start, dca_math::sessions::SessionType::Crypto24_7, 80).unwrap();
+        let a = certify(&bars, &inst, &cfg, start.clone(), dca_math::sessions::SessionType::Crypto24_7, 80, &[]).unwrap();
+        let b = certify(&bars, &inst, &cfg, start, dca_math::sessions::SessionType::Crypto24_7, 80, &[]).unwrap();
         assert_eq!(a.dsr, b.dsr);
         assert_eq!(a.mc_return_p5_pct, b.mc_return_p5_pct);
         assert_eq!(a.pbo_pct, b.pbo_pct);

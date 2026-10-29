@@ -125,6 +125,9 @@ pub struct SimulationStepper {
     pub im_used: Fraction,
     pub cumulative_fees: Fraction,
     pub cumulative_funding: Fraction,
+    /// Faz 18 (P1-1): yalnız KAPANAN (reduce) miktarın komisyonu — giriş
+    /// komisyonları bunu şişirmez. realized_net tanımının bileşeni.
+    pub realized_fees: Fraction,
     pub realized_net: Fraction,
     pub pending: Vec<OrderIntent>,
     pub fills: Vec<FillRecord>,
@@ -150,6 +153,7 @@ impl SimulationStepper {
             im_used: Fraction::zero(),
             cumulative_fees: Fraction::zero(),
             cumulative_funding: Fraction::zero(),
+            realized_fees: Fraction::zero(),
             realized_net: Fraction::zero(),
             pending: Vec::new(),
             fills: Vec::new(),
@@ -207,6 +211,13 @@ impl SimulationStepper {
         if self.halted.is_some() {
             return Err(format!("kernel halted: {}", self.halted.clone().unwrap()));
         }
+        // Faz 18 (P1-13): deterministik zaman — karar zaman damgası geçersizse
+        // (sistem saati sıfırlandı/geriye sardı) sessiz devam etmeyiz.
+        if ts_ms <= 0 {
+            let reason = format!("kernel: invalid decision timestamp {ts_ms}");
+            self.halted = Some(reason.clone());
+            return Err(reason);
+        }
         // Gate 1 — data integrity (HALT on violation)
         let o = Fraction::from_decimal_str(&bar.o).map_err(|e| e.to_string())?;
         let h = Fraction::from_decimal_str(&bar.h).map_err(|e| e.to_string())?;
@@ -246,6 +257,18 @@ impl SimulationStepper {
         self.filled_qty_this_bar = Fraction::zero();
         self.current_bar_ts = bar.t;
         self.last_close = Some(bar.c.clone());
+
+        // Faz 18 (P1-15): donmuş/likiditesiz bar (hacim 0) — imleç ilerletildi;
+        // dolum kararı yok, dinlenen emirler sonraki likit bara devrediyor.
+        if matches!(verdict, GateVerdict::Defer(_)) {
+            self.log_advisory(
+                ts_ms,
+                "GATE1",
+                "FROZEN_BAR_SKIP",
+                "sıfır hacimli bar — dolum kararı uygulanmadı, emirler sonraki likit bara devredildi",
+            );
+            return Ok(vec![]);
+        }
 
         let mut new_fills = Vec::new();
 
@@ -309,6 +332,35 @@ impl SimulationStepper {
                         return Err(e);
                     }
                 };
+                // Faz 18 (P1-8): planlı piyasa Add'leri de sermaye kapısından
+                // geçer — dolum öncesi GERÇEK kalan bakiye kontrol edilir.
+                // Wait modunda emir sonraki bara devreder, Skip modunda atlanır.
+                if order.kind == OrderKind::Add {
+                    let fee = order
+                        .qty
+                        .mul(&fill_price)
+                        .map_err(|e| e.to_string())?
+                        .mul(&self.instrument.taker_fee_rate)
+                        .map_err(|e| e.to_string())?;
+                    let g6 = gate6_capital_guard(
+                        &order.qty,
+                        &fill_price,
+                        &fee,
+                        &self.cfg.leverage,
+                        self.cfg.is_spot,
+                        &self.cash,
+                        &self.cfg.capital_shortfall_mode,
+                    );
+                    self.log_gate(ts_ms, "GATE6", &g6);
+                    match g6 {
+                        GateVerdict::Pass => {}
+                        GateVerdict::Defer(_) => {
+                            self.pending.push(order);
+                            continue;
+                        }
+                        _ => continue,
+                    }
+                }
                 if let Some(f) = self.execute_fill(&order, &fill_price, FeeRole::Taker, FillRealism::MarketableTaker, bar.t)? {
                     new_fills.push(f);
                 }
@@ -349,6 +401,10 @@ impl SimulationStepper {
             };
             let fee_role = if realism == FillRealism::MarketableTaker { FeeRole::Taker } else { FeeRole::Maker };
             // Gate 6 — capital guard (adds only) — FİZİKSEL DEĞİŞMEZ, esnetilemez.
+            // Faz 18 (P1-8): defter aynı barda sıralı dolumlarla tutarlıdır —
+            // her dolum bakiyeyi anında düşer, sonraki emrin G6'sı GERÇEK kalan
+            // bakiyeyi görür. Beklemedeki (sonraki bara kalan) emirler kendi
+            // dolum anlarında yeniden kontrol edilir.
             if order.kind == OrderKind::Add {
                 let fee = order.qty.mul(&fill_price).map_err(|e| e.to_string())?.mul(&self.instrument.taker_fee_rate).map_err(|e| e.to_string())?;
                 let g6 = gate6_capital_guard(
@@ -370,8 +426,10 @@ impl SimulationStepper {
                     _ => continue 'orders,
                 }
             }
-            // Gate 8 — opening salvo tamponu (policy-aware)
-            match gate8_gap_protection(order.role == "SAFETY", ts_ms, &o, &[]) {
+            // Gate 8 — opening salvo tamponu (policy-aware). Faz 18 (P1-14):
+            // gap-through birleştirme kaldırıldı; gerçek birleştirme aşağıdaki
+            // Gate 8b gap_batch yolunda gerçek adet + sentetik VWAP ile yapılır.
+            match gate8_gap_protection(order.role == "SAFETY", ts_ms) {
                 dca_risk::Gate8Outcome::DeferOpeningSalvo => {
                     if order.role == "SAFETY" && self.cfg.policy.opening_salvo_buffer.is_permissive() {
                         self.log_advisory(
@@ -430,13 +488,40 @@ impl SimulationStepper {
                     side,
                     kind: OrderKind::Add,
                     price: Some(o.clone()),
-                    qty: total_qty,
+                    qty: total_qty.clone(),
                     decision_ts: ts_ms,
                     role: "SAFETY".into(),
                     placement_ref_price: Some(o.clone()),
                 };
-                if let Some(f) = self.execute_fill(&merged, &o, FeeRole::Maker, FillRealism::OpenGapBetter, bar.t)? {
-                    new_fills.push(f);
+                // Faz 18 (P1-8): konsolide gap dolumu da sermaye kapısından geçer
+                // (gerçek ücret: maker — tek komisyon semantiği).
+                let fee = total_qty
+                    .mul(&o)
+                    .map_err(|e| e.to_string())?
+                    .mul(&self.instrument.maker_fee_rate)
+                    .map_err(|e| e.to_string())?;
+                let g6 = gate6_capital_guard(
+                    &total_qty,
+                    &o,
+                    &fee,
+                    &self.cfg.leverage,
+                    self.cfg.is_spot,
+                    &self.cash,
+                    &self.cfg.capital_shortfall_mode,
+                );
+                self.log_gate(ts_ms, "GATE6", &g6);
+                match g6 {
+                    GateVerdict::Pass => {
+                        if let Some(f) = self.execute_fill(&merged, &o, FeeRole::Maker, FillRealism::OpenGapBetter, bar.t)? {
+                            new_fills.push(f);
+                        }
+                    }
+                    GateVerdict::Defer(_) => {
+                        for ord in gap_batch {
+                            self.pending.push(ord);
+                        }
+                    }
+                    _ => {}
                 }
             } else {
                 if n >= 2 {
@@ -448,8 +533,31 @@ impl SimulationStepper {
                     );
                 }
                 for order in gap_batch {
-                    if let Some(f) = self.execute_fill(&order, &o, FeeRole::Maker, FillRealism::OpenGapBetter, bar.t)? {
-                        new_fills.push(f);
+                    // Faz 18 (P1-8): tek tek gap dolumu da sermaye kapısından geçer.
+                    let fee = order
+                        .qty
+                        .mul(&o)
+                        .map_err(|e| e.to_string())?
+                        .mul(&self.instrument.maker_fee_rate)
+                        .map_err(|e| e.to_string())?;
+                    let g6 = gate6_capital_guard(
+                        &order.qty,
+                        &o,
+                        &fee,
+                        &self.cfg.leverage,
+                        self.cfg.is_spot,
+                        &self.cash,
+                        &self.cfg.capital_shortfall_mode,
+                    );
+                    self.log_gate(ts_ms, "GATE6", &g6);
+                    match g6 {
+                        GateVerdict::Pass => {
+                            if let Some(f) = self.execute_fill(&order, &o, FeeRole::Maker, FillRealism::OpenGapBetter, bar.t)? {
+                                new_fills.push(f);
+                            }
+                        }
+                        GateVerdict::Defer(_) => self.pending.push(order),
+                        _ => {}
                     }
                 }
             }
@@ -538,12 +646,22 @@ impl SimulationStepper {
             self.cash = self.cash.add(&notional.sub(&fee).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         }
         self.cumulative_fees = self.cumulative_fees.add(&fee).map_err(|e| e.to_string())?;
+        // Faz 18 (P1-1): realized_fees — yalnız kapanış (reduce) dolumlarının
+        // komisyonu birikir; açık pozisyonun giriş komisyonu buraya girmez.
+        if !is_add {
+            self.realized_fees = self.realized_fees.add(&fee).map_err(|e| e.to_string())?;
+        }
         // M-17: `realized_net` kalıcı alan — net_realized() ile aynı tanımda
         // tutulur; eski davranışta hiç güncellenmiyor, persist hep 0 yazıyordu.
+        // Faz 18 (P1-1) tanım: gross − realized_fees − cumulative_funding
+        // (bot ömrü komisyonu ve funding'in tamamı değil, yalnız kapanışa
+        // düşenler netleştirilir; funding tarafı kümulative kalır — funding
+        // pozisyon başınadır ve kapanışla netleşir).
         self.realized_net = self
             .position
             .realized_gross
-            .sub(&self.cumulative_fees)
+            .sub(&self.realized_fees)
+            .and_then(|x| x.sub(&self.cumulative_funding))
             .unwrap_or_else(|_| self.realized_net.clone());
         self.filled_qty_this_bar = self.filled_qty_this_bar.add(&order.qty).unwrap_or_else(|_| self.filled_qty_this_bar.clone());
         let rec = FillRecord {
@@ -631,7 +749,14 @@ impl SimulationStepper {
     }
 
     pub fn net_realized(&self) -> Result<Fraction, MathError> {
-        self.position.realized_gross.sub(&self.cumulative_fees).map_err(Into::into)
+        // Faz 18 (P1-1): realized_net tanımı — gross − realized_fees (yalnız
+        // kapanış komisyonu) − funding. execute_fill_inner'daki kalıcı alanla
+        // aynı formül.
+        self.position
+            .realized_gross
+            .sub(&self.realized_fees)
+            .and_then(|x| x.sub(&self.cumulative_funding))
+            .map_err(Into::into)
     }
 
     pub fn equity(&self, mark: &Fraction) -> Result<Fraction, MathError> {
@@ -667,6 +792,14 @@ impl SimulationStepper {
             .cumulative_funding
             .add(expense)
             .unwrap_or_else(|_| self.cumulative_funding.clone());
+        // Faz 18 (P1-1): funding büyüdükçe realized_net de güncel kalsın
+        // (sonraki dolumu beklemeden doğru raporlansın).
+        self.realized_net = self
+            .position
+            .realized_gross
+            .sub(&self.realized_fees)
+            .and_then(|x| x.sub(&self.cumulative_funding))
+            .unwrap_or_else(|_| self.realized_net.clone());
     }
 
     /// Cancel every resting order (used on liquidation / manual close-all).
@@ -774,6 +907,93 @@ mod tests {
     }
 
     #[test]
+    fn invalid_decision_timestamp_halts() {
+        // Faz 18 (P1-13): karar zaman damgası <= 0 → kernel durur.
+        let mut st = SimulationStepper::new(inst(), f("1000"), margin_cfg("10"));
+        st.set_position_direction(1);
+        assert!(st.step(&bar(1100, "100", "100.5", "99.5", "100"), 0, false).is_err());
+        assert!(st.halted.is_some());
+    }
+
+    #[test]
+    fn frozen_bar_defers_fills_without_halting() {
+        // Faz 18 (P1-15): hacim 0 bar → dolum yok, emir bekler, kernel ayakta.
+        let mut st = SimulationStepper::new(inst(), f("1000"), margin_cfg("10"));
+        st.set_position_direction(1);
+        buy_limit(&mut st, "o1", "99", "1", 1000);
+        let frozen = Bar {
+            t: 1100,
+            o: "100".into(),
+            h: "100.5".into(),
+            l: "99.5".into(),
+            c: "100".into(),
+            v: "0".into(),
+        };
+        let fills = st.step(&frozen, 1100, false).unwrap();
+        assert!(fills.is_empty(), "donmuş barda dolum olmamalı");
+        assert!(st.halted.is_none(), "donmuş bar kalıcı bozulma değildir");
+        // Sonraki likit bar emri doldurur (low 98 < 99 penetre eder).
+        let fills = st.step(&bar(1200, "100", "100.5", "98", "100"), 1200, false).unwrap();
+        assert_eq!(fills.len(), 1);
+    }
+
+    #[test]
+    fn market_add_respects_capital_guard() {
+        // Faz 18 (P1-8): planlı piyasa Add — bakiye (~100.15 gerekli) yetmezse
+        // dolmaz; Wait modunda bekler, Skip modunda atlanır. Halcını asla eksiye
+        // çekmez.
+        let mut st = SimulationStepper::new(inst(), f("50"), StepperConfig { is_spot: true, ..Default::default() });
+        st.set_position_direction(1);
+        st.submit_intent(
+            OrderIntent {
+                id: "m1".into(),
+                side: Side::Buy,
+                kind: OrderKind::Add,
+                price: None,
+                qty: f("1"),
+                decision_ts: 1000,
+                role: "BASE".into(),
+                placement_ref_price: Some(f("100")),
+            },
+            1000,
+        )
+        .unwrap();
+        let fills = st.step(&bar(1100, "100", "100.5", "99.5", "100"), 1100, false).unwrap();
+        assert!(fills.is_empty(), "sermayesi olmayan piyasa Add dolmamalı");
+        assert!(st.cash.is_positive() || st.cash.is_zero());
+        assert!(!st.halted.is_some());
+    }
+
+    #[test]
+    fn gap_flush_respects_capital_guard() {
+        // Faz 18 (P1-8): gap_batch dolumu — bireysel G6'dan geçen iki seviye
+        // birlikte bakiyeyi aşamaz; konsolidasyon moduna göre ya ikisi de
+        // bekler ya yalnız ilki dolar. Nakit asla negatif olmaz.
+        let mut st = SimulationStepper::new(inst(), f("100"), StepperConfig { is_spot: true, ..Default::default() });
+        st.set_position_direction(1);
+        for (id, p) in [("s1", "95"), ("s2", "94")] {
+            st.submit_intent(
+                OrderIntent {
+                    id: id.into(),
+                    side: Side::Buy,
+                    kind: OrderKind::Add,
+                    price: Some(f(p)),
+                    qty: f("1"),
+                    decision_ts: 1000,
+                    role: "SAFETY".into(),
+                    placement_ref_price: Some(f("100")),
+                },
+                1000,
+            )
+            .unwrap();
+        }
+        // Açılış 94'ün altına gap'ledi (90) — her iki seviye OpenGapBetter.
+        let fills = st.step(&bar(1100, "90", "91", "88", "89"), 1100, false).unwrap();
+        assert!(fills.len() <= 1, "100 bakiye iki ~90'lık dolumu karşılayamaz");
+        assert!(!st.cash.is_negative());
+    }
+
+    #[test]
     fn margin_close_credits_released_margin_plus_pnl() {
         let mut st = SimulationStepper::new(inst(), f("1000"), margin_cfg("10"));
         st.set_position_direction(1);
@@ -804,6 +1024,40 @@ mod tests {
         assert!(st.position.qty.is_zero());
         let eq = st.equity(&f("110")).unwrap();
         assert_eq!(eq.to_half_even_display(4), "1009.7351");
+    }
+
+    #[test]
+    fn realized_net_nets_closed_fees_and_funding_only() {
+        // Faz 18 (P1-1): realized_net = gross − realized_fees (yalnız reduce
+        // komisyonu) − funding. Giriş (add) komisyonu defteri şişirmez.
+        let mut st = SimulationStepper::new(inst(), f("1000"), margin_cfg("10"));
+        st.set_position_direction(1);
+        buy_limit(&mut st, "o1", "100", "1", 1000);
+        st.step(&bar(1100, "100", "100.5", "99.5", "100"), 1100, false).unwrap();
+        // Açılış komisyonu 0.1 ödendi ama realized_fees hâlâ sıfır.
+        assert!(st.realized_fees.is_zero(), "giriş komisyonu realized_fees'a girmemeli");
+        st.apply_funding_expense(&f("0.05"));
+        // gross 0, funding 0.05 → net −0.05 (dolum beklemeden güncel).
+        assert_eq!(st.realized_net.to_half_even_display(4), "-0.0500");
+        // 1 @ 110 market reduce: gross 9.945, reduce fee 0.109945.
+        st.submit_intent(
+            OrderIntent {
+                id: "tp1".into(),
+                side: Side::Sell,
+                kind: OrderKind::Reduce,
+                price: None,
+                qty: f("1"),
+                decision_ts: 1100,
+                role: "TP".into(),
+                placement_ref_price: Some(f("100")),
+            },
+            1100,
+        )
+        .unwrap();
+        st.step(&bar(1200, "110", "111", "109", "110"), 1200, false).unwrap();
+        // net = 9.945 − 0.109945 − 0.05 = 9.785055
+        assert_eq!(st.realized_fees.to_half_even_display(4), "0.1099");
+        assert_eq!(st.realized_net.to_half_even_display(4), "9.7851");
     }
 
     #[test]

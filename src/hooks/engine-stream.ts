@@ -85,7 +85,19 @@ interface EngineStreamState {
 }
 
 const RING_SIZE = 200;
-const DATA_EVENT_TYPES = new Set(["FILL", "EQUITY", "BOT_STATE", "ORDER", "LOG"]);
+// Faz 18 (UIX-1): FUNDING (pozisyon maliyetini değiştirir), LIQUIDATION
+// (pozisyon/bot durumu değişir), WEBHOOK_START (yeni deal açılır) — hepsi
+// ekrandaki veriyi bozar; polling'i tetiklemek için dataVer'a katılır.
+const DATA_EVENT_TYPES = new Set([
+  "FILL",
+  "EQUITY",
+  "BOT_STATE",
+  "ORDER",
+  "LOG",
+  "FUNDING",
+  "LIQUIDATION",
+  "WEBHOOK_START",
+]);
 
 export const useEngineStream = create<EngineStreamState>((set) => ({
   events: [],
@@ -130,7 +142,23 @@ function ensureStream() {
     if (type === "PING") return;
     pushEvent(type, payload);
   };
-  for (const t of ["FILL", "EQUITY", "LOG", "BOT_STATE", "ORDER", "RISK", "PING", "KILL_SWITCH", "FREEZE"]) {
+  // Faz 18 (UIX-1): motorun yaydığı tüm olay tipleri dinlenir — FUNDING,
+  // LIQUIDATION ve WEBHOOK_START eksikti; dinlenmeyen olay ring buffer'a
+  // düşmez, ekranda görünmez ve dataVer tetiklenmezdi.
+  for (const t of [
+    "FILL",
+    "EQUITY",
+    "LOG",
+    "BOT_STATE",
+    "ORDER",
+    "RISK",
+    "FUNDING",
+    "LIQUIDATION",
+    "WEBHOOK_START",
+    "KILL_SWITCH",
+    "FREEZE",
+    "PING",
+  ]) {
     es.addEventListener(t, handle(t) as EventListener);
   }
   es.onopen = () => useEngineStream.setState({ connected: true });

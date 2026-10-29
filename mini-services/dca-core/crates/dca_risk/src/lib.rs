@@ -36,6 +36,11 @@ pub fn gate1_bar_integrity(
     v: &Fraction,
     bar_interval_ms: i64,
 ) -> GateVerdict {
+    // Faz 18 (P1-13): sıfır/negatif zaman damgası gerçek veri bozulmasıdır —
+    // deterministik zaman ilkesi bozulur, Halt zorunludur.
+    if t <= 0 {
+        return GateVerdict::Halt("GATE1: non-positive bar timestamp".into());
+    }
     if o.is_zero() || o.is_negative() || h.is_negative() || l.is_negative() || c.is_zero() {
         return GateVerdict::Halt("GATE1: non-positive price".into());
     }
@@ -44,6 +49,12 @@ pub fn gate1_bar_integrity(
     }
     if v.is_negative() {
         return GateVerdict::Halt("GATE1: negative volume".into());
+    }
+    // Faz 18 (P1-15): sıfır hacim = işlem görmemiş (donmuş/likiditesiz) bar.
+    // Kalıcı veri bozulması değil — Halt değil, Defer: dolum kararı bu bara
+    // uygulanmaz, emirler sonraki likit bara devreder (kernel skip & resync).
+    if v.is_zero() {
+        return GateVerdict::Defer("GATE1: zero-volume bar (frozen market)".into());
     }
     if let Some(pt) = prev_ts {
         if t <= pt {
@@ -229,13 +240,17 @@ pub fn gate7_session_guard(session: SessionType, ts_ms: i64, macro_blackout: boo
     GateVerdict::Pass
 }
 
-/// Gate 8 — Gap protection & opening salvo buffer.
-/// Safety orders deferred 09:30–09:35 ET; gap-through levels consolidate to one
-/// synthetic VWAP fill at open price.
+/// Gate 8 — Opening salvo buffer (09:30–09:35 ET).
+///
+/// Faz 18 (P1-14): gap-through birleştirme bu kapıdan ÇIKARILDI — seviye
+/// fiyatlarını çağıran hiçbir zaman gerçek bir liste iletmiyordu (`&[]` çağrısı
+/// her zaman Clear üretirdi: ölü dal) ve `consolidated_qty` seviye başına 1
+/// sayan sahte bir büyüklüktü. Gerçek birleştirme (gerçek adet + sentetik VWAP,
+/// hacim payı kuralıyla) kernel'in Gate 8b `gap_batch` yolunda yaşar; bu kapı
+/// yalnız açılış salvo tamponunu korur.
 pub enum Gate8Outcome {
     Clear,
     DeferOpeningSalvo,
-    ConsolidateGap { consolidated_qty: Fraction, synthetic_price: Fraction },
 }
 
 /// Daily drawdown breaker threshold (Task 18 fix N-1).
@@ -253,27 +268,11 @@ pub fn daily_dd_breaker_threshold(pct_str: &str) -> Fraction {
         .unwrap_or_else(|_| Fraction::from_decimal_str("0.02").unwrap_or_else(|_| Fraction::zero()))
 }
 
-pub fn gate8_gap_protection(
-    is_safety_order: bool,
-    ts_ms: i64,
-    bar_open: &Fraction,
-    pending_level_prices: &[Fraction],
-) -> Gate8Outcome {
+pub fn gate8_gap_protection(is_safety_order: bool, ts_ms: i64) -> Gate8Outcome {
     if in_opening_salvo_buffer(chrono::DateTime::from_timestamp_millis(ts_ms).unwrap_or_else(|| chrono::Utc::now())) {
         if is_safety_order {
             return Gate8Outcome::DeferOpeningSalvo;
         }
-        return Gate8Outcome::Clear;
-    }
-    // Gap-through check: open gapped below (Long buy levels) ALL pending levels at once?
-    let all_gapped = pending_level_prices.iter().all(|p| flt(bar_open, p) || bar_open == p);
-    if is_safety_order && !pending_level_prices.is_empty() && all_gapped {
-        let mut q = Fraction::zero();
-        for p in pending_level_prices {
-            // quantities consolidated; caller passes qty separately — here we only flag
-            q = q.add(&Fraction::one()).unwrap_or_else(|_| q.clone());
-        }
-        return Gate8Outcome::ConsolidateGap { consolidated_qty: q, synthetic_price: bar_open.clone() };
     }
     Gate8Outcome::Clear
 }
@@ -301,6 +300,38 @@ mod tests {
             gate1_bar_integrity(None, 1000, &f("100"), &f("105"), &f("95"), &f("97"), &f("10"), 0),
             GateVerdict::Pass
         ));
+    }
+
+    #[test]
+    fn gate1_timestamp_and_frozen_bar() {
+        // Faz 18 (P1-13): t <= 0 gerçek veri bozulması → Halt
+        assert!(matches!(
+            gate1_bar_integrity(None, 0, &f("100"), &f("105"), &f("95"), &f("97"), &f("10"), 0),
+            GateVerdict::Halt(_)
+        ));
+        // Faz 18 (P1-15): hacim 0 → Defer (donmuş bar, emir devreder)
+        assert!(matches!(
+            gate1_bar_integrity(None, 1000, &f("100"), &f("105"), &f("95"), &f("97"), &f("0"), 0),
+            GateVerdict::Defer(_)
+        ));
+        // negatif hacim kalır Halt
+        assert!(matches!(
+            gate1_bar_integrity(None, 1000, &f("100"), &f("105"), &f("95"), &f("97"), &f("-1"), 0),
+            GateVerdict::Halt(_)
+        ));
+    }
+
+    #[test]
+    fn gate8_opening_salvo_only() {
+        // Faz 18 (P1-14): kapı yalnız açılış salvo tamponunu korur; gap-through
+        // birleştirme kernel Gate 8b'de gerçek adetle yapılır (ölü dal kaldırıldı).
+        // 1776691860000 = 2026-04-20 13:31 UTC = 09:31 ET (EDT) — tampon içinde.
+        let in_salvo = 1776691860000_i64;
+        assert!(matches!(gate8_gap_protection(true, in_salvo), Gate8Outcome::DeferOpeningSalvo));
+        assert!(matches!(gate8_gap_protection(false, in_salvo), Gate8Outcome::Clear));
+        // 1776736800000 = 2026-04-20 22:00 UTC = 18:00 ET — tampon dışı.
+        let outside = 1776736800000_i64;
+        assert!(matches!(gate8_gap_protection(true, outside), Gate8Outcome::Clear));
     }
 
     #[test]

@@ -1581,7 +1581,7 @@ export function Wizard({ onCreated }: WizardProps) {
                   {/* Task 20 — opsiyonel bot TP/SL (pine çıkışına ek) */}
                   <div className="grid gap-2 sm:grid-cols-2">
                     <div>
-                      <Label className="text-xs text-slate-400">Bot TP % (opsiyonel — pine çıkışına ek)</Label>
+                      <Label className="text-xs text-slate-400">Bot TP % (opsiyonel — pine çıkışına ek; örn. 2 = %2)</Label>
                       <Input
                         value={pineTp}
                         onChange={(e) => setPineTp(e.target.value)}
@@ -1591,7 +1591,7 @@ export function Wizard({ onCreated }: WizardProps) {
                       />
                     </div>
                     <div>
-                      <Label className="text-xs text-slate-400">Bot SL % (opsiyonel — pine çıkışına ek)</Label>
+                      <Label className="text-xs text-slate-400">Bot SL % (opsiyonel — pine çıkışına ek; örn. 5 = %5)</Label>
                       <Input
                         value={pineSl}
                         onChange={(e) => setPineSl(e.target.value)}
@@ -1647,8 +1647,15 @@ export function Wizard({ onCreated }: WizardProps) {
                             interval: intervalSel,
                             bars: 400,
                             // Task 20 — opsiyonel bot TP/SL (pine çıkışına ek)
-                            ...(pineTp.trim() ? { target_profit_pct: pineTp.trim() } : {}),
-                            ...(pineSl.trim() ? { stop_loss_pct: pineSl.trim() } : {}),
+                            // Faz 18 (UIX-3): alan % sorar, motor fraksiyon ister
+                            // (0.02 = %2; SL kapısı 0 < SL ≤ 1 denetler). Ham değer
+                            // aynen giderse "2" → %200 olur, TP hiç tetiklenmezdi.
+                            ...(pineTp.trim() && !Number.isNaN(Number(pineTp))
+                              ? { target_profit_pct: String(Number(pineTp) / 100) }
+                              : {}),
+                            ...(pineSl.trim() && !Number.isNaN(Number(pineSl))
+                              ? { stop_loss_pct: String(Number(pineSl) / 100) }
+                              : {}),
                           });
                           setPineBt(r);
                         } catch (e) {
