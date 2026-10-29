@@ -8,7 +8,6 @@
  */
 
 import type { Instrument, SignalConfig } from "@/lib/engine-types";
-import { fracToNum } from "@/lib/format";
 
 /* ------------------------------------------------------------------ */
 /* Motor baglantisi — env override'li, varsayilan 3002 (gateway sozlesmesi) */
@@ -42,11 +41,19 @@ export function microOf(
 ): MicroStructure {
   const fb = MICRO_FALLBACK[market];
   if (!instrument) return fb;
+  // Faz 20 (UIX-9): venue değerleri f64 üzerinden TAŞINMAZ — "1e-8" gibi
+  // step_size bilimsel gösterime düşer ve f64 hassasiyeti UI katmanındaki
+  // ondalık-string sözleşmesini deler. Değer olduğu gibi geçirilir; yalnız
+  // boş/geçersiz girişte kategori fallback'i devreye girer.
+  const pick = (v: string | null | undefined, fbv: string): string => {
+    const s = (v ?? "").trim();
+    return s !== "" && Number.isFinite(Number(s)) ? s : fbv;
+  };
   return {
-    tickSize: String(fracToNum(instrument.tick_size) ?? Number(fb.tickSize)),
-    stepSize: String(fracToNum(instrument.step_size) ?? Number(fb.stepSize)),
-    makerFee: String(fracToNum(instrument.maker_fee_rate) ?? Number(fb.makerFee)),
-    takerFee: String(fracToNum(instrument.taker_fee_rate) ?? Number(fb.takerFee)),
+    tickSize: pick(instrument.tick_size, fb.tickSize),
+    stepSize: pick(instrument.step_size, fb.stepSize),
+    makerFee: pick(instrument.maker_fee_rate, fb.makerFee),
+    takerFee: pick(instrument.taker_fee_rate, fb.takerFee),
   };
 }
 

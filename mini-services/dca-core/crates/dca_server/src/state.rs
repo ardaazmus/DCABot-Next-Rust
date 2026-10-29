@@ -61,6 +61,10 @@ pub struct BotRuntime {
     /// Faz 13A-POLL: dispatch LIVE dalları ağ yapmaz — intent burada birikir,
     /// poll_inner'ın kilit-dışı cascade fazı çalıştırıp uygular.
     pub pending_live_intents: Vec<LiveIntent>,
+    /// Faz 20 (UIX-5): REST handler kaynaklı motor eylemleri (ör. grid
+    /// CLOSE_ALL → halt_mesh + market kapanış) — runner bir sonraki barda
+    /// motor döngüsüyle AYNI dispatch disiplininden akıtır.
+    pub pending_engine_actions: Vec<dca_strategy::Action>,
     /// Faz 13B: hedge bacağı için AYRI kernel stepper (direction=-1) —
     /// EX-06'nın kalıcı çözümü: iki bacak artık tek kernel pozisyonunda
     /// birleşmez; her bacak kendi cash/IM/fee/pozisyon defterini tutar.
@@ -781,6 +785,7 @@ pub async fn create_runtime(
         pos_mode_checked: false,
         pos_mode_blocked: false,
         pending_live_intents: Vec::new(),
+        pending_engine_actions: Vec::new(),
         hedge_stepper,
         pos_mode_hedge: false,
         mmr_brackets: None,

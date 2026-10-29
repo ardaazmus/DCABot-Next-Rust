@@ -215,6 +215,12 @@ pub async fn process_bar(
     for a in acts {
         dispatch_action(app, rt, a, bar.t, sse).await?;
     }
+    // Faz 20 (UIX-5): REST handler kaynaklı eylemler (grid CLOSE_ALL →
+    // halt_mesh + market kapanış) — motor döngüsüyle aynı dispatch disiplini.
+    let pending_acts = std::mem::take(&mut rt.pending_engine_actions);
+    for a in pending_acts {
+        dispatch_action(app, rt, a, bar.t, sse).await?;
+    }
     // 3.5) Grid initial placement — gated by the bot's start condition.
     // (live/paper parity with backtest bootstrap; evaluates on every new bar
     // until the condition passes, then mesh orders are placed exactly once)

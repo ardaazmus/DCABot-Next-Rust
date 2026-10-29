@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import {
   BookOpen,
@@ -64,13 +64,39 @@ const NAV_GROUPS: { title: string; ids: View[] }[] = [
   { title: "Sistem", ids: ["knowledge", "settings"] },
 ];
 
+/**
+ * Faz 20 (UIX-6): veri tazeliği rozeti — poll "sessiz atlama" yaptığında
+ * ekranın ne kadar bayat kaldığı artık görünür. Taze (<15s) yeşil, kuşkulu
+ * (<45s) amber, bayat (≥45s) kırmızı; motor çevrimdışıysa nötr.
+ */
+function DataFreshness({ lastUpdatedAt, offline }: { lastUpdatedAt: number | null; offline: boolean }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  if (offline) {
+    return <span className="shrink-0 rounded border border-border px-2 py-0.5 font-bold tracking-wider text-slate-500">VERİ — (motor çevrimdışı)</span>;
+  }
+  if (lastUpdatedAt == null) {
+    return <span className="shrink-0 rounded border border-border px-2 py-0.5 font-bold tracking-wider text-slate-500">VERİ — bekleniyor…</span>;
+  }
+  const age = Math.max(0, Math.floor((now - lastUpdatedAt) / 1000));
+  const tone = age < 15 ? "border-emerald-500/30 bg-emerald-500/5 text-emerald-400" : age < 45 ? "border-amber-500/30 bg-amber-500/5 text-amber-400" : "border-rose-500/30 bg-rose-500/5 text-rose-400";
+  return (
+    <span className={cn("num shrink-0 rounded border px-2 py-0.5 font-bold tracking-wider", tone)} title="Son başarılı veri güncellemesi">
+      VERİ {age}s ÖNCE
+    </span>
+  );
+}
+
 export default function Page() {
   const [view, setView] = useState<View>("dashboard");
   const [botId, setBotId] = useState<string | null>(null);
   /* P1 + P6 */
   const [moreOpen, setMoreOpen] = useState(false);
   const reduceMotion = useReducedMotion();
-  const { health, error, refetch } = useEngineHealth(10000);
+  const { health, error, lastUpdatedAt, refetch } = useEngineHealth(10000);
   const { status: maint } = useMaintenance(60000);
 
   const online = health?.status === "ok";
@@ -222,6 +248,9 @@ export default function Page() {
       {/* ---------------- Footer (sticky bottom status bar) ---------------- */}
       <footer className="mt-auto mb-16 border-t border-border bg-surface md:mb-0" aria-label="Durum çubuğu">
         <div className="thin-scroll flex items-center gap-x-4 gap-y-1 overflow-x-auto px-4 py-2 text-[10px] md:px-6">
+          {/* Faz 20 (UIX-6): veri tazeliği — poll sessiz atlayınca ekranın
+              ne kadar bayat olduğu artık görünür. */}
+          <DataFreshness lastUpdatedAt={lastUpdatedAt} offline={!online} />
           <span className="num shrink-0 text-slate-500">
             UPTIME <span className="text-slate-300">{online ? fmtDur(health?.uptime_s) : "—"}</span>
           </span>

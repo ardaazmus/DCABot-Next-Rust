@@ -1612,7 +1612,7 @@ export function Wizard({ onCreated }: WizardProps) {
                       spellCheck={false}
                       rows={12}
                       aria-label="Pine strateji kodu"
-                      className="mt-1.5 w-full rounded-lg border border-border-strong bg-surface p-3 font-mono text-[12px] leading-relaxed text-emerald-100 outline-none focus:border-emerald-500/50"
+                      className="mt-1.5 w-full rounded-lg border border-border-strong bg-surface p-3 font-mono text-[12px] leading-relaxed text-emerald-100 outline-none focus:border-emerald-500/50 focus-visible:ring-2 focus-visible:ring-emerald-500/60"
                       placeholder={'//@version=5\nstrategy("Stratejim")\nif ta.crossover(ta.ema(close, 9), ta.ema(close, 21))\n    strategy.entry("L", strategy.long)'}
                     />
                   </div>
@@ -2332,24 +2332,52 @@ export function Wizard({ onCreated }: WizardProps) {
               <div
                 className={cn(
                   "flex items-center gap-2 text-xs font-bold",
-                  needsAck ? "text-amber-300" : "text-slate-400",
+                  needsAck || certGateFailed ? "text-amber-300" : "text-slate-400",
                 )}
               >
-                {needsAck ? <TriangleAlert className="h-4 w-4" aria-hidden /> : <ShieldCheck className="h-4 w-4" aria-hidden />}
-                STRATEJİ RİSK VE UYARI BİLDİRİMİ
+                {needsAck || certGateFailed ? <TriangleAlert className="h-4 w-4" aria-hidden /> : <ShieldCheck className="h-4 w-4" aria-hidden />}
+                RİSK ÖZETİ — TEK ONAY
                 {needsAck && (
                   <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-300">
                     {displayWarnings.length} UYARI
                   </span>
                 )}
               </div>
-              {displayWarnings.length === 0 ? (
+              {/* Faz 20 (UIX-10): iki ayrı onay kutusu yerine TEK "Risk Özeti"
+                  bloğu — uyarılar ve (varsa) sertifika kapısı istisnası aynı
+                  listede sayılır, TEK onay ikisini birden kapsar. Kullanıcı
+                  hangi riski kabul ettiğini listeden okur; motor sözleşmesi
+                  korunur (riskAck + cert_acknowledged ayrı alanlar gönderilir). */}
+              {displayWarnings.length === 0 && !certGateFailed ? (
                 <p className="mt-2 text-[11px] text-slate-400">
                   Aktif uyarı yok — tüm korumalar ZORUNLU modda ve riskli modlar kapalı. Onay kutusu gerekmez.
                 </p>
               ) : (
                 <>
-                  <ul className="mt-2 space-y-1.5">
+                  <ol className="mt-2 space-y-1.5">
+                    {displayWarnings.length > 0 && (
+                      <li className="flex items-start gap-2 text-[11px] leading-snug">
+                        <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-400" aria-hidden />
+                        <span className="text-amber-200/90">
+                          <span className="font-semibold">1. Strateji &amp; politika uyarıları ({displayWarnings.length}):</span> aşağıda maddelenen
+                          riskli modlar/korumalar bu kurulumda geçerli olacak.
+                        </span>
+                      </li>
+                    )}
+                    {certGateFailed && (
+                      <li className="flex items-start gap-2 text-[11px] leading-snug">
+                        <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-rose-400" aria-hidden />
+                        <span className="text-rose-200/90">
+                          <span className="font-semibold">
+                            {displayWarnings.length > 0 ? "2." : "1."} LIVE sertifika kapısı istisnası:
+                          </span>{" "}
+                          strateji sertifika eşiklerini geçemedi ({certGateFailed.length > 160 ? certGateFailed.slice(0, 160) + "…" : certGateFailed}) —
+                          istatistiksel aşırı-uyum riskiyle canlıya alınıyor. Onay kalıcı olay kaydına yazılır.
+                        </span>
+                      </li>
+                    )}
+                  </ol>
+                  <ul className="mt-1.5 space-y-1.5 border-l border-amber-500/20 pl-3">
                     {displayWarnings.map((w) => (
                       <li key={w.code} className="flex items-start gap-2 text-[11px] leading-snug">
                         {w.severity === "WARN" ? (
@@ -2370,49 +2398,27 @@ export function Wizard({ onCreated }: WizardProps) {
                     <Checkbox
                       id="risk-ack"
                       checked={riskAck}
-                      onCheckedChange={(v) => setRiskAck(v === true)}
+                      onCheckedChange={(v) => {
+                        // Faz 20 (UIX-10): tek onay — sertifika istisnası da
+                        // bu tek tikle kapsanır (kapsam yukarıda numaralı liste
+                        // olarak okunur).
+                        setRiskAck(v === true);
+                        setCertAck(v === true);
+                      }}
                       className="mt-0.5 border-amber-500/60 data-[state=checked]:border-amber-500 data-[state=checked]:bg-amber-500 data-[state=checked]:text-[#1c1204]"
-                      aria-label="Riskleri okudum ve onaylıyorum"
+                      aria-label="Risk özetindeki tüm maddeleri okudum ve onaylıyorum"
                     />
                     <span className="text-[11px] leading-snug text-amber-200/90">
-                      Yukarıdaki riskleri okudum, anladım ve sorumluluğu üstleniyorum. (Kullanıcı Kendi Riskini Taşır)
+                      Yukarıda numaralı <span className="font-semibold">TÜM risk maddelerini</span>
+                      {certGateFailed ? " (uyarılar ve sertifika kapısı istisnası dâhil)" : ""} okudum, anladım ve sorumluluğu üstleniyorum.
+                      (Kullanıcı Kendi Riskini Taşır; onaylar kalıcı olay kaydına yazılır.)
                     </span>
                   </label>
                   {serverWarnings.length > 0 && (
                     <p className="mt-1.5 text-[10px] text-slate-400">
-                      Motor 422 yanıtı uyarı listesini doğruladı — onaydan sonra BOTU BAŞLAT&apos;a tekrar basın.
+                      Motor 422 yanıtı uyarı listesini doğruladı — onay işaretliyse BOTU BAŞLAT&apos;a tekrar basın.
                     </p>
                   )}
-                </>
-              )}
-              {certGateFailed && (
-                <>
-                  <div className="rounded-md border border-rose-500/30 bg-rose-500/5 p-2.5">
-                    <p className="text-[11px] font-semibold text-rose-200">
-                      LIVE sertifika kapısı: KALDI
-                    </p>
-                    <p className="mt-1 line-clamp-3 text-[10px] leading-snug text-rose-200/70" title={certGateFailed}>
-                      {certGateFailed}
-                    </p>
-                  </div>
-                  <label
-                    htmlFor="cert-ack"
-                    className="mt-2 flex cursor-pointer items-start gap-2 rounded-md border border-rose-500/30 bg-surface p-2.5"
-                  >
-                    <Checkbox
-                      id="cert-ack"
-                      checked={certAck}
-                      onCheckedChange={(v) => setCertAck(v === true)}
-                      className="mt-0.5 border-rose-500/60 data-[state=checked]:border-rose-500 data-[state=checked]:bg-rose-500 data-[state=checked]:text-white"
-                      aria-label="Sertifikasız stratejiyi bilinçli onaylıyorum"
-                    />
-                    <span className="text-[11px] leading-snug text-rose-200/90">
-                      Sertifikasyon eşiklerini geçemediğimi biliyorum; bu stratejiyi canlıya bilinçli olarak almakta ısrar ediyorum ve tüm riski üstleniyorum. (Onay kalıcı olarak olay kaydına yazılır.)
-                    </span>
-                  </label>
-                  <p className="mt-1.5 text-[10px] text-slate-400">
-                    Öneri: Backtest Lab&apos;de örneklem/WFE/DSR eşiklerini geçen bir config bulun — onaysız geçiş her zaman daha güvenlidir.
-                  </p>
                 </>
               )}
             </div>

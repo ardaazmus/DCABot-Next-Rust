@@ -485,6 +485,18 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
               }
             />
           </div>
+          {/* Faz 20 (UIX-12): Closing fazı artık kör bekleme değil — P0-6
+              koruması ve kullanıcının elindeki manuel tetik açıkça söylenir. */}
+          {s.phase === "Closing" && (
+            <div className="mt-3 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-2.5" role="status">
+              <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" aria-hidden />
+              <p className="text-[11px] leading-snug text-amber-200/90">
+                <span className="font-semibold">Deal kapanıyor:</span> kapanış emri piyasada. Motor 3 bar içinde dolum görmezse kapanışı
+                kendisi yeniden gönderir (P0-6 koruması) — pozisyon sahipsiz kalmaz. Acele ederseniz Filo ekranındaki
+                <span className="font-semibold"> &quot;Tümünü Kapat&quot;</span> ile manuel kapanış da tetikleyebilirsiniz.
+              </p>
+            </div>
+          )}
           <Panel title="Risk Motoru (Piyasa Korumaları)" icon={<ShieldAlert className="h-4 w-4 text-slate-500" aria-hidden />}>
             <div className="flex flex-wrap items-center gap-1.5">
               {RISK_GUARDS.map((g) => {

@@ -1658,16 +1658,45 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
         "STOP" => {
             rt.status = "STOPPED".into();
         }
-        "CLOSE_ALL" => match &mut rt.engine_kind {
-            dca_strategy::EngineTag::Dca(e) => e.request_close_all(),
-            dca_strategy::EngineTag::Hedge(h) => {
-                h.main.request_close_all();
-                if let Some(hg) = &mut h.hedge {
-                    hg.request_close_all();
+        "CLOSE_ALL" => {
+            // Faz 20 (UIX-5): grid artık destekli — kapanış = mesh iptali
+            // (halt_mesh) + açık pozisyonun TEK market kapanışı. Eski davranış
+            // "close-all only on DCA engines" 422 döndürüyor, Studio'daki
+            // "Tümünü Kapat" butonu grid botta anlamsızdı.
+            let mut grid_close_acts: Vec<dca_strategy::Action> = Vec::new();
+            let mut is_grid = false;
+            match &mut rt.engine_kind {
+                dca_strategy::EngineTag::Dca(e) => e.request_close_all(),
+                dca_strategy::EngineTag::Hedge(h) => {
+                    h.main.request_close_all();
+                    if let Some(hg) = &mut h.hedge {
+                        hg.request_close_all();
+                    }
+                }
+                dca_strategy::EngineTag::Grid(g) => {
+                    grid_close_acts = g.halt_mesh();
+                    is_grid = true;
                 }
             }
-            _ => return Err(err422("close-all only on DCA engines")),
-        },
+            if is_grid {
+                rt.pending_engine_actions.extend(grid_close_acts);
+                let qty = rt.stepper.position.qty.clone();
+                if !qty.is_zero() {
+                    rt.pending_engine_actions.push(dca_strategy::Action::PlaceMarket {
+                        id: format!("{}-closeall-{}", rt.bot_id, crate::state::now_ms()),
+                        side: if rt.stepper.position.direction == 1 { dca_math::Side::Sell } else { dca_math::Side::Buy },
+                        qty,
+                        role: "MANUAL",
+                    });
+                }
+                let msg = format!(
+                    "grid CLOSE_ALL: {} mesh emri iptal edildi{} — eylemler bir sonraki barda dispatch edilir",
+                    rt.pending_engine_actions.iter().filter(|a| matches!(a, dca_strategy::Action::CancelResting { .. })).count(),
+                    if rt.stepper.position.qty.is_zero() { ", açık pozisyon yok" } else { " + market kapanış niyeti" }
+                );
+                crate::state::persist_event(app.as_ref(), &rt.bot_id, "INFO", "CLOSE_ALL", &msg).await;
+            }
+        }
         "ADD_FUNDS" => {
             let amount = req.amount.clone().ok_or_else(|| err422("amount required"))?;
             let quote = Fraction::from_decimal_str(&amount).map_err(|e| err422(e))?;

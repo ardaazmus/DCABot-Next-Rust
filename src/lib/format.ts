@@ -21,6 +21,14 @@ export function fracToNum(s: string | number | null | undefined): number | null 
   return isFinite(v) ? v : null;
 }
 
+/**
+ * BİLİNÇLİ TERCİH (Faz 20, UIX-7 kaydı): biçimlendirme "en-US" kalır —
+ * finansal terminal gösterimi "1,234.56" konvansiyonunu kullanır ve kullanıcı
+ * bu değerleri motor girişlerine (ondalık nokta = "1234.56") kopyalayabilir.
+ * "tr-TR" yapılsaydı "1.234,56" ekrana gelir ve motora kopyalanınca
+ * ayrıştırıcıyla çelişirdi. Arayüz dili Türkçe, SAYI konvansiyonu
+ * uluslararası finansal gösterim — bu bilinçli bir tasarım kararıdır.
+ */
 function nf(min: number, max: number): Intl.NumberFormat {
   return new Intl.NumberFormat("en-US", {
     minimumFractionDigits: min,
