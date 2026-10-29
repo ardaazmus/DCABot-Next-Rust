@@ -400,6 +400,33 @@ impl VenueAdapter for BybitAdapter {
         Ok(out)
     }
 
+    /// Faz 22 (P1-23): /v5/account/fee-rate — hesap-bazlı gerçek maker/taker
+    /// (enstrüman varsayılanları VIP kademesini yansıtmaz).
+    async fn account_fee_rate(
+        &self,
+        creds: &VenueCreds,
+        category: &str,
+        symbol: &str,
+    ) -> Result<Option<(Fraction, Fraction)>, String> {
+        let query = format!("category={category}&symbol={symbol}");
+        let v = self.private_get(&creds.key, &creds.secret, "/v5/account/fee-rate", &query).await?;
+        let Some(list) = v.get("list").and_then(|x| x.as_array()) else {
+            return Ok(None);
+        };
+        let Some(item) = list.first() else {
+            return Ok(None);
+        };
+        let maker = item.get("makerFeeRate").and_then(|x| x.as_str()).unwrap_or("");
+        let taker = item.get("takerFeeRate").and_then(|x| x.as_str()).unwrap_or("");
+        if maker.is_empty() || taker.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some((
+            Fraction::from_decimal_str(maker).map_err(|e| e.to_string())?,
+            Fraction::from_decimal_str(taker).map_err(|e| e.to_string())?,
+        )))
+    }
+
     async fn funding_history(&self, symbol: &str, limit: usize) -> Result<Vec<(i64, String)>, String> {
         let query = format!("category=linear&symbol={symbol}&limit={}", limit.min(200));
         let v = self.public_get("/v5/market/funding/history", &query).await?;

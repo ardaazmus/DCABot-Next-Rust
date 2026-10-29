@@ -5,6 +5,11 @@
  * (Deal, Safety Order, Take Profit, Trailing, Grid, Hedge, Signal, Webhook,
  *  Paper/Real, LONG/SHORT), aciklamalar TURKCE'dir. Bu dosya tek kaynaktir —
  * ekranlara sabit gommeyin, buradan import edin.
+ *
+ * Faz 22 (UIX-17 — BILINCLI KARAR): TR/EN karisiklik bir hata degil, bu
+ * sozluk disiplininin gorunur sonucudur (motor terimleri EN, aciklama TR).
+ * Tam i18n sozlugu istenirse ayri bir projesidir; sektor konvansiyonu bu
+ * karari destekler.
  */
 
 import type { Instrument, SignalConfig } from "@/lib/engine-types";

@@ -194,8 +194,14 @@ impl Db {
 
 // ---------------- AES-256-GCM Vault ----------------
 
+/// Faz 22 (P2-4): zarf sürümü — 0x02 = Argon2id KDF (tuz zarf içinde);
+/// sürüm byte'sız eski kayıtlar = legacy unsalted-SHA256 KDF (geriye dönük
+/// okuma; yeni yazılar Argon2id'dir).
+const ENVELOPE_V2: u8 = 0x02;
+
 pub struct Vault {
-    cipher: Aes256Gcm,
+    /// Master secret (env DCA_VAULT_KEY) — DB'ye ASLA yazılmaz; KDF girdisi.
+    master_secret: String,
 }
 
 impl Vault {
@@ -203,39 +209,63 @@ impl Vault {
     /// The master key is NEVER generated or persisted in the DB. If the env
     /// var is missing, vault construction fails (fail-closed) — encrypted
     /// API keys cannot be decrypted without the out-of-DB master key.
-    pub fn new(db: &Db) -> Result<Self, String> {
-        let key_bytes = {
-            let from_env = std::env::var("DCA_VAULT_KEY")
-                .map_err(|_| "DCA_VAULT_KEY environment variable is required — master key must be provided out-of-DB (SEC-02)")?;
-            derive_32(&from_env)
-        };
-        let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
-        Ok(Self { cipher: Aes256Gcm::new(key) })
+    pub fn new(_db: &Db) -> Result<Self, String> {
+        let master_secret = std::env::var("DCA_VAULT_KEY")
+            .map_err(|_| "DCA_VAULT_KEY environment variable is required — master key must be provided out-of-DB (SEC-02)")?;
+        Ok(Self { master_secret })
     }
 
+    /// Faz 22 (P2-4): YENİ yazılar Argon2id zarfıyla —
+    /// [0x02][salt 16B][nonce 12B][ct]. KDF parametreleri OWASP önerisi
+    /// (m=19 MiB, t=2, p=1). Anahtar türetme her çağrıda yapılır (~50 ms —
+    /// vault okuma/yazma sıklığı için kabul edilebilir, sabit-gider güvenlik).
     pub fn encrypt(&self, plaintext: &str) -> Result<String, String> {
+        let mut salt = [0u8; 16];
+        OsRng.fill_bytes(&mut salt);
+        let key = derive_argon2id(&self.master_secret, &salt)?;
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let ct = self
-            .cipher
+        let ct = cipher
             .encrypt(nonce, plaintext.as_bytes())
             .map_err(|_| "vault encrypt failed".to_string())?;
-        let mut out = nonce_bytes.to_vec();
+        let mut out = vec![ENVELOPE_V2];
+        out.extend_from_slice(&salt);
+        out.extend_from_slice(&nonce_bytes);
         out.extend(ct);
         Ok(hex::encode(out))
     }
 
+    /// Sürümlü çözümleme: 0x02 zarfı → Argon2id; aksi halde legacy
+    /// unsalted-SHA256 yolu (P2-4 ÖNCESİ kayıtlar — yeniden kaydedilene dek
+    /// okunur kalır; tam migrasyon ayrı iş).
     pub fn decrypt(&self, hexdata: &str) -> Result<String, String> {
         let data = hex::decode(hexdata).map_err(|e| e.to_string())?;
+        if data.first() == Some(&ENVELOPE_V2) {
+            if data.len() < 1 + 16 + 12 + 1 {
+                return Err("vault v2 data too short".into());
+            }
+            let salt = &data[1..17];
+            let nonce_bytes = &data[17..29];
+            let ct = &data[29..];
+            let key = derive_argon2id(&self.master_secret, salt)?;
+            let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+            let pt = cipher
+                .decrypt(Nonce::from_slice(nonce_bytes), ct)
+                .map_err(|_| "vault v2 decrypt failed".to_string())?;
+            return String::from_utf8(pt).map_err(|e| e.to_string());
+        }
+        // LEGACY: unsalted SHA-256 (tek geçiş) — yalnız OKUMA yolu.
         if data.len() < 13 {
             return Err("vault data too short".into());
         }
         let (nonce_bytes, ct) = data.split_at(12);
-        let pt = self
-            .cipher
+        let key = derive_32(&self.master_secret);
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+        let pt = cipher
             .decrypt(Nonce::from_slice(nonce_bytes), ct)
-            .map_err(|_| "vault decrypt failed".to_string())?;
+            .map_err(|_| "vault legacy decrypt failed".to_string())?;
         String::from_utf8(pt).map_err(|e| e.to_string())
     }
 }
@@ -245,6 +275,50 @@ fn derive_32(s: &str) -> Vec<u8> {
     let mut h = Sha256::new();
     h.update(s.as_bytes());
     h.finalize().to_vec()
+}
+
+/// Faz 22 (P2-4): Argon2id KDF — OWASP önerilen parametrelerle (m=19 MiB,
+/// t=2, p=1) 32 bayt anahtar türetir; tuz zarf içinde taşınır.
+
+#[cfg(test)]
+mod vault_tests {
+    use super::*;
+
+    #[test]
+    fn argon2id_envelope_roundtrip_and_legacy_read() {
+        std::env::set_var("DCA_VAULT_KEY_TEST", "1"); // no-op; Vault env'i new()'da okur
+        let v = Vault { master_secret: "test-master-secret".into() };
+        // yeni yazı: v2 zarf
+        let enc = v.encrypt("secret-abc").expect("encrypt");
+        let raw = hex::decode(&enc).unwrap();
+        assert_eq!(raw[0], ENVELOPE_V2, "yeni yazı v2 zarf taşımalı");
+        assert_eq!(v.decrypt(&enc).unwrap(), "secret-abc");
+        // legacy okuma: eski format (nonce+ct, unsalted sha256)
+        use aes_gcm::{aead::Aead, Aes256Gcm, Key, KeyInit, Nonce};
+        let legacy_secret: &[u8] = b"legacy-secret";
+        let key = derive_32("test-master-secret");
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+        let mut nonce_bytes = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let ct = cipher.encrypt(Nonce::from_slice(&nonce_bytes), legacy_secret).unwrap();
+        let mut legacy = nonce_bytes.to_vec();
+        legacy.extend(ct);
+        let legacy_hex = hex::encode(legacy);
+        assert_eq!(v.decrypt(&legacy_hex).unwrap(), "legacy-secret");
+        // farklı secret ile çözümleme başarısız (fail-closed)
+        let v2 = Vault { master_secret: "wrong".into() };
+        assert!(v2.decrypt(&enc).is_err());
+    }
+}
+
+fn derive_argon2id(secret: &str, salt: &[u8]) -> Result<[u8; 32], String> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    let params = Params::new(19456, 2, 1, Some(32)).map_err(|e| e.to_string())?;
+    let a2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut out = [0u8; 32];
+    a2.hash_password_into(secret.as_bytes(), salt, &mut out)
+        .map_err(|e| e.to_string())?;
+    Ok(out)
 }
 
 /// Resolve the newest ACTIVE vault key for a venue into plaintext credentials.

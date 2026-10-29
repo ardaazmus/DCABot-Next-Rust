@@ -816,11 +816,12 @@ fn dispatch(stepper: &mut SimulationStepper, action: Action, ts: i64) -> Result<
                     decision_ts: ts,
                     role: role.to_string(),
                     placement_ref_price: Some(Fraction::from_any_str(&placement_ref).unwrap_or_else(|_| Fraction::one())),
+                    quote_notional: None,
                 },
                 ts,
             )?;
         }
-        Action::PlaceMarket { id, side, qty, role } => {
+        Action::PlaceMarket { id, side, qty, role, quote_notional } => {
             let kind = if matches!(role, "TP" | "SL" | "MANUAL" | "TRAIL") {
                 OrderKind::Reduce
             } else {
@@ -836,6 +837,7 @@ fn dispatch(stepper: &mut SimulationStepper, action: Action, ts: i64) -> Result<
                     decision_ts: ts,
                     role: role.to_string(),
                     placement_ref_price: None,
+                    quote_notional,
                 },
                 ts,
             )?;

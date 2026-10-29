@@ -297,6 +297,9 @@ pub struct AppState {
     /// P4-1 haber önbelleği: symbol → (cached_at_ms, yanıt). 5 dk TTL —
     /// sağlayıcı rate-limit koruması (v3 ile aynı süre).
     pub news_cache: Mutex<HashMap<String, (i64, serde_json::Value)>>,
+    /// Faz 22 (P2-10 dilim): webhook rate-limit — IP bazlı sabit pencere
+    /// sayaçları (pencere_başlangıcı_ms, penceredeki_istek_sayısı).
+    pub webhook_rate: Mutex<HashMap<String, (i64, u32)>>,
     /// P4-1 haber HTTP istemcisi (8 sn zaman aşımı, beyaz-liste konaklar).
     pub news_http: reqwest::Client,
     /// P4-2 YZ sağlayıcı HTTP istemcisi (35 sn zaman aşımı — LLM yanıtları).
@@ -348,6 +351,7 @@ impl AppState {
             instruments_cache: Mutex::new(HashMap::new()),
             tickers_cache: Mutex::new(HashMap::new()),
             news_cache: Mutex::new(HashMap::new()),
+            webhook_rate: Mutex::new(HashMap::new()),
             news_http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(8))
                 .user_agent("dcabot-news/1.0 (+internal)")
@@ -575,6 +579,10 @@ pub struct RuntimeSnapshot {
     pub breaker_tripped: bool,
     #[serde(default)]
     pub live_open_orders: Vec<LiveTrackedOrder>,
+    /// Faz 22: rejim sınıflandırma penceresi — restart'ta sıfırlanırsa
+    /// sınıflandırıcı warm-up'a döner (200 kapanış penceresi).
+    #[serde(default)]
+    pub regime_closes: Vec<f64>,
 }
 
 /// Faz 13B: hedge bacağı kernel defteri — ana bacaktan bağımsız restore.
@@ -618,6 +626,7 @@ pub fn save_runtime_state(app: &AppState, bot_id: &str, rt: &BotRuntime) {
         breaker_day_start_eq: rt.breaker_day_start_eq.as_ref().map(|x| x.to_string()),
         breaker_tripped: rt.breaker_tripped,
         live_open_orders: rt.live_open_orders.clone(),
+        regime_closes: rt.regime_closes.clone(),
     };
     let json = match serde_json::to_string(&snap) {
         Ok(j) => j,
@@ -712,7 +721,39 @@ pub async fn create_runtime(
 ) -> Result<(), String> {
     // Faz 4 (H-6): enstrüman botun kendi venue'sundan çözülür (PAPER bots
     // BYBIT piyasa verisiyle koştuğundan PAPER da BYBIT'ten çözülür).
-    let inst = engine_instrument_for(&cfg, venue, app).await;
+    let mut inst = engine_instrument_for(&cfg, venue, app).await;
+    // Faz 22 (P1-23): LIVE botlarda hesap-bazlı GERÇEK ücretler — enstrüman
+    // varsayılanları VIP/komisyon kademesini yansıtmaz; venue destekliyorsa
+    // (/v5/account/fee-rate) maker/taker burada override edilir.
+    if mode == "LIVE" {
+        if let (Some(creds), Some(adapter)) = (credentials.as_ref(), app.adapter(venue)) {
+            let category = if cfg.kind.is_futures() { "linear" } else { "spot" };
+            match adapter.account_fee_rate(creds, category, &cfg.symbol).await {
+                Ok(Some((maker, taker))) if maker.is_positive() && taker.is_positive() => {
+                    persist_event(
+                        app,
+                        id,
+                        "INFO",
+                        "FEES",
+                        &format!(
+                            "hesap-bazlı gerçek ücretler uygulandı: maker={} taker={} (enstrüman varsayılanı yerine)",
+                            maker.to_half_even_display(6),
+                            taker.to_half_even_display(6)
+                        ),
+                    )
+                    .await;
+                    inst.maker_fee_rate = maker;
+                    inst.taker_fee_rate = taker;
+                }
+                Ok(_) => {
+                    persist_event(app, id, "INFO", "FEES", "venue hesap ücreti döndürmedi — enstrüman varsayılan ücretleri kullanılıyor").await;
+                }
+                Err(e) => {
+                    persist_event(app, id, "WARN", "FEES", &format!("hesap ücreti alınamadı: {e} — enstrüman varsayılan ücretleri kullanılıyor")).await;
+                }
+            }
+        }
+    }
     let kind = cfg.kind;
     let engine = match kind {
         StrategyKind::SpotGrid | StrategyKind::FuturesGrid | StrategyKind::InfinityGrid => {
@@ -875,6 +916,7 @@ pub async fn create_runtime(
                     .and_then(|s| dca_math::fraction::Fraction::from_any_str(s).ok());
                 rt.breaker_tripped = snap.breaker_tripped;
                 rt.live_open_orders = snap.live_open_orders.clone();
+                rt.regime_closes = snap.regime_closes;
                 // Faz 18 (P0-3 kalanı) + Faz 21 (N-9): restore TUTARLILIK KAPISI —
                 // kernel pozisyonu ile engine mirror (adet, YÖN, ortalama fiyat)
                 // üçlüsü uyuşmuyorsa sessiz devam ETME: kernel fail-closed HALT

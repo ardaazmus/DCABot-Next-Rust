@@ -15,7 +15,6 @@ import {
   Wallet,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { KillButton } from "@/components/terminal/killswitch";
 import { NewsPulse } from "@/components/terminal/news-pulse";
 import { Donut, ExposureBar, type DonutSlice } from "@/components/terminal/charts";
 import {
@@ -567,7 +566,9 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
                 <li>RISK olayları canlı akışta rozetle bildirilir — kullanıcı patron, risk kendi sorumluluğunda</li>
               </ul>
             </div>
-            <KillButton className="w-full justify-center" />
+            {/* Faz 22 (UIX-13): KillButton tekrarı kaldırıldı — global kill
+                anahtarı header'da tek yerde (page.tsx); kokpitte iki aynı
+                yıkıcı-buton fark edilmemiş tıklamaya davetiydi. */}
           </div>
         </Panel>
       </div>

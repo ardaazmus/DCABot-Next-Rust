@@ -272,7 +272,9 @@ impl BotConfig {
 #[derive(Debug, Clone)]
 pub enum Action {
     PlaceLimit { id: String, side: dca_math::Side, price: Fraction, qty: Fraction, role: &'static str },
-    PlaceMarket { id: String, side: dca_math::Side, qty: Fraction, role: &'static str },
+    /// Faz 22 (P1-21): `quote_notional` — QuoteNotional market emrinde dolum
+    /// anında qty GERÇEK dolum fiyatından çözülür (kernel); None = qty sabit.
+    PlaceMarket { id: String, side: dca_math::Side, qty: Fraction, role: &'static str, quote_notional: Option<Fraction> },
     CancelResting { id: String },
     Log { level: &'static str, message: String },
 }

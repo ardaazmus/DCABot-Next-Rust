@@ -402,6 +402,13 @@ impl DcaEngine {
         self.trailing = if self.cfg.trailing_enabled { TrailingState::Idle } else { TrailingState::Off };
         self.trailing_peak = None;
         self.manual_close_requested = false;
+        // Faz 22 (P1-21): QuoteNotional'da harcanan QUOTE sabittir — market
+        // dolumunda kernel qty'yi gerçek dolum fiyatından çözer (plan-anı qty
+        // yalnız kapı/UI girdisi olarak taşınır).
+        let base_quote = match self.cfg.sizing_mode {
+            SizingMode::QuoteNotional => Some(base_qty.clone()),
+            SizingMode::BaseQty => None,
+        };
         let qty = match self.cfg.sizing_mode {
             SizingMode::BaseQty => base_qty,
             SizingMode::QuoteNotional => dca_math::m02::qty_down(&base_qty.div(&anchor).unwrap_or_else(|_| Fraction::zero()), &self.inst.step_size)
@@ -435,6 +442,7 @@ impl DcaEngine {
             side: if self.direction == Direction::Long { dca_math::Side::Buy } else { dca_math::Side::Sell },
             qty,
             role: "BASE",
+            quote_notional: base_quote,
         });
         acts.push(Action::Log { level: "INFO", message: format!("deal {deal_id} base order dispatched") });
         self.phase = DcaPhase::BasePending;
@@ -673,6 +681,7 @@ impl DcaEngine {
                             side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
                             qty: self.mirror.qty.clone(),
                             role: "SL",
+                        quote_notional: None,
                         });
                         self.phase = DcaPhase::Closing;
                         self.close_orders_out += 1;
@@ -734,6 +743,7 @@ impl DcaEngine {
                                                 side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
                                                 qty: self.mirror.qty.clone(),
                                                 role: "TP",
+                                            quote_notional: None,
                                             });
                                             self.phase = DcaPhase::Closing;
                                             self.close_orders_out += 1;
@@ -798,6 +808,7 @@ impl DcaEngine {
                         side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
                         qty: self.mirror.qty.clone(),
                         role: "MANUAL",
+                    quote_notional: None,
                     });
                     self.phase = DcaPhase::Closing;
                     self.close_orders_out += 1;
@@ -819,6 +830,7 @@ impl DcaEngine {
                         side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
                         qty: self.mirror.qty.clone(),
                         role: "MANUAL",
+                    quote_notional: None,
                     });
                     self.close_orders_out += 1;
                     self.closing_bars_waited = 0;
@@ -843,6 +855,7 @@ impl DcaEngine {
                         side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
                         qty: self.mirror.qty.clone(),
                         role: "MANUAL",
+                    quote_notional: None,
                     });
                     self.close_orders_out += 1;
                     self.closing_bars_waited = 0;

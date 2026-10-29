@@ -246,6 +246,7 @@ impl GridEngine {
                                 side: dca_math::Side::Sell,
                                 qty: dq,
                                 role: "TP",
+                                quote_notional: None,
                             });
                         }
                     }

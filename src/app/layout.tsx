@@ -30,6 +30,10 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
+    // Faz 22 (UIX-16 — BİLİNÇLİ KARAR): dark-first terminal. Finansal terminal
+    // konvansiyonu (Bloomberg/TradingView koyu palet); palet slate/x ile koyu
+    // tasarımlı olduğundan yarım bir "light mod" bilinçli olarak YOK — tema
+    // istenirse ayrı bir tasarım projesi olarak yapılır.
     <html lang="tr" suppressHydrationWarning className="dark">
       <body
         className={`${inter.variable} ${jetbrainsMono.variable} antialiased bg-[#0B0E14] text-slate-200 min-h-screen flex flex-col font-sans`}

@@ -51,6 +51,12 @@ pub struct OrderIntent {
     pub role: String,
     /// Market reference price AT PLACEMENT TIME (Gate 5 marketable check).
     pub placement_ref_price: Option<Fraction>,
+    /// Faz 22 (P1-21): QuoteNotional market emri — dolum anında qty GERÇEK
+    /// dolum fiyatından çözülür (qty = notional / fill_price); plan-anı qty
+    /// alanı yalnız tahmin/kapı girdisi olarak kalır. Böylece harcanan quote
+    /// planla birebir tutar (kapanış ↔ açılış drifti artık miktara sızamaz).
+    #[serde(default)]
+    pub quote_notional: Option<Fraction>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -411,6 +417,34 @@ impl SimulationStepper {
                         continue; // Enforce: fail-closed (eski davranış)
                     }
                 }
+                let fill_price = match gate3_slippage(order.side, &o, &self.cfg.slippage_bps) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.halted = Some(e.clone());
+                        return Err(e);
+                    }
+                };
+                // Faz 22 (P1-21): QuoteNotional market emri — qty GERÇEK dolum
+                // fiyatından (açılış ± slippage) çözülür; plan-anı qty tahmini
+                // atılır. Kapanış ↔ açılış drifti artık harcanan quote'a
+                // sızmaz (3Commas quote-spend semantiği).
+                let mut order = order;
+                if let Some(qn) = order.quote_notional.clone() {
+                    if !qn.is_zero() && !fill_price.is_zero() {
+                        let solved = dca_math::m02::qty_down(&qn.div(&fill_price).unwrap_or_else(|_| Fraction::zero()), &self.instrument.step_size)
+                            .unwrap_or_else(|_| Fraction::zero());
+                        if solved.is_zero() {
+                            self.log_advisory(
+                                ts_ms,
+                                "M02",
+                                "QUOTE_QTY_BELOW_STEP",
+                                &format!("quote notional {} dolum fiyatında adım boyutunun altında — emir bu bar atlandı", qn.to_half_even_display(8)),
+                            );
+                            continue;
+                        }
+                        order.qty = solved;
+                    }
+                }
                 // Faz 21 (P1-10): piyasa Add'ler de hacim payı kapısından geçer
                 // (eski kodda piyasa yolunda kapı hiç yoktu); risk-azaltan
                 // Reduce muaf (N-7). Kapıyı aşan emir sonraki bara devreder.
@@ -431,13 +465,6 @@ impl SimulationStepper {
                         continue;
                     }
                 }
-                let fill_price = match gate3_slippage(order.side, &o, &self.cfg.slippage_bps) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        self.halted = Some(e.clone());
-                        return Err(e);
-                    }
-                };
                 // Faz 18 (P1-8): planlı piyasa Add'leri de sermaye kapısından
                 // geçer — dolum öncesi GERÇEK kalan bakiye kontrol edilir.
                 // Wait modunda emir sonraki bara devreder, Skip modunda atlanır.
@@ -610,6 +637,7 @@ impl SimulationStepper {
                     decision_ts: ts_ms,
                     role: "SAFETY".into(),
                     placement_ref_price: Some(o.clone()),
+                quote_notional: None,
                 };
                 // Faz 18 (P1-8): konsolide gap dolumu da sermaye kapısından geçer
                 // (gerçek ücret: maker — tek komisyon semantiği).
@@ -872,6 +900,7 @@ impl SimulationStepper {
             decision_ts: ts,
             role: role.to_string(),
             placement_ref_price: Some(price.clone()),
+            quote_notional: None,
         };
         self.execute_fill_inner(&order, price, fee_role, realism, ts, venue_fee)
     }
@@ -951,6 +980,7 @@ impl SimulationStepper {
             decision_ts: ts,
             role: role.to_string(),
             placement_ref_price: Some(price.clone()),
+            quote_notional: None,
         };
         self.execute_fill(&order, price, FeeRole::Taker, FillRealism::MarketableTaker, ts)
     }
@@ -997,6 +1027,7 @@ mod tests {
                 decision_ts: ts,
                 role: "BASE".into(),
                 placement_ref_price: Some(f("100")),
+                quote_notional: None,
             },
             ts,
         )
@@ -1079,6 +1110,7 @@ mod tests {
                 decision_ts: 1000,
                 role: "BASE".into(),
                 placement_ref_price: Some(f("100")),
+                quote_notional: None,
             },
             1000,
         )
@@ -1107,6 +1139,7 @@ mod tests {
                     decision_ts: 1000,
                     role: "SAFETY".into(),
                     placement_ref_price: Some(f("100")),
+                    quote_notional: None,
                 },
                 1000,
             )
@@ -1135,6 +1168,7 @@ mod tests {
                 decision_ts: 1100,
                 role: "TP".into(),
                 placement_ref_price: Some(f("100")),
+                quote_notional: None,
             },
             1100,
         )
@@ -1175,6 +1209,7 @@ mod tests {
                 decision_ts: 1100,
                 role: "TP".into(),
                 placement_ref_price: Some(f("100")),
+                quote_notional: None,
             },
             1100,
         )
@@ -1217,6 +1252,7 @@ mod tests {
                 decision_ts: 1000,
                 role: "BASE".into(),
                 placement_ref_price: Some(f("100")),
+                quote_notional: None,
             },
             1000,
         )
@@ -1275,6 +1311,7 @@ mod tests {
                 decision_ts: 1000,
                 role: "BASE".into(),
                 placement_ref_price: Some(f("100")),
+                quote_notional: None,
             },
             1000,
         )
@@ -1304,6 +1341,7 @@ mod tests {
                 decision_ts: 1000,
                 role: "BASE".into(),
                 placement_ref_price: Some(f("100")),
+                quote_notional: None,
             },
             1000,
         )
@@ -1327,6 +1365,7 @@ mod tests {
                 decision_ts: 1000,
                 role: "BASE".into(),
                 placement_ref_price: Some(f("100")),
+                quote_notional: None,
             },
             1000,
         )
@@ -1352,6 +1391,7 @@ mod tests {
                 decision_ts: 1000,
                 role: "BASE".into(),
                 placement_ref_price: Some(f("100")),
+                quote_notional: None,
             },
             1000,
         )
@@ -1378,6 +1418,7 @@ mod tests {
                 decision_ts: 1000,
                 role: "TP".into(),
                 placement_ref_price: Some(f("108")),
+                quote_notional: None,
             },
             1000,
         )
@@ -1406,6 +1447,7 @@ mod tests {
                 decision_ts: 1000,
                 role: "SAFETY".into(),
                 placement_ref_price: Some(f("100")),
+                quote_notional: None,
             },
             1000,
         )
@@ -1513,6 +1555,7 @@ mod tests {
                 decision_ts: ts,
                 role: "SAFETY".into(),
                 placement_ref_price: Some(F::from_decimal_str("100").unwrap()),
+                quote_notional: None,
             },
             ts,
         )
@@ -1570,6 +1613,7 @@ mod tests {
                 decision_ts: t_sat - 1,
                 role: "BASE".into(),
                 placement_ref_price: None,
+            quote_notional: None,
             },
             t_sat - 1,
         )
@@ -1600,6 +1644,7 @@ mod tests {
                 decision_ts: t_sat - 1,
                 role: "BASE".into(),
                 placement_ref_price: None,
+            quote_notional: None,
             },
             t_sat - 1,
         )

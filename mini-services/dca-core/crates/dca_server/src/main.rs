@@ -200,10 +200,14 @@ async fn main() {
         .route("/api/vault/keys/:id", delete(remove_key))
         .route(
             "/api/stream",
-            get(move || {
+            get(move |headers: axum::http::HeaderMap| {
                 let st = sse_state.clone();
                 let rx = sse_rx.resubscribe();
-                sse_handler(st, rx)
+                let last_event_id = headers
+                    .get("last-event-id")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<i64>().ok());
+                sse_handler(st, rx, last_event_id)
             }),
         )
         // SEC-01: kimlik doğrulama middleware'i (yönetim routes'ları).
@@ -1268,6 +1272,34 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
     if let Some(w) = stress_warning.take() {
         warnings.push(w);
     }
+    // Faz 22 (P1-24): MOTOR TARAFI FEE-GUARD — hedef kâr, tur maliyetini
+    // (giriş taker + çıkış maker + beklenen funding) karşılamıyorsa deal
+    // yapısal olarak kâra kapanamaz. Sector-standardı (3Commas) minimum TP'yi
+    // maliyet üstü şart koşar; burada RISK_ACK onay akışına girer.
+    {
+        let entry_fee = &inst_for_warnings.taker_fee_rate; // BASE market taker
+        let exit_fee = &inst_for_warnings.maker_fee_rate; // TP resting limit maker
+        let expected_funding = Fraction::from_decimal_str("0.002").unwrap(); // koruyucu varsayım: tutma süresi içinde ~%0.2 funding
+        if let (Ok(tp), Ok(rt_cost)) = (
+            Fraction::from_decimal_str(&cfg.target_profit_pct),
+            entry_fee.add(exit_fee).and_then(|x| x.add(&expected_funding)),
+        ) {
+            if dca_math::fraction::Fraction::cmp(&tp, &rt_cost) != std::cmp::Ordering::Greater {
+                warnings.push(dca_kernel::risk_policy::AdvisoryWarning {
+                    code: "M02_FEE_GUARD".into(),
+                    title: "M02 ÜCRET EŞİĞİ".into(),
+                    message: format!(
+                        "Hedef kâr ({}) tur maliyetinin (giriş taker {} + çıkış maker {} + beklenen funding {}) altında veya eşit — deal yapısal olarak net kâra kapanamaz. TP'yi maliyetin ÜSTÜNE çekin ya da riski bilinçli üstlenin.",
+                        tp.to_half_even_display(6),
+                        entry_fee.to_half_even_display(6),
+                        exit_fee.to_half_even_display(6),
+                        expected_funding.to_half_even_display(6)
+                    ),
+                    severity: "WARN".into(),
+                });
+            }
+        }
+    }
 
     // M20 kullanıcı AÇIKÇA ZORUNLU seçtiyse eski fail-closed davranışı sürer.
     if cfg.risk_policy.m20_sl_ladder_guard == GuardAction::Enforce
@@ -1811,6 +1843,7 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
                         side: if rt.stepper.position.direction == 1 { dca_math::Side::Sell } else { dca_math::Side::Buy },
                         qty,
                         role: "MANUAL",
+                        quote_notional: None,
                     });
                 }
                 let msg = format!(
@@ -3457,7 +3490,36 @@ struct TradingViewWebhookReq {
     timestamp: i64,
 }
 
-async fn tradingview_webhook(State(app): State<Arc<AppState>>, Json(req): Json<TradingViewWebhookReq>) -> axum::response::Response {
+async fn tradingview_webhook(
+    State(app): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<TradingViewWebhookReq>,
+) -> axum::response::Response {
+    // Faz 22 (P2-10 dilim): webhook rate-limit — IP bazlı sabit pencere
+    // (60 sn / 60 istek). Secret doğrulamasından ÖNCE kapatılır: flood
+    // denemeleri DB/runtime kilidine hiç dokunmaz.
+    {
+        let ip = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(str::trim)
+            .map(str::to_string)
+            .unwrap_or_else(|| "unknown".into());
+        let now = crate::state::now_ms();
+        const WINDOW_MS: i64 = 60_000;
+        const WINDOW_MAX: u32 = 60;
+        let mut rate = app.webhook_rate.lock().await;
+        let entry = rate.entry(ip).or_insert((now, 0u32));
+        if now - entry.0 > WINDOW_MS {
+            *entry = (now, 0);
+        }
+        entry.1 += 1;
+        if entry.1 > WINDOW_MAX {
+            drop(rate);
+            return (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": "rate limit exceeded"}))).into_response();
+        }
+    }
     let mut rts = app.runtimes.lock().await;
     let Some(rt) = rts.get_mut(&req.bot_id) else {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unknown bot"}))).into_response();
@@ -3820,34 +3882,83 @@ async fn remove_key(State(app): State<Arc<AppState>>, Path(id): Path<String>) ->
 async fn sse_handler(
     app: Arc<AppState>,
     rx: tokio::sync::broadcast::Receiver<SseEvent>,
+    last_event_id: Option<i64>,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
-    let stream = async_stream_wrapper(rx, app.clone());
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    // Faz 22 (P2-8 kalanı): Last-Event-ID — yeniden bağlanan istemciye DB
+    // events tablosundan (autoincrement id) kaçtı olaylar best-effort replay
+    // edilir (en fazla 200, LOG event olarak). Sınır dürüstçe belgelenir:
+    // FILL/FUNDING gibi canlı-yayın olaylarının bir kısmı events tablosuna
+    // yazılmadığından replay tam kurtarma DEĞİLDİR; istemcinin polling
+    // telafisi (UIX-6 dataVer) birincil mekanizma olarak kalır. Canlı akıştaki
+    // her olay `id:` etiketi taşır — istemci kaldığı yeri bildirebilir.
+    let mut replay: Vec<Result<Event, Infallible>> = Vec::new();
+    if let Some(since) = last_event_id.filter(|x| *x > 0) {
+        // Satırlar önce owned Vec'e toplanır (guard en kısa ömürde).
+        let mut rows_raw: Vec<(i64, String, String, String, String, i64)> = Vec::new();
+        {
+            let conn = app.db.conn.lock().unwrap();
+            if let Ok(mut stmt) = conn
+                .prepare("SELECT id, bot_id, level, gate, message, ts FROM events WHERE id > ?1 ORDER BY id ASC LIMIT 200")
+            {
+                if let Ok(rows) = stmt.query_map([since], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, i64>(5)?,
+                    ))
+                }) {
+                    for row in rows.flatten() {
+                        rows_raw.push(row);
+                    }
+                }
+            };
+        }
+        for (id, bot_id, level, gate, message, ts) in rows_raw {
+            replay.push(Ok(Event::default()
+                .id(id.to_string())
+                .event("LOG")
+                .data(
+                    serde_json::json!({
+                        "botId": bot_id, "level": level, "gate": gate,
+                        "message": message, "ts": ts, "replayed": true
+                    })
+                    .to_string(),
+                )));
+        }
+    }
+    let stream = async_stream_wrapper(rx, app.clone(), last_event_id);
+    let replay_stream = futures_util::stream::iter(replay);
+    Sse::new(futures_util::stream::select(replay_stream, stream)).keep_alive(KeepAlive::default())
 }
 
 fn async_stream_wrapper(
     mut rx: tokio::sync::broadcast::Receiver<SseEvent>,
     app: Arc<AppState>,
+    last_event_id: Option<i64>,
 ) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
     // Faz 22 (P2-8 kalanı): PING olay-sayacı yerine ZAMAN tabanlıdır —
     // sessiz dönemlerde de sabit aralıkla atar (15 sn), olay patlamasında
     // spam üretmez.
+    let seq_start = last_event_id.unwrap_or(0);
     futures_util::stream::unfold(
-        (rx, app, 0u64, std::time::Instant::now() - std::time::Duration::from_secs(15)),
+        (rx, app, seq_start as u64, std::time::Instant::now() - std::time::Duration::from_secs(15)),
         |(mut rx, app, mut n, mut last_ping)| async move {
             loop {
                 if last_ping.elapsed() >= std::time::Duration::from_secs(15) {
                     last_ping = std::time::Instant::now();
                     n += 1;
                     return Some((
-                        Ok(Event::default().event("PING").data("1")),
+                        Ok(Event::default().id(n.to_string()).event("PING").data("1")),
                         (rx, app, n, last_ping),
                     ));
                 }
                 n += 1;
             match rx.recv().await {
                 Ok(ev) => {
-                    let e = Event::default().event(ev.event).data(ev.data);
+                    let e = Event::default().id(n.to_string()).event(ev.event).data(ev.data);
                     return Some((Ok(e), (rx, app, n, last_ping)));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {

@@ -1256,6 +1256,7 @@ pub async fn dispatch_action(
                                 decision_ts: ts,
                                 role: role.to_string(),
                                 placement_ref_price: ref_price,
+                                quote_notional: None,
                             },
                             ts,
                         )
@@ -1304,7 +1305,7 @@ pub async fn dispatch_action(
                 }
             }
         }
-        Action::PlaceMarket { id, side, qty, role } => {
+        Action::PlaceMarket { id, side, qty, role, quote_notional } => {
             let kind = if matches!(role, "TP" | "SL" | "MANUAL" | "TRAIL") { OrderKind::Reduce } else { OrderKind::Add };
             match rt.mode.as_str() {
                 "PAPER" => {
@@ -1327,6 +1328,7 @@ pub async fn dispatch_action(
                                 decision_ts: ts,
                                 role: role.to_string(),
                                 placement_ref_price: None,
+                                quote_notional,
                             },
                             ts,
                         )

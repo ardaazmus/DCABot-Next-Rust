@@ -179,6 +179,18 @@ pub trait VenueAdapter: Send + Sync {
     /// 24h istatistik listesi (tüm semboller). PAPER boş döner.
     async fn tickers_24h(&self, category: &str) -> Result<Vec<Ticker24h>, String>;
     async fn funding_history(&self, symbol: &str, limit: usize) -> Result<Vec<(i64, String)>, String>;
+    /// Faz 22 (P1-23): HESAP-bazlı gerçek ücretler (VIP/komisyon kademesi) —
+    /// (maker, taker). Desteklemeyen venue'lar None döner (enstrüman varsayılanı
+    /// kalır). Bybit: /v5/account/fee-rate.
+    async fn account_fee_rate(
+        &self,
+        creds: &VenueCreds,
+        category: &str,
+        symbol: &str,
+    ) -> Result<Option<(Fraction, Fraction)>, String> {
+        let _ = (creds, category, symbol);
+        Ok(None)
+    }
     /// Private (requires credentials); returns permissions for zero-withdrawal gate.
     async fn key_permissions(&self, creds: &VenueCreds) -> Result<KeyPermissions, String>;
     async fn wallet(&self, creds: &VenueCreds, coin: &str) -> Result<WalletSnapshot, String>;

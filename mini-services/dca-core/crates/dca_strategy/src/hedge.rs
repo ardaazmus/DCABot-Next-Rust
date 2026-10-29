@@ -210,6 +210,7 @@ impl HedgeEngine {
             side: dca_math::Side::Sell,
             qty: hq,
             role: "BASE",
+            quote_notional: None,
         });
         acts.push(Action::Log { level: "WARN", message: "hedge leg spawned (protective)".into() });
         acts
