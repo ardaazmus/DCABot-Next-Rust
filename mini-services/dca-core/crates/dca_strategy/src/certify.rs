@@ -253,6 +253,7 @@ pub fn certify(
     session: dca_math::sessions::SessionType,
     mc_runs: usize,
     funding: &[(i64, String)],
+    attempts: usize,
 ) -> Result<CertifyOutput, String> {
     if bars.len() < 20 {
         return Err("certify: need at least 20 bars".into());
@@ -366,7 +367,11 @@ pub fn certify(
     let n = rets.len();
     let sr = base.sharpe;
     let srs: Vec<f64> = trials.iter().map(|t| t.sharpe).collect();
-    let trials_n = srs.len() as f64;
+    // Faz 22 (P0-10 kalanı): DSR'nin "deneme sayısı" kullanıcılarının
+    // GERÇEK denediği konfigürasyon sayısıdır — dahili 9 varyant alt sınır;
+    // çağıran (`attempts`) daha büyük bir değer verirse söndürme buna göre
+    // sertleşir (Bailey–López de Prado tanımı).
+    let trials_n = (srs.len()).max(attempts) as f64;
     let sr_var = if srs.len() > 1 {
         let m = srs.iter().sum::<f64>() / trials_n;
         srs.iter().map(|s| (s - m) * (s - m)).sum::<f64>() / (srs.len() - 1) as f64
@@ -652,7 +657,7 @@ mod tests {
         let inst = Instrument::default();
         let cfg = base_cfg();
         let start = Fraction::from_decimal_str("10000").unwrap();
-        let out = certify(&bars, &inst, &cfg, start, dca_math::sessions::SessionType::Crypto24_7, 120, &[]).expect("certify ok");
+        let out = certify(&bars, &inst, &cfg, start, dca_math::sessions::SessionType::Crypto24_7, 120, &[], 0).expect("certify ok");
         assert!(out.trials >= 5, "expected >= 5 trials, got {}", out.trials);
         let pbo: f64 = out.pbo_pct.trim_end_matches('%').parse().unwrap_or(f64::NAN);
         assert!(pbo >= 0.0 && pbo <= 100.0, "pbo out of range: {pbo}");
@@ -677,8 +682,8 @@ mod tests {
         let inst = Instrument::default();
         let cfg = base_cfg();
         let start = Fraction::from_decimal_str("10000").unwrap();
-        let a = certify(&bars, &inst, &cfg, start.clone(), dca_math::sessions::SessionType::Crypto24_7, 80, &[]).unwrap();
-        let b = certify(&bars, &inst, &cfg, start, dca_math::sessions::SessionType::Crypto24_7, 80, &[]).unwrap();
+        let a = certify(&bars, &inst, &cfg, start.clone(), dca_math::sessions::SessionType::Crypto24_7, 80, &[], 0).unwrap();
+        let b = certify(&bars, &inst, &cfg, start, dca_math::sessions::SessionType::Crypto24_7, 80, &[], 0).unwrap();
         assert_eq!(a.dsr, b.dsr);
         assert_eq!(a.mc_return_p5_pct, b.mc_return_p5_pct);
         assert_eq!(a.pbo_pct, b.pbo_pct);

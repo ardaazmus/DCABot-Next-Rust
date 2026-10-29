@@ -95,7 +95,10 @@ export async function apiBacktest(req: BacktestRequest, signal?: AbortSignal): P
   return engineFetch("/api/backtest", { ...engineJson("POST", req), signal });
 }
 
-export async function apiBacktestCert(req: BacktestRequest & { mc_runs?: number }, signal?: AbortSignal): Promise<BacktestCertResult> {
+export async function apiBacktestCert(
+  req: BacktestRequest & { mc_runs?: number; attempts?: number },
+  signal?: AbortSignal,
+): Promise<BacktestCertResult> {
   return engineFetch("/api/backtest/cert", { ...engineJson("POST", req), signal });
 }
 

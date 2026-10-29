@@ -24,13 +24,42 @@ function enginePort(): string {
 }
 
 function engineKey(): string {
-  return process.env.ENGINE_API_KEY || process.env.NEXT_PUBLIC_ENGINE_API_KEY || "";
+  // Faz 22 (N-13): NEXT_PUBLIC_ fallback SİLİNDİ — o önekli her değişken,
+  // herhangi bir istemci dosyası okuduğu anda pakete girer; anahtarın tek
+  // kaynağı sunucu env'idir. Motorun gerçek anahtarı DCA_API_KEY'dir
+  // (start-local üretir); ENGINE_API_KEY opsiyonel takma addır.
+  return process.env.DCA_API_KEY || process.env.ENGINE_API_KEY || "";
+}
+
+/** N-12: proxy'ye CSRF/origin kapısı — same-origin doğrulaması.
+ *  Proxy Bearer'ı sunucuda eklediği için Next uygulamasına erişebilen herkes
+ *  (LAN cihazı, zararlı sayfanın fetch'i) motora tam yetkiyle yazabilirdi.
+ *  Model: tarayıcı istekleri YA Sec-Fetch-Site (modern) YA Origin (POST'ta
+ *  her zaman) taşır — ikisi de same-origin olmalı. İki başlık da yoksa istek
+ *  tarayıcı-dışıdır (curl, sunucu-içi otomasyon, tunnel arkası) → izinli;
+ *  zararlı-sayfa senaryosu bu yolla oluşamaz çünkü tarayıcı başlıkları
+ *  sözleşmeyi bırakmaz. */
+function originAllowed(req: NextRequest): boolean {
+  const site = req.headers.get("sec-fetch-site");
+  if (site) return site === "same-origin" || site === "none";
+  const origin = req.headers.get("origin");
+  if (!origin) return true; // tarayıcı-dışı istemci — başlık sözleşmesi yok
+  try {
+    const host = req.headers.get("host") ?? "";
+    return new URL(origin).host === host;
+  } catch {
+    return false;
+  }
 }
 
 export function middleware(req: NextRequest) {
   const { pathname, search } = req.nextUrl;
   if (!pathname.startsWith("/api/engine/")) {
     return NextResponse.next();
+  }
+  // Faz 22 (N-12): CSRF/origin kapısı — cross-origin yazma denemeleri 403.
+  if (!originAllowed(req)) {
+    return new NextResponse("cross-origin engine write rejected", { status: 403 });
   }
   // "/api/engine/api/health" → hedef "/api/health" (önek soyulur).
   const rest = pathname.slice("/api/engine".length) || "/";

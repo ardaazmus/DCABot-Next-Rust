@@ -289,6 +289,22 @@ impl SimulationStepper {
             }
             _ => {}
         }
+        // Faz 22 (P1-15): GELECEK-ZAMAN barı — karar saati (ts_ms) bar
+        // kapanışından önceyse veri henüz kapanmamıştır; işlenmez, imleç
+        // İLERLETİLMEZ (bar saat döndüğünde tekrar değerlendirilir).
+        // (defense-in-depth: engine zaten `b.t + interval <= now` filtreler.)
+        if bar.t > ts_ms {
+            self.log_advisory(
+                ts_ms,
+                "GATE1",
+                "FUTURE_BAR_SKIP",
+                &format!("bar kapanışı ({}) karar saatinden ({}) ileride — bar henüz işlenmedi", bar.t, ts_ms),
+            );
+            return Ok(vec![]);
+        }
+        // Spike tespiti için ÖNCEKİ kapanış yakalanır (last_close hemen altta
+        // bu barın kapanışına döner).
+        let prev_close = self.last_close.clone();
         if let Some(pt) = self.prev_bar_ts {
             self.bar_interval_ms = bar.t - pt;
         }
@@ -307,6 +323,38 @@ impl SimulationStepper {
                 "sıfır hacimli bar — dolum kararı uygulanmadı, emirler sonraki likit bara devredildi",
             );
             return Ok(vec![]);
+        }
+        // NOT (P1-15, bilinçli): h == l tek başına dolum engelleyici DEĞİL —
+        // sabit fiyatlı barlar meşrudur (stabilcoin, seyrek piyasa) ve dolum
+        // gerçekçiliğini GATE5 penetrasyon kuralları, donmuşluğu hacim-0
+        // kontrolü zaten yönetir. (İlk turda eklenmişti, backtest'in düz
+        // bar'lı verisiyle çelişti — kaldırıldı.)
+        // Faz 22 (P1-15): FİYAT SPIKE'ı — tek barda %50+ kapanış sıçraması
+        // (kirli veri / fitil); o barın dolum kararı verilmez, emirler
+        // sonraki normal bara devreder (kalıcı halt DEĞİL).
+        if let Some(pc_str) = prev_close {
+            if let Ok(pc) = Fraction::from_any_str(&pc_str) {
+                if let Ok(diff) = c.sub(&pc).and_then(|d| d.abs()) {
+                    if let Ok(ratio) = diff.div(&pc) {
+                        if Fraction::cmp(&ratio, &Fraction::from_decimal_str("0.5").unwrap_or_else(|_| Fraction::zero()))
+                            == std::cmp::Ordering::Greater
+                        {
+                            self.log_advisory(
+                                ts_ms,
+                                "GATE1",
+                                "PRICE_SPIKE_SKIP",
+                                &format!(
+                                    "tek barda %{} fiyat sıçraması ({} → {}) — bar fitil/kirli veri sayıldı, dolum kararı uygulanmadı",
+                                    ratio.mul(&Fraction::from_u64(100)).map(|x| x.to_half_even_display(1)).unwrap_or_else(|_| "?".into()),
+                                    pc.to_half_even_display(4),
+                                    c.to_half_even_display(4)
+                                ),
+                            );
+                            return Ok(vec![]);
+                        }
+                    }
+                }
+            }
         }
 
         let mut new_fills = Vec::new();
@@ -366,6 +414,10 @@ impl SimulationStepper {
                 // Faz 21 (P1-10): piyasa Add'ler de hacim payı kapısından geçer
                 // (eski kodda piyasa yolunda kapı hiç yoktu); risk-azaltan
                 // Reduce muaf (N-7). Kapıyı aşan emir sonraki bara devreder.
+                // Not (P1-8, bilinçli): piyasa Add için yakın-kademe rezervasyonu
+                // YOKTUR — market emri tanım gereği en yakın kademedir (kendi
+                // dolumu anında tahsis edilir), rezervlenecek "daha yakın bekleyen"
+                // kavramı yalnız LIMIT merdiveninde anlamlıdır.
                 if order.kind == OrderKind::Add {
                     let cap = v.mul(&self.cfg.max_volume_share).unwrap_or_else(|_| Fraction::zero());
                     let total = self
@@ -684,6 +736,16 @@ impl SimulationStepper {
             .map_err(|e: MathError| e.to_string())?;
         if !state_changed {
             return Ok(None);
+        }
+        // Faz 22 (P1-7): reduce overfill artık YÜZEYE ÇIKAR — m04 OVERFILL'i
+        // kırpıp violations'a yazıyordu ama kimse okumuyordu; pozisyon "eksik
+        // kapanmış" olarak sessizce sürüyordu. Advisory defterine CRITICAL
+        // seviyesinde yazılır (runtime RISK SSE tüketicisi görür).
+        if !self.position.violations.is_empty()
+            && self.position.violations.iter().any(|v| v.contains(&fill_key))
+        {
+            let last = self.position.violations.last().cloned().unwrap_or_default();
+            self.log_advisory(ts, "M04", "OVERFILL", &format!("reduce overfill tespit edildi: {last}"));
         }
         if margin_mode {
             // Linear futures isolated-margin cash flow:

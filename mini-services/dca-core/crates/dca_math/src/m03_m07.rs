@@ -27,7 +27,7 @@ pub fn plan_notional(
     direction: Direction,
     sizing_mode: SizingMode,
     base_size: &Fraction,
-    safety_size: &Fraction,
+    _safety_size: &Fraction,
 ) -> Result<PlanNotional, MathError> {
     let _ = direction;
     let mut gross = match sizing_mode {
@@ -43,15 +43,11 @@ pub fn plan_notional(
             }
         })?;
     }
-    if sizing_mode == SizingMode::QuoteNotional {
-        // recompute exact planned notional from spec: B_N + sum N_i
-        gross = base_size.clone();
-        let mut n = safety_size.clone();
-        for _ in levels {
-            gross = gross.add(&n)?;
-            n = n.mul(&Fraction::from_i64(1))?; // N_i scaling applied by caller ladder; kept simple
-        }
-    }
+    // Faz 22 (P1-11): ESKİ "recompute" bloğu SİLİNDİ — base_size + sabit
+    // safety_size × levels toplayıp volume_scale'i YOKSAYIYORDU (`n.mul(1)`
+    // placeholder'ı); ladder'ın gerçek N_i notional'ları (B_N + Σ N_i, spec)
+    // döngüde zaten toplanıyor. Sonuç: QuoteNotional'da plan notional'ı
+    // eksik hesaplanıyordu.
     let leverage = if leverage.is_zero() { Fraction::one() } else { leverage.clone() };
     let im = gross.div(&leverage)?;
     let fees = gross.mul(fee_rate)?;

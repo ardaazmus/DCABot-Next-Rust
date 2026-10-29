@@ -1365,6 +1365,12 @@ export function Wizard({ onCreated }: WizardProps) {
                 </div>
                 <div className="mt-4">
                   <SliderField label="Seviye Sayısı" value={gridLevels} min={2} max={60} step={1} onChange={(v) => setGridLevels(Math.round(v))} integer />
+                  {/* Faz 22 (P1-18 kalanı): n seviye = n ARALIK; mesh n+1 çizgi
+                      üretir (alt+üst sınırlar dâhil) — sektörel konvansiyon
+                      belgelendi. */}
+                  <p className="mt-1 text-[10px] leading-snug text-slate-500">
+                    {gridLevels} seviye = {gridLevels} işlem aralığı; mesh {gridLevels + 1} fiyat çizgisiyle kurulur (alt ve üst sınır dâhil).
+                  </p>
                 </div>
                 <div className="mt-4">
                   <NumField label="Seviye Başına Notional (USDT)" value={gridNotional} onChange={setGridNotional} />
@@ -2404,11 +2410,12 @@ export function Wizard({ onCreated }: WizardProps) {
                       id="risk-ack"
                       checked={riskAck}
                       onCheckedChange={(v) => {
-                        // Faz 20 (UIX-10): tek onay — sertifika istisnası da
-                        // bu tek tikle kapsanır (kapsam yukarıda numaralı liste
-                        // olarak okunur).
+                        // Faz 22 (P0-10 kalanı): sertifika istisnası AYRI onaydır —
+                        // Faz 20'deki tek-tik birleşimi kapı istisnasını da
+                        // yanlışlıkla kapsıyordu; iki onay iki ayrı sorumluluktur
+                        // (strateji uyarıları ≠ sertifika istisnası).
                         setRiskAck(v === true);
-                        setCertAck(v === true);
+                        if (v !== true) setCertAck(false);
                       }}
                       className="mt-0.5 border-amber-500/60 data-[state=checked]:border-amber-500 data-[state=checked]:bg-amber-500 data-[state=checked]:text-[#1c1204]"
                       aria-label="Risk özetindeki tüm maddeleri okudum ve onaylıyorum"
@@ -2423,6 +2430,25 @@ export function Wizard({ onCreated }: WizardProps) {
                     <p className="mt-1.5 text-[10px] text-slate-400">
                       Motor 422 yanıtı uyarı listesini doğruladı — onay işaretliyse BOTU BAŞLAT&apos;a tekrar basın.
                     </p>
+                  )}
+                  {certGateFailed && (
+                    <label
+                      htmlFor="cert-ack"
+                      className="mt-2 flex cursor-pointer items-start gap-2 rounded-md border border-rose-500/30 bg-surface p-2.5"
+                    >
+                      <Checkbox
+                        id="cert-ack"
+                        checked={certAck}
+                        onCheckedChange={(v) => setCertAck(v === true)}
+                        className="mt-0.5 border-rose-500/60 data-[state=checked]:border-rose-500 data-[state=checked]:bg-rose-500 data-[state=checked]:text-white"
+                        aria-label="Sertifikasız stratejiyi bilinçli onaylıyorum"
+                      />
+                      <span className="text-[11px] leading-snug text-rose-200/90">
+                        <span className="font-semibold">Sertifika kapısı istisnası ayrı onaydır:</span> strateji sertifika
+                        eşiklerini geçemediğini bilerek canlıya alıyorum; tüm riski üstleniyorum. (Onay kalıcı olay
+                        kaydına yazılır; strateji uyarı onayı bunun yerine GEÇMEZ.)
+                      </span>
+                    </label>
                   )}
                 </>
               )}

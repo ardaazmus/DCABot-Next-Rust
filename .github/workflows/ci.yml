@@ -42,6 +42,14 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # Faz 22 (N-13): P0-9 geri-gelme tuzağına karşı negatif test — anahtarın
+      # istemci kodunda env okuması ASLA dönmemeli (yalnız sunucu dosyaları).
+      - name: guard — no NEXT_PUBLIC_ENGINE_API_KEY reads in client code
+        run: |
+          if grep -rn "process.env.NEXT_PUBLIC" src --include="*.ts" --include="*.tsx" | grep -v "NEXT_PUBLIC_ENGINE_PORT"; then
+            echo "::error::NEXT_PUBLIC_* env okuması istemci kodunda — P0-9 regresyonu (yalnız NEXT_PUBLIC_ENGINE_PORT serbest)"
+            exit 1
+          fi
       - name: tsc --noEmit
         run: npx tsc --noEmit --incremental false
       - name: eslint

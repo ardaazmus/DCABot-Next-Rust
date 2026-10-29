@@ -285,69 +285,202 @@ pub async fn process_bar(
 }
 
 /// Per-bar funding settlement for futures bots (linear perpetuals).
-/// Bybit settles funding at fixed UTC boundaries (8h grid for most symbols);
-/// when a bar crosses a boundary while a position is open, the current funding
-/// rate is charged on position notional (mark ≈ bar close). Sign bridge (M05):
-/// positive rate → longs PAY (expense > 0), shorts receive (expense < 0).
+/// Funding settlement — P1-6 (Faz 22): mutabakat artık GERÇEK settlement
+/// geçmişiyle. `funding_history` kayıtlarından bar penceresine (prev_ts, bar.t]
+/// düşen her settlement AYRI uygulanır; interval kayıt aralığından çıkarılır
+/// (venue'daki fundingIntervalHour'un fiili karşılığı). Eski "sabit 8h × anlık
+/// ticker rate" yaklaşımı iki hata yapıyordu: (a) sembol 1h/2h/4h funding
+/// yapabilir, (b) anlık rate geçmiş settlement'i temsil etmez. Ticker tabanlı
+/// yol yalnız geçmiş BOŞSA fallback'tir ve hata yolları SESSİZ DEĞİLDİR
+/// (görünür WARN olayı — sessiz `Ok(())` yok).
 async fn check_funding(
     app: &AppState,
     rt: &mut BotRuntime,
     bar: &Bar,
     sse: &broadcast::Sender<SseEvent>,
 ) -> Result<(), String> {
-    const FUNDING_INTERVAL_MS: i64 = 8 * 3600 * 1000;
-    if rt.stepper.cfg.is_spot || rt.stepper.position.qty.is_zero() {
+    const FALLBACK_INTERVAL_MS: i64 = 8 * 3600 * 1000;
+    const HISTORY_TTL_MS: i64 = 6 * 3600 * 1000; // başarılı fetch tazeliği
+    const RETRY_TTL_MS: i64 = 10 * 60 * 1000; // başarısız fetch yeniden deneme aralığı
+    if rt.stepper.cfg.is_spot {
         return Ok(());
     }
-    let prev_ts = rt.last_bar_ts;
-    let crossings = bar.t / FUNDING_INTERVAL_MS - prev_ts / FUNDING_INTERVAL_MS;
-    if crossings <= 0 {
-        return Ok(()); // no funding boundary crossed since the previous bar
+    let main_open = !rt.stepper.position.qty.is_zero();
+    let hedge_open = rt
+        .hedge_stepper
+        .as_ref()
+        .map(|h| !h.position.qty.is_zero())
+        .unwrap_or(false);
+    if !main_open && !hedge_open {
+        return Ok(());
     }
     let category = if rt.cfg.kind.is_futures() { "linear" } else { "spot" };
     let Some(adapter) = app.adapter(&rt.venue) else {
+        crate::state::persist_event(app, &rt.bot_id, "WARN", "FUNDING", "venue adapter yok — funding mutabakatı atlandı").await;
         return Ok(());
     };
-    // Best-effort: funding needs the live rate; a failed ticker fetch must not
-    // kill the bar loop.
-    let Ok(ticker) = adapter.ticker(category, &rt.cfg.symbol).await else {
-        return Ok(());
+
+    // Geçmiş cache: başarılı fetch HISTORY_TTL taze; başarısızlık RETRY_TTL
+    // sonra yeniden denenir (her bar isteği spam olmasın).
+    let now_ms = crate::state::now_ms();
+    let stale = now_ms - rt.funding_history_ok_at > HISTORY_TTL_MS;
+    let retry_due = now_ms - rt.funding_history_tried_at > RETRY_TTL_MS;
+    if rt.funding_history.is_empty() || (stale && retry_due) {
+        rt.funding_history_tried_at = now_ms;
+        match adapter.funding_history(&rt.cfg.symbol, 200).await {
+            Ok(mut v) => {
+                v.sort_by_key(|(t, _)| *t);
+                let n = v.len();
+                rt.funding_history = v;
+                rt.funding_history_ok_at = now_ms;
+                if n == 0 {
+                    crate::state::persist_event(app, &rt.bot_id, "WARN", "FUNDING", "venue funding geçmişi boş döndü — settlement'lar fallback (anlık rate) ile karşılanacak").await;
+                }
+            }
+            Err(e) => {
+                crate::state::persist_event(
+                    app,
+                    &rt.bot_id,
+                    "WARN",
+                    "FUNDING",
+                    &format!("funding geçmişi alınamadı: {e} — son bilinen kayıtlarla devam (10 dk sonra yeniden denenecek)"),
+                )
+                .await;
+            }
+        }
+    }
+
+    // Interval: geçmişteki ardışık settlement aralıklarının medyanı; yetersiz
+    // kayıt varsa 8h fallback (eski davranış).
+    let interval_ms = {
+        let hs = &rt.funding_history;
+        if hs.len() >= 3 {
+            let mut diffs: Vec<i64> = hs.windows(2).map(|w| w[1].0 - w[0].0).filter(|d| *d > 0).collect();
+            if !diffs.is_empty() {
+                diffs.sort_unstable();
+                diffs[diffs.len() / 2]
+            } else {
+                FALLBACK_INTERVAL_MS
+            }
+        } else {
+            FALLBACK_INTERVAL_MS
+        }
     };
-    let Some(rate) = ticker.funding_rate else {
-        return Ok(());
-    };
-    if rate.is_zero() {
+
+    let prev_ts = rt.last_bar_ts.max(0);
+    let window: Vec<(i64, String)> = rt
+        .funding_history
+        .iter()
+        .filter(|(t, _)| *t > prev_ts && *t <= bar.t)
+        .cloned()
+        .collect();
+
+    // Gerçek kayıt yoksa: boundary gerçekten geçilmedi olabilir (en yaygın)
+    // YA DA geçmiş cache'i pencereyi kapsamıyor. Boundary sayısıyla ayırt et;
+    // geçildiyse fallback anlık-rate yoluna in — hataları SESSİZ geçme.
+    if window.is_empty() {
+        let crossings = if interval_ms > 0 { bar.t / interval_ms - prev_ts / interval_ms } else { 0 };
+        if crossings <= 0 {
+            return Ok(());
+        }
+        let Ok(ticker) = adapter.ticker(category, &rt.cfg.symbol).await else {
+            crate::state::persist_event(app, &rt.bot_id, "WARN", "FUNDING", &format!("funding boundary geçildi ({crossings}x) ama ticker alınamadı — settlement ertelendi (P1-6: sessiz yutma yok)")).await;
+            return Ok(());
+        };
+        let Some(rate) = ticker.funding_rate else {
+            crate::state::persist_event(app, &rt.bot_id, "WARN", "FUNDING", &format!("funding boundary geçildi ({crossings}x) ama ticker'da rate yok — settlement ertelendi")).await;
+            return Ok(());
+        };
+        if !rate.is_zero() {
+            let close = Fraction::from_decimal_str(&bar.c).map_err(|e| e.to_string())?;
+            let crossings_f = Fraction::from_i64(crossings);
+            let scale = if crossings > 1 { Some(&crossings_f) } else { None };
+            apply_funding_settlement(app, rt, bar, &rate, &close, scale, "fallback(anlık-rate)", sse).await?;
+        }
         return Ok(());
     }
+
+    // GERÇEK mutabakat: penceredeki her settlement kaydı ayrı uygulanır.
     let close = Fraction::from_decimal_str(&bar.c).map_err(|e| e.to_string())?;
-    let qty = rt.stepper.position.qty.clone();
-    let notional = qty.mul(&close).map_err(|e| e.to_string())?;
-    let dir = Fraction::from_i64(rt.stepper.position.direction as i64);
-    let mut expense = rate
-        .mul(&notional)
-        .map_err(|e| e.to_string())?
-        .mul(&dir)
-        .map_err(|e| e.to_string())?;
-    if crossings > 1 {
-        // Multi-boundary bar (e.g. 1d bars): settle once per boundary.
-        expense = expense
-            .mul(&Fraction::from_i64(crossings))
-            .map_err(|e| e.to_string())?;
+    for (t, rate_str) in &window {
+        let Ok(rate) = Fraction::from_any_str(rate_str) else {
+            crate::state::persist_event(app, &rt.bot_id, "WARN", "FUNDING", &format!("funding kaydı çözülemedi (ts={t}, rate='{rate_str}') — atlandı")).await;
+            continue;
+        };
+        if rate.is_zero() {
+            continue;
+        }
+        apply_funding_settlement(app, rt, bar, &rate, &close, None, "history", sse).await?;
     }
-    rt.stepper.apply_funding_expense(&expense);
-    // Strategy mirror: net-TP (M05) prices cumulative funding into future TP targets.
-    match &mut rt.engine_kind {
-        dca_strategy::EngineTag::Dca(e) => e.apply_funding(&expense),
-        dca_strategy::EngineTag::Hedge(h) => h.main.apply_funding(&expense),
-        // Grid engines carry no net-TP ledger (funding already moved the cash).
-        dca_strategy::EngineTag::Grid(_) => {}
+    Ok(())
+}
+
+/// Tek settlement'ın uygulanması — ana + hedge bacak, SSE FUNDING + olay kaydı.
+#[allow(clippy::too_many_arguments)]
+async fn apply_funding_settlement(
+    app: &AppState,
+    rt: &mut BotRuntime,
+    bar: &Bar,
+    rate: &Fraction,
+    close: &Fraction,
+    scale: Option<&Fraction>,
+    source: &str,
+    sse: &broadcast::Sender<SseEvent>,
+) -> Result<(), String> {
+    let scale_f = |x: &Fraction| -> Fraction {
+        match scale {
+            Some(s) => x.mul(s).unwrap_or_else(|_| x.clone()),
+            None => x.clone(),
+        }
+    };
+    if !rt.stepper.position.qty.is_zero() {
+        let notional = rt.stepper.position.qty.mul(close).map_err(|e| e.to_string())?;
+        let dir = Fraction::from_i64(rt.stepper.position.direction as i64);
+        let expense = scale_f(&rate.mul(&notional).map_err(|e| e.to_string())?.mul(&dir).map_err(|e| e.to_string())?);
+        rt.stepper.apply_funding_expense(&expense);
+        match &mut rt.engine_kind {
+            dca_strategy::EngineTag::Dca(e) => e.apply_funding(&expense),
+            dca_strategy::EngineTag::Hedge(h) => h.main.apply_funding(&expense),
+            dca_strategy::EngineTag::Grid(_) => {}
+        }
+        let bot_id = rt.bot_id.clone();
+        let _ = sse.send(SseEvent {
+            event: "FUNDING".into(),
+            data: json!({
+                "botId": bot_id,
+                "ts": bar.t,
+                "rate": rate.to_string(),
+                "expense": expense.to_string(),
+                "cash": rt.stepper.cash.to_string(),
+                "cumulativeFunding": rt.stepper.cumulative_funding.to_string(),
+                "source": source,
+            })
+            .to_string(),
+        });
+        crate::state::persist_event(
+            app,
+            &bot_id,
+            "INFO",
+            "FUNDING",
+            &format!(
+                "funding settled [{source}]: rate={} expense={} qty={}",
+                rate.to_half_even_display(8),
+                expense.to_half_even_display(8),
+                rt.stepper.position.qty.to_half_even_display(8)
+            ),
+        )
+        .await;
     }
     // Faz 13B: hedge bacağı AYRI kernel — kendi pozisyonuyla ayrı settlement.
     if let Some(hs) = rt.hedge_stepper.as_mut() {
         if !hs.position.qty.is_zero() {
-            let hnotional = hs.position.qty.mul(&close).unwrap_or_else(|_| Fraction::zero());
+            let hnotional = hs.position.qty.mul(close).unwrap_or_else(|_| Fraction::zero());
             let hdir = Fraction::from_i64(hs.position.direction as i64);
-            if let Ok(hexp) = rate.mul(&hnotional).and_then(|x| x.mul(&hdir)).and_then(|x| if crossings > 1 { x.mul(&Fraction::from_i64(crossings)) } else { Ok(x) }) {
+            if let Ok(hexp) = rate
+                .mul(&hnotional)
+                .and_then(|x| x.mul(&hdir))
+                .and_then(|x| Ok(scale_f(&x)))
+            {
                 hs.apply_funding_expense(&hexp);
                 if let dca_strategy::EngineTag::Hedge(h) = &mut rt.engine_kind {
                     if let Some(hleg) = h.hedge.as_mut() {
@@ -357,33 +490,6 @@ async fn check_funding(
             }
         }
     }
-    let bot_id = rt.bot_id.clone();
-    let _ = sse.send(SseEvent {
-        event: "FUNDING".into(),
-        data: json!({
-            "botId": bot_id,
-            "ts": bar.t,
-            "rate": rate.to_string(),
-            "expense": expense.to_string(),
-            "cash": rt.stepper.cash.to_string(),
-            "cumulativeFunding": rt.stepper.cumulative_funding.to_string(),
-            "settlements": crossings,
-        })
-        .to_string(),
-    });
-    crate::state::persist_event(
-        app,
-        &bot_id,
-        "INFO",
-        "FUNDING",
-        &format!(
-            "funding settled: rate={} expense={} ({}x boundary)",
-            rate.to_half_even_display(8),
-            expense.to_half_even_display(8),
-            crossings
-        ),
-    )
-    .await;
     Ok(())
 }
 
@@ -807,18 +913,41 @@ async fn apply_intent_outcomes(
                 }
             }
             crate::state::IntentOutcome::MarketOpen { id, side, kind, role, price, qty } => {
-                // Faz 21 (N-4): sıfır referans fiyatı patolojik — kitaba yine de
-                // girer (takip/sweep-retry canlı kalsın diye) ama CRITICAL olayla
-                // GÖRÜNÜR olur; sweep 0 fiyatla ingest etmez (fail-closed).
+                // Faz 22 (N-14): 0 referans fiyatı patolojik — venue yük defterini
+                // eksik sayıyor ve sweep fallback'i 0 fiyatla ingest edemez.
+                // Kitaba girmeden önce son kapanış fiyatından türet; hâlâ yoksa
+                // CRITICAL yazıp kitaba 0 fiyatla KOYMA (fail-closed; sweep
+                // bundan sonra fiyat bulursa kaydı açar).
+                let mut price = price;
+                if price.is_zero() {
+                    let derived = rt
+                        .stepper
+                        .last_close
+                        .as_deref()
+                        .and_then(|s| Fraction::from_any_str(s).ok())
+                        .unwrap_or_else(Fraction::zero);
+                    if !derived.is_zero() {
+                        crate::state::persist_event(
+                            app,
+                            &rt.bot_id,
+                            "WARN",
+                            "ORDER",
+                            &format!("LIVE kalan dolum referans fiyatı yoktu ({id}) — son kapanış ({}) ile deftere yazıldı", derived.to_half_even_display(8)),
+                        )
+                        .await;
+                        price = derived;
+                    }
+                }
                 if price.is_zero() {
                     crate::state::persist_event(
                         app,
                         &rt.bot_id,
                         "CRITICAL",
                         "ORDER",
-                        &format!("LIVE kalan dolum takibi REFERANS FİYATSIZ kitaba yazıldı ({id}, kalan {qty}) — sweep fallback fiyat bulmadan ingest etmez"),
+                        &format!("LIVE kalan dolum takibi REFERANS FİYATSIZ — kitaba yazılmadı ({id}, kalan {qty}); sonraki poll'da fiyat bulunursa sweep açar"),
                     )
                     .await;
+                    continue;
                 }
                 // Faz 4.5: resting partial — deftere (+) (kilit-dışı düzeltme: eski kod
                 // market place'te bump(+) yapmıyordu; poll-refresh zaten düzeltiyordu).
@@ -858,8 +987,26 @@ async fn apply_intent_outcomes(
                 rollback_pending_phase_after_gate_reject(app, rt);
             }
             crate::state::IntentOutcome::PlaceFailed { id, err } => {
-                let msg = format!("LIVE emir yerleştirilemedi ({id}): {err}");
+                let msg = format!("LIVE emir yerleştirilemedi ({id}): {err} — faz geri alındı, koşul düzelince yeniden denenecek (P0-6 kalanı)");
                 crate::state::persist_event(app, &rt.bot_id, "WARN", "ORDER", &msg).await;
+                // Faz 22 (P0-6 kalanı): PlaceFailed artık GateBlocked ile AYNI
+                // faz-geri-alma disiplininden geçer — borsa emri reddederse
+                // (minNotional, risk limiti, bakım) strateji "emir verildi"
+                // varsayımında takılıp kalırdı (BasePending/Closing kilidi).
+                // Reduce (kapanış) emirleri hariç: Closing'teki pozisyon P0-6
+                // retry döngüsüne (3 bar) sahiptir, fazı geri almak pozisyonu
+                // sahipsiz bırakırdı — orada mekanizma retry'dır.
+                let is_reduce = rt
+                    .live_open_orders
+                    .iter()
+                    .find(|o| o.id == *id)
+                    .map(|o| o.kind == OrderKind::Reduce)
+                    .unwrap_or(false);
+                if !is_reduce {
+                    rollback_pending_phase_after_gate_reject(app, rt);
+                } else {
+                    crate::state::persist_event(app, &rt.bot_id, "INFO", "ORDER", &format!("kapanış emri reddi ({id}) — Closing retry döngüsünde yeniden gönderilecek")).await;
+                }
             }
             crate::state::IntentOutcome::Cancelled { cancelled, failed } => {
                 for link in failed {

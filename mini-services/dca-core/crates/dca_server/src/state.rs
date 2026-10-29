@@ -65,6 +65,13 @@ pub struct BotRuntime {
     /// CLOSE_ALL → halt_mesh + market kapanış) — runner bir sonraki barda
     /// motor döngüsüyle AYNI dispatch disiplininden akıtır.
     pub pending_engine_actions: Vec<dca_strategy::Action>,
+    /// Faz 22 (P1-6): funding settlement geçmişi cache'i — gerçek mutabakat
+    /// penceredeki kayıtlarla yapılır; interval kayıt aralığından çıkarılır.
+    pub funding_history: Vec<(i64, String)>,
+    /// Son BAŞARILI funding-geçmişi fetch zamanı (0 = hiç).
+    pub funding_history_ok_at: i64,
+    /// Son fetch DENEMESİ (başarısızlıkta retry throttle'ı).
+    pub funding_history_tried_at: i64,
     /// Faz 13B: hedge bacağı için AYRI kernel stepper (direction=-1) —
     /// EX-06'nın kalıcı çözümü: iki bacak artık tek kernel pozisyonunda
     /// birleşmez; her bacak kendi cash/IM/fee/pozisyon defterini tutar.
@@ -180,7 +187,9 @@ pub enum IntentOutcome {
 }
 
 /// One LIVE resting order awaiting venue fill reconciliation.
-#[derive(Debug, Clone)]
+/// Faz 22 (P2-1): Serialize/Deserialize — snapshot'a girer (restart sonrası
+/// dış dolum takibi kaybolmazdı).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LiveTrackedOrder {
     pub id: String,
     pub side: dca_math::Side,
@@ -556,6 +565,16 @@ pub struct RuntimeSnapshot {
     /// P0-3: bekleyen emirler de snapshot'a girer (kapanış emri kaybı olmasın).
     #[serde(default)]
     pub pending: Vec<dca_kernel::OrderIntent>,
+    /// Faz 22 (P2-1 kalanı): günlük DD devre kesici durumu + açık emir defteri
+    /// — restart'ta kesici sıfırlanır ve dış dolum takibi kaybolurdu (fail-open).
+    #[serde(default)]
+    pub breaker_day: i64,
+    #[serde(default)]
+    pub breaker_day_start_eq: Option<String>,
+    #[serde(default)]
+    pub breaker_tripped: bool,
+    #[serde(default)]
+    pub live_open_orders: Vec<LiveTrackedOrder>,
 }
 
 /// Faz 13B: hedge bacağı kernel defteri — ana bacaktan bağımsız restore.
@@ -595,6 +614,10 @@ pub fn save_runtime_state(app: &AppState, bot_id: &str, rt: &BotRuntime) {
         position: Some(rt.stepper.position.clone()),
         kernel_prev_bar_ts: rt.stepper.prev_bar_ts,
         pending: rt.stepper.pending.clone(),
+        breaker_day: rt.breaker_day,
+        breaker_day_start_eq: rt.breaker_day_start_eq.as_ref().map(|x| x.to_string()),
+        breaker_tripped: rt.breaker_tripped,
+        live_open_orders: rt.live_open_orders.clone(),
     };
     let json = match serde_json::to_string(&snap) {
         Ok(j) => j,
@@ -755,8 +778,12 @@ pub async fn create_runtime(
     // fresh secret on restore; the UI surfaces it in bot settings).
     // Task 20 L4 — webhook secret CSPRNG: DefaultHasher (SipHash sabit seed +
     // zaman girdisi) CSPRNG DEĞİLDİ ve tahmin edilebilirdi. uuid v4 (OsRng
-    // destekli) — vault deseninin aynısı. Secret DB'ye yazılmaz; restore'da
-    // yeniden üretilir (UI bot ayarlarında gösterir).
+    // destekli) — vault deseninin aynısı. Faz 22 (P2-2): YORUM DÜZELTİLDİ —
+    // eski metin "Secret DB'ye yazılmaz" diyordu ama save_runtime_state
+    // webhook_secret'i RuntimeSnapshot'a YAZAR (restart sonrası TradingView
+    // alert'leri geçerliliğini korur). Yanlış yorum güvenlik incelemesini
+    // yanıltırdı; gerçek davranış: secret snapshot'ta kalıcıdır, DB'de ayrı
+    // bir sütun tutulmaz.
     let webhook_secret = format!("tvw_{}", uuid::Uuid::new_v4().simple());
     if let Some(sc) = &cfg.entry_signal {
         dca_signals::validate_signal_node(&sc.root)?;
@@ -790,6 +817,9 @@ pub async fn create_runtime(
         pos_mode_blocked: false,
         pending_live_intents: Vec::new(),
         pending_engine_actions: Vec::new(),
+        funding_history: Vec::new(),
+        funding_history_ok_at: 0,
+        funding_history_tried_at: 0,
         hedge_stepper,
         pos_mode_hedge: false,
         mmr_brackets: None,
@@ -835,6 +865,16 @@ pub async fn create_runtime(
                 }
                 rt.stepper.prev_bar_ts = snap.kernel_prev_bar_ts.or(Some(snap.last_bar_ts));
                 rt.stepper.pending = snap.pending.clone();
+                // Faz 22 (P2-1 kalanı): günlük DD kesici + açık emir defteri
+                // restore — restart'ta kesici sıfırlanmıyor, dış dolum takibi
+                // sürüyor (eski davranış fail-open'dı).
+                rt.breaker_day = snap.breaker_day;
+                rt.breaker_day_start_eq = snap
+                    .breaker_day_start_eq
+                    .as_deref()
+                    .and_then(|s| dca_math::fraction::Fraction::from_any_str(s).ok());
+                rt.breaker_tripped = snap.breaker_tripped;
+                rt.live_open_orders = snap.live_open_orders.clone();
                 // Faz 18 (P0-3 kalanı) + Faz 21 (N-9): restore TUTARLILIK KAPISI —
                 // kernel pozisyonu ile engine mirror (adet, YÖN, ortalama fiyat)
                 // üçlüsü uyuşmuyorsa sessiz devam ETME: kernel fail-closed HALT

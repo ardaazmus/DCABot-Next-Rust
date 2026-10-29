@@ -20,24 +20,38 @@ fn is_grid(kind: crate::StrategyKind) -> bool {
     matches!(kind, crate::StrategyKind::SpotGrid | crate::StrategyKind::FuturesGrid | crate::StrategyKind::InfinityGrid)
 }
 
-/// Grid fee-breaker ihlali: Some((per_level_step, g_min)) — ihlal yoksa None.
-/// Hem burada (create/snapshot uyarısı) hem GridEngine::new (Enforce reddi)
-/// tarafından kullanılır — tek matematik, tek kaynak.
+/// Grid fee-breaker ihlali: Some((en_dar_segment, g_min)) — ihlal yoksa None.
+/// Faz 22 (N-11): TEK MATEMATİK — create-time uyarısı artık GridEngine::new
+/// ile AYNI yolu yürür: gerçek mesh üretilir (aritmetik/geometrik), tick'e
+/// hizalanır ve `validate_grid_fee_breaker` ile EN DAR segment + asimetrik
+/// ücretler (maker-in / taker-out) denetlenir. Eski "ortalama adım ×
+/// maker×maker" hesabı iki kapının farklı hüküm vermesine yol açıyordu.
 pub fn grid_fee_breaker_violation(cfg: &BotConfig, inst: &Instrument) -> Option<(Fraction, Fraction)> {
     let lower = Fraction::from_decimal_str(cfg.grid_lower.as_deref().unwrap_or("0")).ok()?;
     let upper = Fraction::from_decimal_str(cfg.grid_upper.as_deref().unwrap_or("0")).ok()?;
     if lower.is_zero() || upper.is_zero() || lower >= upper {
         return None; // yapısal hata ayrıca 422 ile yüzeye çıkar
     }
-    let levels = cfg.grid_levels.unwrap_or(10).max(2) as u64;
-    let g_min = dca_math::m15_m20::fee_breaker_min_step(&inst.maker_fee_rate, &inst.maker_fee_rate).ok()?;
-    let step_pct = upper.div(&lower).ok()?.sub(&Fraction::one()).ok()?;
-    let per_level = step_pct.div(&Fraction::from_u64(levels)).ok()?;
-    if per_level <= g_min {
-        Some((per_level, g_min))
-    } else {
-        None
+    let levels = cfg.grid_levels.unwrap_or(10).max(2).min(500);
+    let mesh = match cfg.grid_mode.as_deref() {
+        Some("geometric") => dca_math::m15_m20::geometric_mesh(&lower, &upper, levels).ok()?,
+        _ => dca_math::m15_m20::arithmetic_mesh(&lower, &upper, levels).ok()?,
+    };
+    let mesh: Vec<Fraction> = mesh
+        .into_iter()
+        .map(|p| dca_math::m02::tick_down(&p, &inst.tick_size).unwrap_or(p))
+        .collect();
+    let ok = dca_math::m15_m20::validate_grid_fee_breaker(&mesh, &inst.maker_fee_rate, &inst.taker_fee_rate).ok()?;
+    if ok {
+        return None;
     }
+    let g_min = dca_math::m15_m20::fee_breaker_min_step(&inst.maker_fee_rate, &inst.taker_fee_rate).ok()?;
+    // En dar segmenti raporla (uyarı metni gerçek darboğazı göstersin).
+    let tightest = mesh
+        .windows(2)
+        .filter_map(|w| w[1].div(&w[0]).ok()?.sub(&Fraction::one()).ok())
+        .min()?;
+    Some((tightest, g_min))
 }
 
 /// M20 çakışma taraması: oransal anchor (1) ve base (1) ile merdiveni kurar,

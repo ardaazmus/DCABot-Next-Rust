@@ -261,6 +261,9 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
     }
   };
   const [certBusy, setCertBusy] = useState(false);
+  // Faz 22 (P0-10 kalanı): kullanıcının gerçek deneme sayısı — DSR söndürmesi
+  // bunu kullanır (dahili 9 varyant alt sınır; sertleştirme buradan).
+  const [certAttempts, setCertAttempts] = useState(0);
   const [certError, setCertError] = useState<string | null>(null);
   const [cert, setCert] = useState<BacktestCertResult | null>(null);
 
@@ -325,6 +328,7 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
           config,
           mc_runs: 200,
           venue,
+          attempts: certAttempts > 0 ? certAttempts : undefined,
         },
         ctrl.signal,
       );
@@ -645,6 +649,20 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
               {busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Play className="h-4 w-4" aria-hidden />}
               {busy ? "Koşuyor…" : "BACKTEST"}
             </Button>
+            <div className="flex min-h-11 flex-1 flex-col justify-center rounded-lg border border-border bg-surface px-3 py-1.5 lg:w-40 lg:flex-none">
+              <label htmlFor="cert-attempts" className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+                Deneme sayısı (DSR)
+              </label>
+              <Input
+                id="cert-attempts"
+                inputMode="numeric"
+                value={String(certAttempts)}
+                onChange={(e) => setCertAttempts(Math.max(0, Math.floor(Number(e.target.value) || 0)))}
+                placeholder="0 = yalnız varyantlar"
+                aria-label="Kullanıcının gerçek denediği konfigürasyon sayısı (DSR söndürmesi)"
+                className="num mt-0.5 h-7 border-0 bg-transparent px-0 text-sm text-slate-100 shadow-none focus-visible:ring-0"
+              />
+            </div>
             <Button
               onClick={() => void runCert()}
               disabled={certBusy}

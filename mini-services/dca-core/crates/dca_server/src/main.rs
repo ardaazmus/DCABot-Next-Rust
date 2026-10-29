@@ -995,6 +995,11 @@ struct CreateBotReq {
     /// istisna). Onay kalıcı olarak olay akışına yazılır.
     #[serde(default)]
     cert_acknowledged: bool,
+    /// Faz 22 (P0-10 kalanı): kullanıcının GERÇEK denediği strateji
+    /// konfigürasyon sayısı — DSR söndürmesi bunu kullanır (dahili 9 varyant
+    /// alt sınırdır). 0/eksik = sadece dahili varyantlar.
+    #[serde(default)]
+    attempts: usize,
 }
 
 fn default_interval() -> String {
@@ -1107,12 +1112,24 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
     // < %100, ölçekler, tektonluk) geçerli. Grid türleri merdivensiz çalıştığı
     // için muaftır. (Çapa=1 + tick=0.01 alma: seviye fiyatları aynı tick'e
     // yuvarlanır ve gerçek olmayan "not below previous" hataları üretir.)
+    //
+    // Faz 22 (P1-19 kalanı): tick/step artık GERÇEK enstrüman metadata'sından
+    // (venue çözümü; PAPER→BYBIT) — SHIBUSDT gibi mikro-tick sembollerinde
+    // nominal 0.01/0.001 tamamen farklı plan üretiyordu. Metadata gelmezse
+    // eski nominal değerler fallback (yapısal doğrulama yine çalışır).
+    let inst_resolved = state::resolve_instrument(&cfg, &req.venue.to_uppercase(), &app).await;
+    let mut stress_warning: Option<dca_kernel::risk_policy::AdvisoryWarning> = None;
     {
         let gridish = matches!(kind, StrategyKind::SpotGrid | StrategyKind::FuturesGrid | StrategyKind::InfinityGrid);
         if !gridish {
             // validate_cfg_positive yukarıda parse edilebilirliği garanti etti.
-            let tick = Fraction::from_decimal_str("0.01").unwrap();
-            let step = Fraction::from_decimal_str("0.001").unwrap();
+            let real_tick_ok = !inst_resolved.tick_size.is_zero() && inst_resolved.tick_size.is_positive();
+            let tick = if real_tick_ok { inst_resolved.tick_size.clone() } else { Fraction::from_decimal_str("0.01").unwrap() };
+            let step = if !inst_resolved.step_size.is_zero() && inst_resolved.step_size.is_positive() {
+                inst_resolved.step_size.clone()
+            } else {
+                Fraction::from_decimal_str("0.001").unwrap()
+            };
             let anchor = Fraction::from_decimal_str("1000").unwrap();
             let base = Fraction::from_decimal_str(&cfg.base_order_size).unwrap();
             let safety = Fraction::from_decimal_str(&cfg.safety_order_size).unwrap();
@@ -1134,6 +1151,93 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
             ) {
                 return Err(err422(format!("config merdiveni kurulamıyor: {e} — deviation_pct kesir olarak yazılır (0.005 = %0.5), kümülatif sapma %100'ü aşamaz")));
             }
+
+            // Faz 22 (P1-11): M03 stres-teminat kapısı canlandırıldı — planı
+            // GERÇEK çapa (venue ticker) ile kur; plan notional + şok-altında
+            // (−%30) gereken teminatı hesapla; start_cash yetmiyorsa
+            // M03_STRESS_COLLATERAL uyarısı düşür (onay akışı: RISK_ACK -
+            // gerekli; fiziksel sermaye kısıtı onaylansa bile GATE6
+            // fiziksel değişmezdir — safetiler dolmaz).
+            let start_cash_frac = Fraction::from_decimal_str(&req.start_cash).unwrap_or_else(|_| Fraction::zero());
+            let is_spot_cfg = !kind.is_futures();
+            let anchor_real = match app.adapter(&req.venue.to_uppercase()) {
+                Some(a) => match a.ticker(if is_spot_cfg { "spot" } else { "linear" }, &req.symbol).await {
+                    Ok(t) if t.last_price.is_positive() => Some(t.last_price),
+                    _ => None,
+                },
+                None => None,
+            };
+            if let Some(anchor_real) = anchor_real {
+                if let Ok(plan) = dca_math::build_dca_plan(
+                    &anchor_real,
+                    &base,
+                    &safety,
+                    &dev,
+                    &sscale,
+                    &vscale,
+                    cfg.max_safety_orders.min(1000),
+                    dca_math::m02::Direction::Long,
+                    &tick,
+                    &step,
+                    cfg.sizing_mode,
+                ) {
+                    let leverage = if is_spot_cfg {
+                        Fraction::one()
+                    } else {
+                        Fraction::from_decimal_str(&cfg.leverage).unwrap_or(Fraction::one())
+                    };
+                    if let Ok(pn) = dca_math::m03_m07::plan_notional(
+                        &base.div(&anchor_real).unwrap_or_else(|_| Fraction::one()),
+                        &anchor_real,
+                        &plan,
+                        &leverage,
+                        &inst_resolved.taker_fee_rate,
+                        dca_math::m02::Direction::Long,
+                        cfg.sizing_mode,
+                        &base,
+                        &safety,
+                    ) {
+                        // M03 varsayılan şok senaryosu: −%30 fiyat, MMR %0.5,
+                        // ek tampon %0.5, funding tamponu %0.2, gap tamponu %1
+                        // (notional oranı — M03 doküman varsayılanları).
+                        let shock = Fraction::from_decimal_str("-0.30").unwrap();
+                        let mm = Fraction::from_decimal_str("0.005").unwrap();
+                        let extra = Fraction::from_decimal_str("0.005").unwrap();
+                        let funding_buf = Fraction::from_decimal_str("0.002").unwrap();
+                        let gap = Fraction::from_decimal_str("0.01").unwrap();
+                        if let Ok(required) = dca_math::m03_m07::required_collateral(
+                            &pn.planned_gross_notional,
+                            &pn.estimated_initial_margin,
+                            &mm,
+                            &shock,
+                            &pn.planned_gross_notional.mul(&extra).unwrap_or_else(|_| Fraction::zero()),
+                            &pn.planned_gross_notional.mul(&funding_buf).unwrap_or_else(|_| Fraction::zero()),
+                            &pn.planned_gross_notional.mul(&gap).unwrap_or_else(|_| Fraction::zero()),
+                            is_spot_cfg,
+                        ) {
+                            let available = match start_cash_frac.mul(&leverage) {
+                                Ok(x) => x,
+                                Err(_) => start_cash_frac.clone(),
+                            };
+                            if !required.is_zero()
+                                && dca_math::fraction::Fraction::cmp(&required, &available) == std::cmp::Ordering::Greater
+                            {
+                                stress_warning = Some(dca_kernel::risk_policy::AdvisoryWarning {
+                                    code: "M03_STRESS_COLLATERAL".into(),
+                                    title: "M03 STRES TEMİNAT YETERSİZLİĞİ".into(),
+                                    message: format!(
+                                        "Tam merdiven ({}) şok senaryosunda (−%30) {} teminat/gider gerektiriyor; kullanılabilir sermaye (start_cash×kaldıraç) {}. Eksik kademe kademeleri GATE6 tarafından bekletilir (Wait) ya da atlanır (Skip) — tam sermaye şoku üstleniyorsunuz.",
+                                        pn.planned_gross_notional.to_half_even_display(4),
+                                        required.to_half_even_display(4),
+                                        available.to_half_even_display(4)
+                                    ),
+                                    severity: "WARN".into(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1143,24 +1247,27 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
         kind,
         StrategyKind::SpotGrid | StrategyKind::FuturesGrid | StrategyKind::InfinityGrid
     );
-    let inst_for_warnings: Instrument = if is_grid_kind {
-        let inst = state::resolve_instrument(&cfg, &req.venue.to_uppercase(), &app).await;
-        if cfg.risk_policy.grid_fee_breaker == GuardAction::Enforce {
-            if let Some((per_level, g_min)) = dca_strategy::grid_fee_breaker_violation(&cfg, &inst) {
-                return Err(err422(format!(
-                    "fee-breaker: per-level step {} <= g_min {}; increase range or lower level count",
-                    per_level.to_half_even_display(6),
-                    g_min.to_half_even_display(6)
-                )));
-            }
+    let inst_for_warnings: Instrument = inst_resolved;
+    // Task 16 — Grid g_min fee-breaker: Enforce modda kurulum reddedilir.
+    // Faz 22 (N-11): kapı artık GridEngine::new ile AYNI matematikten geçer
+    // (gerçek mesh + en dar segment + asimetrik ücret) — create 422 ile
+    // runtime reddi farklı hüküm veremeyecek.
+    if is_grid_kind && cfg.risk_policy.grid_fee_breaker == GuardAction::Enforce {
+        if let Some((per_level, g_min)) = dca_strategy::grid_fee_breaker_violation(&cfg, &inst_for_warnings) {
+            return Err(err422(format!(
+                "fee-breaker: en dar mesh segmenti {} <= g_min {}; aralığı büyütün veya kademe sayısını düşürün",
+                per_level.to_half_even_display(6),
+                g_min.to_half_even_display(6)
+            )));
         }
-        inst
-    } else {
-        Instrument::default()
-    };
+    }
 
     // Task 16 — TÜM advisory uyarıları (tek kaynak: dca_strategy::advisory).
-    let warnings = dca_strategy::compute_warnings(&cfg, &inst_for_warnings);
+    let mut warnings = dca_strategy::compute_warnings(&cfg, &inst_for_warnings);
+    // Faz 22 (P1-11): M03 stres-teminat uyarısı onay akışına girer.
+    if let Some(w) = stress_warning.take() {
+        warnings.push(w);
+    }
 
     // M20 kullanıcı AÇIKÇA ZORUNLU seçtiyse eski fail-closed davranışı sürer.
     if cfg.risk_policy.m20_sl_ladder_guard == GuardAction::Enforce
@@ -1297,11 +1404,12 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
             .collect();
         let gate_cfg = cfg.clone();
         let gate_cash = start_cash.clone();
+        let gate_attempts = req.attempts;
         let (gate_cert, gate_base) = tokio::task::spawn_blocking(move || {
             let base = run_backtest(&bars_n, &inst, &gate_cfg, gate_cash.clone(), dca_math::sessions::SessionType::Crypto24_7, &funding).ok();
             // Faz 18 (P0-10): denemeler de base ile aynı funding takviminde —
             // ortak maliyet tabanı.
-            let cert = certify(&bars_n, &inst, &gate_cfg, gate_cash, dca_math::sessions::SessionType::Crypto24_7, 100, &funding);
+            let cert = certify(&bars_n, &inst, &gate_cfg, gate_cash, dca_math::sessions::SessionType::Crypto24_7, 100, &funding, gate_attempts);
             (cert, base)
         })
         .await
@@ -2148,6 +2256,9 @@ struct BacktestCertReq {
     /// P4-3d: sertifikasyon market verisi bu venue'den çekilir (BYBIT varsayılan).
     #[serde(default)]
     venue: Option<String>,
+    /// Faz 22 (P0-10 kalanı): kullanıcı gerçek deneme sayısı (DSR söndürmesi).
+    #[serde(default)]
+    attempts: usize,
 }
 
 fn default_mc_runs() -> usize {
@@ -2229,7 +2340,7 @@ async fn backtest_cert(
     let (cert, base_metrics) = tokio::task::spawn_blocking(move || {
         let base = run_backtest(&bars_n, &inst, &cfg, start.clone(), session, &funding).ok();
         // Faz 18 (P0-10): denemeler de base ile aynı funding takviminde.
-        let cert = certify(&bars_n, &inst, &cfg, start, session, req.mc_runs, &funding);
+        let cert = certify(&bars_n, &inst, &cfg, start, session, req.mc_runs, &funding, req.attempts);
         (cert, base)
     })
     .await
@@ -3718,24 +3829,26 @@ fn async_stream_wrapper(
     mut rx: tokio::sync::broadcast::Receiver<SseEvent>,
     app: Arc<AppState>,
 ) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
-    futures_util::stream::unfold((rx, app, 0u64), |(mut rx, app, mut n)| async move {
-        loop {
-            if n % 15 == 0 {
-                let _ = &app;
-                // heartbeat comment handled by keep-alive; still emit periodic ping event
-                if n > 0 {
+    // Faz 22 (P2-8 kalanı): PING olay-sayacı yerine ZAMAN tabanlıdır —
+    // sessiz dönemlerde de sabit aralıkla atar (15 sn), olay patlamasında
+    // spam üretmez.
+    futures_util::stream::unfold(
+        (rx, app, 0u64, std::time::Instant::now() - std::time::Duration::from_secs(15)),
+        |(mut rx, app, mut n, mut last_ping)| async move {
+            loop {
+                if last_ping.elapsed() >= std::time::Duration::from_secs(15) {
+                    last_ping = std::time::Instant::now();
                     n += 1;
                     return Some((
                         Ok(Event::default().event("PING").data("1")),
-                        (rx, app, n),
+                        (rx, app, n, last_ping),
                     ));
                 }
-            }
-            n += 1;
+                n += 1;
             match rx.recv().await {
                 Ok(ev) => {
                     let e = Event::default().event(ev.event).data(ev.data);
-                    return Some((Ok(e), (rx, app, n)));
+                    return Some((Ok(e), (rx, app, n, last_ping)));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     // Faz 21 (P2-8): Lagged artık SESSİZ değil — istemciye açık
@@ -3746,11 +3859,12 @@ fn async_stream_wrapper(
                         Ok(Event::default()
                             .event("LOG")
                             .data(serde_json::json!({"level": "WARN", "message": msg, "ts": crate::state::now_ms()}).to_string())),
-                        (rx, app, n),
+                        (rx, app, n, last_ping),
                     ));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
             }
-        }
-    })
+            }
+        },
+    )
 }

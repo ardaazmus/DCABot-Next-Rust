@@ -35,7 +35,10 @@ export async function GET() {
   if (target.protocol !== "http:" || !ALLOWED_HOSTS.has(target.hostname)) {
     return new Response("engine endpoint not allowed", { status: 403 });
   }
-  const key = process.env.NEXT_PUBLIC_ENGINE_API_KEY || process.env.ENGINE_API_KEY || "";
+  // Faz 22 (N-13): NEXT_PUBLIC_ fallback silindi — anahtarın tek kaynağı
+  // sunucu env'idir (ENGINE_API_KEY); o önekli değişken istemci paketine
+  // girme riski taşır ve ismin durması P0-9'un geri gelme tuzağıydı.
+  const key = process.env.DCA_API_KEY || process.env.ENGINE_API_KEY || "";
   let upstream: Response;
   try {
     upstream = await fetch(target, {
