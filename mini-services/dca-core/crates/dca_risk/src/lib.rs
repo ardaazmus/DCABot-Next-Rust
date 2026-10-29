@@ -130,6 +130,8 @@ pub fn gate5_limit_realism(
     bar_volume: &Fraction,
     already_filled_qty_this_bar: &Fraction,
     optimistic_touch: bool,
+    volume_share_cap: &Fraction,
+    volume_share_exempt: bool,
 ) -> (FillRealism, GateVerdict) {
     let tag = if side == dca_math::Side::Buy && (flt(placement_price, limit_price) || limit_price == placement_price) {
         FillRealism::MarketableTaker
@@ -158,16 +160,22 @@ pub fn gate5_limit_realism(
     if !penetrated {
         return (tag, GateVerdict::Defer("GATE5: no price penetration".into()));
     }
-    // Volume share cap: single bar cannot fill > 10% of its volume for strategy orders.
-    let cap = bar_volume
-        .mul(&Fraction::from_decimal_str("0.1").unwrap())
-        .map_err(|e| e.to_string())
-        .unwrap_or_else(|_| Fraction::zero());
-    let total = already_filled_qty_this_bar
-        .add(order_qty)
-        .unwrap_or_else(|_| Fraction::zero());
-    if flt(&cap, &total) {
-        return (tag, GateVerdict::Defer("GATE5: bar volume share cap (10%) exceeded".into()));
+    // Volume share cap: tek bar emrin toplam hacminin payı kadar doldurabilir.
+    // Faz 21 (N-7): RISK-AZALTAN emirler (Reduce/TP/SL) pay kapısından MUAF —
+    // büyük pozisyon / düşük hacimli sembolde TP her barda Defer'a takılıp
+    // fiyat geçtiği halde kapanamıyordu (GATE7 ile aynı muafiyet mantığı).
+    // Faz 21 (P1-10): pay artık konfigüre (max_volume_share, varsayılan %10).
+    if !volume_share_exempt {
+        let cap = bar_volume
+            .mul(volume_share_cap)
+            .map_err(|e| e.to_string())
+            .unwrap_or_else(|_| Fraction::zero());
+        let total = already_filled_qty_this_bar
+            .add(order_qty)
+            .unwrap_or_else(|_| Fraction::zero());
+        if flt(&cap, &total) {
+            return (tag, GateVerdict::Defer("GATE5: bar volume share cap exceeded".into()));
+        }
     }
     (tag, GateVerdict::Pass)
 }
@@ -385,12 +393,14 @@ mod tests {
             &f("100"),
             &f("0"),
             false,
+            &f("0.1"),
+            false,
         );
         assert!(matches!(verdict, GateVerdict::Defer(_)), "REALISTIC: teğet dokunuş dolmamalı");
         // OPTIMISTIC: same bar fills (legacy touch semantics).
         let (_, v_touch) = gate5_limit_realism(
             dca_math::Side::Buy, &f("98"), &f("100"), &f("99"), &f("100.5"), &f("98"),
-            &f("1"), &f("100"), &f("0"), true,
+            &f("1"), &f("100"), &f("0"), true, &f("0.1"), false,
         );
         assert!(matches!(v_touch, GateVerdict::Pass), "OPTIMISTIC: teğet dokunuş dolmalı");
         // Realistic pass: low strictly beyond the limit.
@@ -405,19 +415,34 @@ mod tests {
             &f("100"),
             &f("0"),
             false,
+            &f("0.1"),
+            false,
         );
         assert_eq!(tag, FillRealism::RestingTouch);
         assert!(matches!(verdict, GateVerdict::Pass));
         // volume cap: bar volume 5, order 1 -> 20% > 10%
         let (_, v2) = gate5_limit_realism(
             dca_math::Side::Buy, &f("98"), &f("100"), &f("99"), &f("100.5"), &f("97.5"),
-            &f("1"), &f("5"), &f("0"), false,
+            &f("1"), &f("5"), &f("0"), false, &f("0.1"), false,
         );
         assert!(matches!(v2, GateVerdict::Defer(_)));
+        // Faz 21 (N-7): risk-azaltan (Reduce/TP) emir pay kapısından MUAF —
+        // aynı hacim koşulunda Reduce dolumu Defer'a takılmaz.
+        let (_, v_reduce) = gate5_limit_realism(
+            dca_math::Side::Sell, &f("98"), &f("100"), &f("99"), &f("100.5"), &f("97.5"),
+            &f("1"), &f("5"), &f("0"), false, &f("0.1"), true,
+        );
+        assert!(matches!(v_reduce, GateVerdict::Pass), "Reduce hacim payından muaf olmalı");
+        // Faz 21 (P1-10): pay konfigüre edilebilir — %1 kapıyla aynı koşul Defer.
+        let (_, v_custom) = gate5_limit_realism(
+            dca_math::Side::Buy, &f("98"), &f("100"), &f("99"), &f("100.5"), &f("97.5"),
+            &f("1"), &f("50"), &f("0"), false, &f("0.01"), false,
+        );
+        assert!(matches!(v_custom, GateVerdict::Defer(_)), "konfigüre pay devrede olmalı");
         // no penetration at all
         let (_, v3) = gate5_limit_realism(
             dca_math::Side::Buy, &f("97"), &f("100"), &f("99"), &f("100.5"), &f("98.5"),
-            &f("1"), &f("100"), &f("0"), false,
+            &f("1"), &f("100"), &f("0"), false, &f("0.1"), false,
         );
         assert!(matches!(v3, GateVerdict::Defer(_)));
     }

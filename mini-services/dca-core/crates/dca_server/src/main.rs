@@ -1083,6 +1083,22 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
             _ => return Err(err422(format!("config.stop_loss_pct: '{sl}' 0 < SL ≤ 1 (yüzde olarak) aralığında olmalı — geçersiz SL sessizce devre dışı bırakılamaz"))),
         }
     }
+    // Faz 21 (P0-11): ÜST SINIRLAR — sınırsız max_safety_orders / grid_levels
+    // tek API çağrısıyla bellek ayırmayı patlatıp TÜM motoru düşürebiliyordu
+    // (3Commas: SO 50'de sınırlı). Sector-standart sınırlar + dürüst 422.
+    if cfg.max_safety_orders > 100 {
+        return Err(err422(format!(
+            "config.max_safety_orders: {} > 100 — üst sınır 100 (tek istekle motor belleğini patlatmaya karşı; sektörde 3Commas 50 kullanır)",
+            cfg.max_safety_orders
+        )));
+    }
+    if let Some(levels) = cfg.grid_levels {
+        if !(2..=500).contains(&levels) {
+            return Err(err422(format!(
+                "config.grid_levels: {levels} — aralık [2, 500] olmalı (sınırsız mesh tek istekle motoru düşürür)"
+            )));
+        }
+    }
 
     // D-2: kurulum anında merdiven ön-inşası — runtime'da her poll'da ERROR
     // tekrarlayan hatalı kombinasyonlar (örn. kesir yerine yüzde yazılan
@@ -1723,10 +1739,18 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
         "RESET_KERNEL" => {
             // P0-2: sticky kernel halt'ın AÇIK kurtarma ucu — GATE1 Halt
             // (gerçek veri bozulması) sonrası operatör buradan açar.
+            // Faz 21 (N-8): HEDGE kernel'in halt'ı da açılır — eski kod yalnız
+            // ana kernel'i açıyordu, hedge bacak kalıcı duruyor kalıyordu.
             rt.stepper.halted = None;
             rt.stepper.prev_bar_ts = None;
             rt.stepper.bar_interval_ms = 0;
-            state::persist_event(&app, &id, "WARN", "RESET_KERNEL", "kernel halt temizlendi — imleç sıfırlandı, bir sonraki kapalı bardan warmup ile devam").await;
+            if let Some(hs) = rt.hedge_stepper.as_mut() {
+                if hs.halted.take().is_some() {
+                    hs.prev_bar_ts = None;
+                    hs.bar_interval_ms = 0;
+                }
+            }
+            state::persist_event(&app, &id, "WARN", "RESET_KERNEL", "kernel halt temizlendi (hedge dâhil) — imleç sıfırlandı, bir sonraki kapalı bardan warmup ile devam").await;
         }
         other => return Err(err422(format!("unknown action: {other}"))),
     }
@@ -3713,7 +3737,18 @@ fn async_stream_wrapper(
                     let e = Event::default().event(ev.event).data(ev.data);
                     return Some((Ok(e), (rx, app, n)));
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    // Faz 21 (P2-8): Lagged artık SESSİZ değil — istemciye açık
+                    // LOG olayı düşer; UI "veri tazeliği" rozetinde fark edilir
+                    // ve istemci kendi polling'iyle telafi eder.
+                    let msg = format!("SSE akışı {skipped} olay kaçırdı (yavaş tüketici) — polling telafi eder");
+                    return Some((
+                        Ok(Event::default()
+                            .event("LOG")
+                            .data(serde_json::json!({"level": "WARN", "message": msg, "ts": crate::state::now_ms()}).to_string())),
+                        (rx, app, n),
+                    ));
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
             }
         }

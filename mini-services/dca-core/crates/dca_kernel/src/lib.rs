@@ -142,6 +142,42 @@ pub struct SimulationStepper {
     gate_log_cursor: usize,
 }
 
+/// Faz 21 (P1-8): yakın-kademe SO-fonu — `fill_price` ile piyas arasında
+/// (Buy merdiveni: daha YÜKSEK fiyatlı; Sell: daha DÜŞÜK) bekleyen Add
+/// emirlerinin notional+taker-fee toplamı. Bu emir doluma erişmeden önce
+/// yakın kademeler dolacağı için nakit onlara ayrılmalıdır; aksi halde uzak
+/// bir kademe yakının sermayesini "ilk gelen alır" mantığıyla kilitler.
+fn closer_pending_reserved(
+    pending: &[OrderIntent],
+    fill_price: &Fraction,
+    is_buy_ladder: bool,
+    taker_fee_rate: &Fraction,
+) -> Fraction {
+    let mut acc = Fraction::zero();
+    for p in pending {
+        if p.kind != OrderKind::Add {
+            continue;
+        }
+        let Some(pp) = &p.price else { continue };
+        let closer = if is_buy_ladder {
+            Fraction::cmp(pp, fill_price) == std::cmp::Ordering::Greater
+        } else {
+            Fraction::cmp(pp, fill_price) == std::cmp::Ordering::Less
+        };
+        if !closer {
+            continue;
+        }
+        let with_fee = p
+            .qty
+            .mul(pp)
+            .and_then(|n| n.mul(taker_fee_rate).and_then(|f| n.add(&f)));
+        if let Ok(v) = with_fee {
+            acc = v.add(&acc).unwrap_or(acc);
+        }
+    }
+    acc
+}
+
 impl SimulationStepper {
     pub fn new(instrument: Instrument, start_cash: Fraction, cfg: StepperConfig) -> Self {
         let dir = 1_i8; // engine-specific; strategies set their own position dir
@@ -284,9 +320,8 @@ impl SimulationStepper {
         let mut gap_batch: Vec<OrderIntent> = Vec::new();
         let mut gap_batch_qty = Fraction::zero();
         let gap_consolidate_on = self.cfg.policy.gap_consolidation == GuardAction::Enforce;
-        let volume_cap = v
-            .mul(&Fraction::from_decimal_str("0.1").unwrap_or_else(|_| Fraction::zero()))
-            .unwrap_or_else(|_| Fraction::zero());
+        // Faz 21 (P1-10): hacim payı kapısı konfigürasyondan (ölü alan canlandı).
+        let volume_cap = v.mul(&self.cfg.max_volume_share).unwrap_or_else(|_| Fraction::zero());
 
         // Intrabar evaluation of resting limit orders (penetration + realism + capital)
         let remaining = std::mem::take(&mut self.pending);
@@ -323,6 +358,22 @@ impl SimulationStepper {
                         // proceed to fill below
                     } else {
                         continue; // Enforce: fail-closed (eski davranış)
+                    }
+                }
+                // Faz 21 (P1-10): piyasa Add'ler de hacim payı kapısından geçer
+                // (eski kodda piyasa yolunda kapı hiç yoktu); risk-azaltan
+                // Reduce muaf (N-7). Kapıyı aşan emir sonraki bara devreder.
+                if order.kind == OrderKind::Add {
+                    let cap = v.mul(&self.cfg.max_volume_share).unwrap_or_else(|_| Fraction::zero());
+                    let total = self
+                        .filled_qty_this_bar
+                        .add(&order.qty)
+                        .unwrap_or_else(|_| Fraction::zero());
+                    if Fraction::cmp(&cap, &total) == std::cmp::Ordering::Less {
+                        let verdict = GateVerdict::Defer("GATE5: market add exceeds bar volume share cap".into());
+                        self.log_gate(ts_ms, "GATE5", &verdict);
+                        self.pending.push(order);
+                        continue;
                     }
                 }
                 let fill_price = match gate3_slippage(order.side, &o, &self.cfg.slippage_bps) {
@@ -368,6 +419,8 @@ impl SimulationStepper {
             };
 
             // Gate 5 — realism & penetration (dolum modeli: REALISTIC/OPTIMISTIC)
+            // Faz 21 (N-7): risk-azaltan (Reduce/TP/SL) emirler hacim payı
+            // kapısından muaf; Faz 21 (P1-10): pay konfigürasyondan gelir.
             let placement_ref = order.placement_ref_price.clone().unwrap_or_else(|| target.clone());
             let (realism, g5) = gate5_limit_realism(
                 order.side,
@@ -380,6 +433,8 @@ impl SimulationStepper {
                 &v,
                 &self.filled_qty_this_bar,
                 self.cfg.policy.fill_model == FillModel::Optimistic,
+                &self.cfg.max_volume_share,
+                order.kind == OrderKind::Reduce,
             );
             self.log_gate(ts_ms, "GATE5", &g5);
             match g5 {
@@ -405,15 +460,26 @@ impl SimulationStepper {
             // her dolum bakiyeyi anında düşer, sonraki emrin G6'sı GERÇEK kalan
             // bakiyeyi görür. Beklemedeki (sonraki bara kalan) emirler kendi
             // dolum anlarında yeniden kontrol edilir.
+            // Faz 21 (P1-8): yakın-kademe SO-fonu — bu emirden piyasaya DAHA
+            // YAKIN bekleyen Add'lerin maliyeti rezerve edilir; nakit yetmezse
+            // dolum sırasını yakın kademeler kazanır (uzak kademe Wait'te
+            // bekler — kör ilk-gelen-alır değil, öncelikli tahsis).
             if order.kind == OrderKind::Add {
                 let fee = order.qty.mul(&fill_price).map_err(|e| e.to_string())?.mul(&self.instrument.taker_fee_rate).map_err(|e| e.to_string())?;
+                let reserved = closer_pending_reserved(
+                    &self.pending,
+                    &fill_price,
+                    order.side == Side::Buy,
+                    &self.instrument.taker_fee_rate,
+                );
+                let available = self.cash.sub(&reserved).unwrap_or_else(|_| Fraction::zero());
                 let g6 = gate6_capital_guard(
                     &order.qty,
                     &fill_price,
                     &fee,
                     &self.cfg.leverage,
                     self.cfg.is_spot,
-                    &self.cash,
+                    &available,
                     &self.cfg.capital_shortfall_mode,
                 );
                 self.log_gate(ts_ms, "GATE6", &g6);

@@ -128,6 +128,14 @@ impl UserRiskPolicy {
         if self.active_safety_orders == 0 {
             return Err("risk_policy.active_safety_orders en az 1 olmalı".into());
         }
+        // Faz 21 (P0-11): aktif güvenlik emri üst sınırı 10 — API üzerinden
+        // anlamsız derecede büyük değerle defter/mesh şişirme engellenir.
+        if self.active_safety_orders > 10 {
+            return Err(format!(
+                "risk_policy.active_safety_orders ({}) > 10 — üst sınır 10",
+                self.active_safety_orders
+            ));
+        }
         if self.active_safety_orders as usize > max_safety_orders.max(1) {
             return Err(format!(
                 "risk_policy.active_safety_orders ({}) maksimum güvenlik emri sayısını ({max_safety_orders}) aşamaz",

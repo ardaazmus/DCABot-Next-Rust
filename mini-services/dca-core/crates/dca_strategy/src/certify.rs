@@ -326,17 +326,18 @@ pub fn certify(
             if rel <= 0.5 {
                 overfit += 1;
             }
-            // Faz 18 (P0-10): WFE fold katkısı — negatif fold cezası.
-            // Eski kod "IS bileşik ≤ 0" fold'ları ortalamadan DÜŞÜYORDU:
-            // çoğu fold'da zarar eden bir strateji iki şanslı fold ile WFE ≥ %50
-            // alabiliyordu. Yeni kural: IS'i zarar eden fold, OOS'i kazansa bile
-            // ortalamayı yukarı ÇEKEMEZ (katkı en fazla 0); OOS de negatifse
-            // negatif katkıyla cezalandırır. Tüm fold'lar payda sayılır.
+            // Faz 18 (P0-10) + Faz 21 (N-5): WFE fold katkısı — negatif fold
+            // cezası, TEK BİRİMDE. Eski kod "IS bileşik ≤ 0" fold'ları ortalamadan
+            // DÜŞÜYORDU; ilk ceza denemesi ise oranı (OOS/IS) getiriyle karıştırıp
+            // cezayı sayısal olarak etkisizleştirmişti (|%5| vs ~0.8 katkı).
+            // Yeni kural (rapor önerisi): IS'i zarar eden fold KATKISI SABİT
+            // −1.0'dır — iyi bir fold ~+0.8 katkı verirken ceza onu anlamlı
+            // biçimde dengeler; OOS kazancı şans sayılmaya devam eder.
             let contrib = if trial_is_tot[best] > 1e-12 {
                 trial_oos_tot[best] / trial_is_tot[best]
             } else {
                 wfe_is_losing += 1;
-                trial_oos_tot[best].min(0.0)
+                -1.0
             };
             wfe_sum += contrib;
             wfe_cnt += 1;

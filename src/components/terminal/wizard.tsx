@@ -81,6 +81,7 @@ import {
   apiVaultKeys,
   EngineError,
   saveBotMeta,
+  useEngineHealth,
   type PineBacktestResponse,
   type PineScriptItem,
   type PineValidateResponse,
@@ -656,7 +657,11 @@ export function Wizard({ onCreated }: WizardProps) {
 
   const needsAck = displayWarnings.length > 0;
   const sec6Valid = !needsAck || riskAck;
-  const canLaunch = sec1Valid && sec2Valid && sec3Valid && sec4Valid && sec5Valid && sec6Valid;
+  // Faz 21 (UIX-14): motor çevrimdışıyken submit kapalı — eski davranışta
+  // form doluydu, launch ağ hatasıyla patlıyor ve kullanıcı kayboluyordu.
+  const { health: engineHealth } = useEngineHealth(15000);
+  const engineOnline = engineHealth?.status === "ok";
+  const canLaunch = sec1Valid && sec2Valid && sec3Valid && sec4Valid && sec5Valid && sec6Valid && engineOnline;
   const secValid = [sec1Valid, sec2Valid, sec3Valid, sec4Valid, sec5Valid, sec6Valid];
 
   /* ---- LIVE mode: verify a vault key exists for the selected venue ---- */
@@ -2533,7 +2538,9 @@ export function Wizard({ onCreated }: WizardProps) {
               <p className="text-center text-[10px] text-slate-400">
                 {needsAck && !riskAck
                   ? "Önce 6. bölümdeki onay kutusuyla riskleri onaylayın."
-                  : "Tüm bölümler geçerli olunca aktif olur."}
+                  : !engineOnline
+                    ? "Motor çevrimdışı — çekirdek başlatılınca launch açılır."
+                    : "Tüm bölümler geçerli olunca aktif olur."}
               </p>
             )}
           </div>

@@ -86,6 +86,14 @@ pub fn build_dca_plan(
     if anchor_p0.is_zero() || anchor_p0.is_negative() {
         return Err(MathError::DomainViolation("anchor P0 must be > 0".into()));
     }
+    // Faz 21 (P0-11): savunma üst sınırı — sınırsız safety_count tek istekle
+    // with_capacity üzerinden bellek ayırmayı patlatır (tüm motor çöker).
+    // API katmanı 100'de 422 döner; bu katman 1000'de sert Err verir.
+    if safety_count > 1000 {
+        return Err(MathError::DomainViolation(format!(
+            "safety_count {safety_count} > 1000 — reddedildi (P0-11 savunma sınırı)"
+        )));
+    }
 
     let mut levels = Vec::with_capacity(safety_count);
     let mut current_step_dev = deviation_pct.clone();

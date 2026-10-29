@@ -71,32 +71,11 @@ impl GridEngine {
         }
         let lower = Fraction::from_decimal_str(cfg.grid_lower.as_deref().unwrap_or("0")).map_err(|e| e.to_string())?;
         let upper = Fraction::from_decimal_str(cfg.grid_upper.as_deref().unwrap_or("0")).map_err(|e| e.to_string())?;
-        let levels = cfg.grid_levels.unwrap_or(10).max(2);
+        // Faz 21 (P0-11): kademe sayısı üst sınırı 500 — sınırsız mesh tek
+        // istekle motoru düşürebiliyordu (API katmanı da 422 verir; savunma).
+        let levels = cfg.grid_levels.unwrap_or(10).max(2).min(500);
         if lower.is_zero() || upper.is_zero() || lower >= upper {
             return Err("grid bounds invalid: need 0 < lower < upper".into());
-        }
-        // M15 fee breaker guard — Task 16 (spec 2.2): artık UYARI moduna alındı.
-        // Enforce → kurulum reddedilir (eski davranış); PermissiveWithWarning →
-        // grid kurulur ama risk bildirimi kaydedilir (spec: "Izgarayı kurmayı
-        // engelleme! NEGATIVE_FEE_MARGIN uyarısı üret").
-        let g_min = fee_breaker_min_step(&inst.maker_fee_rate, &inst.maker_fee_rate).map_err(|e| e.to_string())?;
-        let step_pct = upper.div(&lower).map_err(|e| e.to_string())?.sub(&Fraction::one()).map_err(|e| e.to_string())?;
-        let per_level = step_pct.div(&Fraction::from_u64(levels as u64)).map_err(|e| e.to_string())?;
-        let mut fee_breaker_violation: Option<String> = None;
-        if per_level <= g_min {
-            if cfg.risk_policy.grid_fee_breaker.is_permissive() {
-                fee_breaker_violation = Some(format!(
-                    "NEGATIVE_FEE_MARGIN: ızgara adımı ({}) komisyon toplamından (g_min {}) dar; her turda net bakiyeniz komisyona erir (kullanıcı onayıyla kuruldu)",
-                    per_level.to_half_even_display(6),
-                    g_min.to_half_even_display(6)
-                ));
-            } else {
-                return Err(format!(
-                    "fee-breaker: per-level step {} <= g_min {}; increase range or lower level count",
-                    per_level.to_half_even_display(6),
-                    g_min.to_half_even_display(6)
-                ));
-            }
         }
         let mesh = match cfg.grid_mode.as_deref() {
             Some("geometric") => geometric_mesh(&lower, &upper, levels).map_err(|e| e.to_string())?,
@@ -107,6 +86,31 @@ impl GridEngine {
             .into_iter()
             .map(|p| dca_math::m02::tick_down(&p, &inst.tick_size).unwrap_or(p))
             .collect();
+        // M15 fee breaker — Task 16 (spec 2.2) + Faz 21 (N-10/P1-18): kontrol
+        // ARTIK gerçek mesh üzerinden — EN DAR segment + asimetrik gerçek
+        // ücretler (maker-in / taker-out). Eski kod ortalamayı
+        // ((upper/lower−1)/levels) maker×maker ile ölçüyordu: aritmetik
+        // mesh'te en dar üst segment Ortalamadan dar olabilir → üretimde
+        // komisyona eren tur riski görünmezdi.
+        // Enforce → kurulum reddedilir; PermissiveWithWarning → grid kurulur
+        // ama risk bildirimi kaydedilir (spec: "Izgarayı kurmayı engelleme!").
+        let fee_ok = dca_math::m15_m20::validate_grid_fee_breaker(&mesh, &inst.maker_fee_rate, &inst.taker_fee_rate)
+            .map_err(|e| e.to_string())?;
+        let mut fee_breaker_violation: Option<String> = None;
+        if !fee_ok {
+            let g_min = fee_breaker_min_step(&inst.maker_fee_rate, &inst.taker_fee_rate).map_err(|e| e.to_string())?;
+            if cfg.risk_policy.grid_fee_breaker.is_permissive() {
+                fee_breaker_violation = Some(format!(
+                    "NEGATIVE_FEE_MARGIN: en dar ızgara adımı komisyon toplamından (g_min {}) dar; her turda net bakiyeniz komisyona erir (kullanıcı onayıyla kuruldu)",
+                    g_min.to_half_even_display(6)
+                ));
+            } else {
+                return Err(format!(
+                    "fee-breaker: en dar mesh adımı <= g_min ({}); aralığı büyütün veya kademe sayısını düşürün",
+                    g_min.to_half_even_display(6)
+                ));
+            }
+        }
         let n = mesh.len();
         Ok(Self {
             bot_id: bot_id.to_string(),

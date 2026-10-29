@@ -620,14 +620,19 @@ async fn execute_live_intents(
                             // Kısmi/hiç dolum: kalan kitaba girer (sweep tamamlar).
                             // Sorgu tamamen başarısızsa bile emir KİTAPTA kalır —
                             // görünmez dolum artık imkansız (fail-closed).
+                            // Faz 21 (N-4): kalan GERÇEK referans fiyatla yazılır
+                            // (gate.last_close) — 0 fiyatlı kitap kaydı venue yük
+                            // defterini eksikletiyor ve sweep fallback'i m04
+                            // DOMAIN hatasıyla yutuyordu.
                             let remaining = qty.sub(&captured).unwrap_or_else(|_| Fraction::zero());
                             if let Some(e) = exec_err {
                                 out.push(crate::state::IntentOutcome::MarketQueryFailed { id: id.clone(), err: e });
                             }
                             if !remaining.is_zero() && !remaining.is_negative() {
+                                let ref_px = gate.last_close.clone().unwrap_or_else(Fraction::zero);
                                 out.push(crate::state::IntentOutcome::MarketOpen {
                                     id, side, kind, role,
-                                    price: Fraction::zero(),
+                                    price: ref_px,
                                     qty: remaining,
                                 });
                             }
@@ -802,6 +807,19 @@ async fn apply_intent_outcomes(
                 }
             }
             crate::state::IntentOutcome::MarketOpen { id, side, kind, role, price, qty } => {
+                // Faz 21 (N-4): sıfır referans fiyatı patolojik — kitaba yine de
+                // girer (takip/sweep-retry canlı kalsın diye) ama CRITICAL olayla
+                // GÖRÜNÜR olur; sweep 0 fiyatla ingest etmez (fail-closed).
+                if price.is_zero() {
+                    crate::state::persist_event(
+                        app,
+                        &rt.bot_id,
+                        "CRITICAL",
+                        "ORDER",
+                        &format!("LIVE kalan dolum takibi REFERANS FİYATSIZ kitaba yazıldı ({id}, kalan {qty}) — sweep fallback fiyat bulmadan ingest etmez"),
+                    )
+                    .await;
+                }
                 // Faz 4.5: resting partial — deftere (+) (kilit-dışı düzeltme: eski kod
                 // market place'te bump(+) yapmıyordu; poll-refresh zaten düzeltiyordu).
                 {
@@ -1047,6 +1065,22 @@ pub async fn dispatch_action(
     ts: i64,
     sse: &broadcast::Sender<SseEvent>,
 ) -> Result<(), String> {
+    // Faz 21 (N-2, KRİTİK): positionIdx emrin GİTTİĞİ bacağın yönünden
+    // türetilir. Hedge bacağı (id "-hedge" önekli) ana bacağın TERSİdir;
+    // eski kod her iki bacak için de ana bacağın yönünü kullanıyordu —
+    // hedge'in Sell emirleri ana bacağın idx'iyle gidiyor, Bybit hedge-mode'da
+    // yanlış pozisyona yazılıyor ya da reddediliyordu (para kaybı sınıfı).
+    let leg_direction = |rt: &BotRuntime, id: &str| -> i8 {
+        let is_hedge = id.starts_with(&format!("{}-hedge", rt.bot_id));
+        if is_hedge {
+            rt.hedge_stepper
+                .as_ref()
+                .map(|h| h.position.direction)
+                .unwrap_or(1)
+        } else {
+            rt.stepper.position.direction
+        }
+    };
     match action {
         Action::PlaceLimit { id, side, price, qty, role } => {
             // Faz 19 (P1-4): TP de resting reduce-only limit — GRID_CLOSE ile
@@ -1103,10 +1137,10 @@ pub async fn dispatch_action(
                         order_link_id: id.clone(),
                         // Faz 5 (C-5): hedge modda yön eşlemesi (Buy→1/Sell→2)
                         position_idx: if rt.cfg.kind.is_futures() && rt.pos_mode_hedge {
-                            // P0-1: bacak POZİSYON yönüne göre eşlenir — reduce
-                            // kapanış emirleri de ait olduğu bacağın idx'ini kullanır
-                            // (long bacağı Sell kapanışı = idx 1, yanlışlıkla 2 değil).
-                            if rt.stepper.position.direction == 1 { 1 } else { 2 }
+                            // P0-1 + Faz 21 (N-2): idx, emrin gittiği BACAĞIN
+                            // pozisyon yönünden gelir — hedge bacağı emirleri
+                            // ana bacağın idx'ini ASLA almaz.
+                            if leg_direction(rt, &id) == 1 { 1 } else { 2 }
                         } else { 0 },
                     };
                     rt.pending_live_intents.push(crate::state::LiveIntent::Place {
@@ -1175,10 +1209,9 @@ pub async fn dispatch_action(
                         order_link_id: id.clone(),
                         // Faz 5 (C-5): hedge modda yön eşlemesi (Buy→1/Sell→2)
                         position_idx: if rt.cfg.kind.is_futures() && rt.pos_mode_hedge {
-                            // P0-1: bacak POZİSYON yönüne göre eşlenir — reduce
-                            // kapanış emirleri de ait olduğu bacağın idx'ini kullanır
-                            // (long bacağı Sell kapanışı = idx 1, yanlışlıkla 2 değil).
-                            if rt.stepper.position.direction == 1 { 1 } else { 2 }
+                            // P0-1 + Faz 21 (N-2): idx, emrin gittiği BACAĞIN
+                            // pozisyon yönünden gelir.
+                            if leg_direction(rt, &id) == 1 { 1 } else { 2 }
                         } else { 0 },
                     };
                     let is_close_m = kind_m == OrderKind::Reduce;
@@ -1419,26 +1452,9 @@ pub async fn poll_and_advance(
     }
     app.tick_trace.lock().await.insert(bot_id.to_string(), trace.clone());
     // TICK kökü: izin ilk satırı (traces listesi buradan özetlenir).
-    let root = {
-        let rts = app.runtimes.lock().await;
-        rts.get(bot_id)
-            // Faz 3: PAUSED/STOPPED bot sweep amaçlı poll edilir — TICK spam'i
-            // events tablosunu şişirmesin; yalnız gerçek çalışma halleri iz bırakır.
-            .filter(|rt| !matches!(rt.status.as_str(), "PAUSED" | "STOPPED"))
-            .map(|rt| {
-            let kind = serde_json::to_string(&rt.cfg.kind).unwrap_or_default();
-            format!(
-                "TICK symbol={} kind={} venue={} mode={}",
-                rt.cfg.symbol,
-                kind.trim_matches('"'),
-                rt.venue,
-                rt.mode
-            )
-        })
-    };
-    if let Some(msg) = root {
-        crate::state::persist_event(app, bot_id, "INFO", "TICK", &msg).await;
-    }
+    // Faz 21 (P2-9): TICK olayı events tablosuna ARTIK YAZILMAZ — her poll'da
+    // bot başına bir satır üretip tabloyu şişiriyordu (12 bot × poll ≈ günde
+    // milyonlarca satır); iz zaten tick_trace ring'inde görünüyor.
     let out = poll_inner(app, bot_id, sse).await;
     app.tick_trace.lock().await.remove(bot_id);
     out
@@ -1729,6 +1745,18 @@ async fn poll_inner(
         }
     }
     let mut processed = 0;
+    // Faz 21 (UIX-5 + N-6): REST handler kaynaklı motor eylemleri (grid
+    // CLOSE_ALL → halt_mesh + market kapanış) bar beklemeden, HER poll'da ve
+    // FROZEN/PAUSED/STOPPED'ta bile akıtılır — bunlar risk-AZALTAN eylemlerdir
+    // (iptal + kapanış); strateji kilidi onları tutmaz. ts = son kapanmış bar
+    // (Gate 4 no-look-ahead uyumu; piyasa emri sonraki bar açılışında dolar).
+    if !rt.pending_engine_actions.is_empty() {
+        let ts_act = rt.last_bar_ts.max(1);
+        let pending_acts = std::mem::take(&mut rt.pending_engine_actions);
+        for a in pending_acts {
+            dispatch_action(app, rt, a, ts_act, sse).await?;
+        }
+    }
     // P2-2 Freeze (+ Faz 0.2/0.3 global şalter) ve Faz 3 (H-10 kalıntısı):
     // strateji kararı işlemez (yeni safety/TP/deal yok, webhook force-start
     // yok) — ama imleç ilerler ve aşağıdaki LIVE fill sweep borsada gerçekleşen
@@ -1936,7 +1964,24 @@ async fn live_fill_sweep(
                     }
                     n += 1;
                 }
-                _ => {}
+                Ok(None) => {
+                    // Çift/kırpılmış ingest — idempotent tekrar, sessiz geçmesi
+                    // DOĞRU davranış (fill zaten defterde).
+                }
+                Err(e) => {
+                    // Faz 21 (N-3): sweep tarafında da yutulan dolum yok —
+                    // CRITICAL olay + emir kitapta KALIR; bir sonraki sweep
+                    // aynı execId anahtarıyla yeniden dener (kitap = kuyruk).
+                    let msg = format!(
+                        "LIVE dolum sweep'i işlenemedi ({} / {}): {e} — emir kitapta tutuldu, sweep yeniden deneyecek",
+                        order.id, ex.order_link_id
+                    );
+                    crate::state::persist_event(app, &rt.bot_id, "CRITICAL", "FILL_INGEST", &msg).await;
+                    let _ = sse.send(SseEvent {
+                        event: "RISK".into(),
+                        data: json!({"botId": rt.bot_id, "code": "FILL_INGEST_FAILED", "message": msg, "ts": crate::state::now_ms()}).to_string(),
+                    });
+                }
             }
         }
         // (2) Terminal-durum tespiti: realtime + order-history.
@@ -1944,40 +1989,78 @@ async fn live_fill_sweep(
             Ok(Some(st)) => {
                 let terminal = matches!(st.status.as_str(), "Filled" | "Cancelled" | "Rejected" | "Deactivated");
                 if terminal {
-                    // Fallback: execution API'si boş döndü ama venueFilled + gerçek miktar
-                    // varsa VE bu emir için hiç fill işlenmediyse TEK toplan fill.
+                    // Faz 21 (N-3): fallback koşulu "hiç fill yok" DEĞİL —
+                    // "KALAN miktar var mı". %40'ı daha önce işlendiyse yalnız
+                    // kalan (cum_exec − işlenen) toplanır; executions API'si
+                    // boş dönerse kalan artık kaybolmaz.
+                    let mut terminal_settled = true;
                     if st.status == "Filled" && !st.cum_exec_qty.is_zero() {
-                        let already = fill_any_for_order(app, &rt.bot_id, &order.id).await.unwrap_or(false);
-                        if !already {
+                        let ingested = filled_qty_for_order(app, &rt.bot_id, &order.id).await.unwrap_or_else(|_| Fraction::zero());
+                        let remaining = st.cum_exec_qty.sub(&ingested).unwrap_or_else(|_| Fraction::zero());
+                        if !remaining.is_zero() && !remaining.is_negative() {
                             let ts = crate::state::now_ms();
                             let px = st.price.clone().unwrap_or_else(|| order.price.clone());
-                            let fee_role = if st.status == "Filled" { dca_kernel::FeeRole::Taker } else { dca_kernel::FeeRole::Maker };
-                            let hedge_prefix_fb = format!("{}-hedge", rt.bot_id);
-                            let fb_target = if order.id.starts_with(&hedge_prefix_fb) {
-                                rt.hedge_stepper.as_mut()
-                            } else {
-                                Some(&mut rt.stepper)
-                            };
-                            if let Ok(Some(f)) = fb_target
-                                .ok_or("hedge stepper yok")?
-                                .ingest_external_fill_with_fee(&order.id, &order.role, order.side, order.kind.clone(), &st.cum_exec_qty, &px, fee_role, FillRealism::MarketableTaker, ts, st.cum_exec_fee.as_ref())
-                            {
-                                let acts = rt.engine_kind.on_fill(&f);
-                                persist_fill(app, &rt.bot_id, &f).await?;
+                            // Faz 21 (N-4): 0 fiyatlı ingest m04 DOMAIN hatası
+                            // üretir ve dolum yutulur — fiyat yoksa ingest
+                            // ETME, CRITICAL yaz, takibi AÇ (fail-closed).
+                            if px.is_zero() || px.is_negative() {
+                                terminal_settled = false;
+                                let msg = format!(
+                                    "LIVE fallback dolum için fiyat yok ({}) — kalan {} işlenemedi, emir kitapta tutuldu (fail-closed)",
+                                    order.id,
+                                    remaining.to_half_even_display(8)
+                                );
+                                crate::state::persist_event(app, &rt.bot_id, "CRITICAL", "FILL_INGEST", &msg).await;
                                 let _ = sse.send(SseEvent {
-                                    event: "FILL".into(),
-                                    data: json!({
-                                        "botId": rt.bot_id, "fillKey": f.fill_key, "orderId": f.order_id,
-                                        "role": f.role, "side": format!("{:?}", f.side), "kind": format!("{:?}", f.kind),
-                                        "price": f.price.to_string(), "qty": f.qty.to_string(), "fee": f.fee.to_string(),
-                                        "feeRole": format!("{}", f.fee_role), "fillModel": format!("{:?}", f.realism), "ts": f.ts,
-                                    })
-                                    .to_string(),
+                                    event: "RISK".into(),
+                                    data: json!({"botId": rt.bot_id, "code": "FILL_INGEST_FAILED", "message": msg, "ts": ts}).to_string(),
                                 });
-                                for a in acts {
-                                    Box::pin(dispatch_action(app, rt, a, ts, sse)).await?;
+                            } else {
+                                let fee_role = if st.status == "Filled" { dca_kernel::FeeRole::Taker } else { dca_kernel::FeeRole::Maker };
+                                let hedge_prefix_fb = format!("{}-hedge", rt.bot_id);
+                                let fb_target = if order.id.starts_with(&hedge_prefix_fb) {
+                                    rt.hedge_stepper.as_mut()
+                                } else {
+                                    Some(&mut rt.stepper)
+                                };
+                                let fb_ingest = fb_target
+                                    .ok_or("hedge stepper yok")?
+                                    .ingest_external_fill_with_fee(&order.id, &order.role, order.side, order.kind.clone(), &remaining, &px, fee_role, FillRealism::MarketableTaker, ts, st.cum_exec_fee.as_ref());
+                                match fb_ingest {
+                                    Ok(Some(f)) => {
+                                        let acts = rt.engine_kind.on_fill(&f);
+                                        persist_fill(app, &rt.bot_id, &f).await?;
+                                        let _ = sse.send(SseEvent {
+                                            event: "FILL".into(),
+                                            data: json!({
+                                                "botId": rt.bot_id, "fillKey": f.fill_key, "orderId": f.order_id,
+                                                "role": f.role, "side": format!("{:?}", f.side), "kind": format!("{:?}", f.kind),
+                                                "price": f.price.to_string(), "qty": f.qty.to_string(), "fee": f.fee.to_string(),
+                                                "feeRole": format!("{}", f.fee_role), "fillModel": format!("{:?}", f.realism), "ts": f.ts,
+                                            })
+                                            .to_string(),
+                                        });
+                                        for a in acts {
+                                            Box::pin(dispatch_action(app, rt, a, ts, sse)).await?;
+                                        }
+                                        n += 1;
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        // Faz 21 (N-3): sessiz yutma yok — CRITICAL
+                                        // + takip AÇIK kalır (sonraki sweep yeniden dener).
+                                        terminal_settled = false;
+                                        let msg = format!(
+                                            "LIVE fallback dolum işlenemedi ({}): {e} — emir kitapta tutuldu",
+                                            order.id
+                                        );
+                                        crate::state::persist_event(app, &rt.bot_id, "CRITICAL", "FILL_INGEST", &msg).await;
+                                        let _ = sse.send(SseEvent {
+                                            event: "RISK".into(),
+                                            data: json!({"botId": rt.bot_id, "code": "FILL_INGEST_FAILED", "message": msg, "ts": ts}).to_string(),
+                                        });
+                                    }
                                 }
-                                n += 1;
                             }
                         }
                     }
@@ -1985,16 +2068,20 @@ async fn live_fill_sweep(
                         crate::state::persist_event(app, &rt.bot_id, "INFO", "LIVE_SYNC", &format!("LIVE emir terminal duruma düştü (fill ÜRETİLMEDİ): {} → {}", order.id, st.status)).await;
                     }
                     // Faz 4.5 (C-6): terminal emrin açık-emir yükü defterden düşer.
-                    {
-                        let n = order.qty.mul(&order.price).unwrap_or_else(|_| Fraction::zero());
-                        let cost = if order.kind == OrderKind::Add && !rt.stepper.cfg.is_spot {
-                            let lev = if rt.stepper.cfg.leverage.is_zero() { Fraction::one() } else { rt.stepper.cfg.leverage.clone() };
-                            n.div(&lev).unwrap_or(n)
-                        } else { n };
-                        crate::state::bump_venue_live_load(app, &rt.venue, &cost, false).await;
+                    // Faz 21 (N-3): ingest başarısızsa takip AÇILMAZ — kalan
+                    // sonraki sweep'te yeniden denenir.
+                    if terminal_settled {
+                        {
+                            let n = order.qty.mul(&order.price).unwrap_or_else(|_| Fraction::zero());
+                            let cost = if order.kind == OrderKind::Add && !rt.stepper.cfg.is_spot {
+                                let lev = if rt.stepper.cfg.leverage.is_zero() { Fraction::one() } else { rt.stepper.cfg.leverage.clone() };
+                                n.div(&lev).unwrap_or(n)
+                            } else { n };
+                            crate::state::bump_venue_live_load(app, &rt.venue, &cost, false).await;
+                        }
+                        rt.live_open_orders.retain(|o| o.id != order.id);
+                        crate::state::remove_live_order(app, &rt.bot_id, &order.id);
                     }
-                    rt.live_open_orders.retain(|o| o.id != order.id);
-                    crate::state::remove_live_order(app, &rt.bot_id, &order.id);
                 }
                 // Açık/Partial: tracking kalır — executions artımlı işlenmeye devam eder.
             }
@@ -2022,12 +2109,26 @@ async fn live_fill_sweep(
 
 /// Faz 3 (C-3): bu emir için daha önce HERHANGİ bir fill işlendi mi?
 /// (fallback toplan fill'in çift muhasebesini engeller)
-async fn fill_any_for_order(app: &AppState, bot_id: &str, order_id: &str) -> Result<bool, String> {
+async fn filled_qty_for_order(app: &AppState, bot_id: &str, order_id: &str) -> Result<Fraction, String> {
     let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
-    let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM fills WHERE bot_id=?1 AND order_id=?2", rusqlite::params![bot_id, order_id], |r| r.get(0))
-        .unwrap_or(0);
-    Ok(n > 0)
+    let rows: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT qty FROM fills WHERE bot_id=?1 AND order_id=?2")
+            .map_err(|e| e.to_string())?;
+        let list = stmt
+            .query_map(rusqlite::params![bot_id, order_id], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        list
+    };
+    let mut sum = Fraction::zero();
+    for q in rows {
+        if let Ok(v) = Fraction::from_any_str(&q) {
+            sum = sum.add(&v).unwrap_or_else(|_| sum.clone());
+        }
+    }
+    Ok(sum)
 }
 
 /// Parse interval string ("1m", "1h"...) to the Bybit interval token.

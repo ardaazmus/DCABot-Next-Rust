@@ -231,6 +231,10 @@ impl BotRuntime {
             "venue": self.venue,
             "mode": self.mode,
             "status": self.status,
+            // Faz 21 (N-8): kernel halt durumu arayüze görünür — Studio/Fleet
+            // kırmızı rozet + "KERNEL'İ SIFIRLA" düğmesi bununla çalışır.
+            "kernelHalted": self.stepper.halted.is_some(),
+            "kernelHaltedReason": self.stepper.halted.clone(),
             "symbol": self.cfg.symbol,
             "interval": self.interval_str,
             "stats": snap,
@@ -831,27 +835,72 @@ pub async fn create_runtime(
                 }
                 rt.stepper.prev_bar_ts = snap.kernel_prev_bar_ts.or(Some(snap.last_bar_ts));
                 rt.stepper.pending = snap.pending.clone();
-                // Faz 18 (P0-3 kalanı): restore TUTARLILIK KAPISI — kernel
-                // pozisyonu ile engine mirror'ı uyuşmuyorsa sessiz devam ETME:
-                // kernel fail-closed HALT ile durdurulur (step() Err döner, UI
-                // 'halted' gösterir), CRITICAL olay kullanıcıya yazılır. Kararı
-                // (uzlaştırma/RESET) bot sahibi verir.
-                if let EngineTag::Dca(e) = &rt.engine_kind {
-                    let engine_qty = e.mirror.qty.clone();
-                    let kernel_qty = rt.stepper.position.qty.clone();
-                    if dca_math::Fraction::cmp(&engine_qty, &kernel_qty) != std::cmp::Ordering::Equal {
-                        let reason = format!(
-                            "HALTED_RESTORE: kernel pozisyonu ({}) ile engine mirror ({}) uyuşmuyor — manuel uzlaştırma gerekli (kernel RESET action ile açılır)",
-                            kernel_qty.to_half_even_display(8),
-                            engine_qty.to_half_even_display(8)
-                        );
-                        rt.stepper.halted = Some(reason.clone());
-                        persist_event(app, id, "CRITICAL", "RESTORE", &reason).await;
+                // Faz 18 (P0-3 kalanı) + Faz 21 (N-9): restore TUTARLILIK KAPISI —
+                // kernel pozisyonu ile engine mirror (adet, YÖN, ortalama fiyat)
+                // üçlüsü uyuşmuyorsa sessiz devam ETME: kernel fail-closed HALT
+                // ile durdurulur, CRITICAL olay yazılır. Eski kapı yalnız adet
+                // bakıyordu — ters yönlü ama aynı adetli restore (short yerine
+                // long) kapıdan sessiz geçip TP/SL'i ters çalıştırıyordu.
+                // Hedge bacağı için de AYRI kapı uygulanır.
+                let tick = rt.stepper.instrument.tick_size.clone();
+                let mut restore_mismatch: Option<String> = None;
+                {
+                    let kernel_main = rt.stepper.position.clone();
+                    let engine_main = match &rt.engine_kind {
+                        EngineTag::Dca(e) => Some(e.mirror.clone()),
+                        EngineTag::Hedge(h) => Some(h.main.mirror.clone()),
+                        EngineTag::Grid(_) => None,
+                    };
+                    if let Some(em) = engine_main {
+                        if let Some(detail) = position_leg_mismatch(&kernel_main, &em, &tick, "ana") {
+                            restore_mismatch = Some(detail);
+                        }
                     }
+                    // Hedge bacağı: kernel hedge_stepper ↔ engine hedge leg mirror.
+                    if let (Some(hs), EngineTag::Hedge(h)) = (rt.hedge_stepper.as_ref(), &rt.engine_kind) {
+                        match &h.hedge {
+                            Some(leg) => {
+                                if let Some(detail) = position_leg_mismatch(&hs.position, &leg.mirror, &tick, "hedge") {
+                                    let combined = match restore_mismatch {
+                                        Some(prev) => format!("{prev}; {detail}"),
+                                        None => detail,
+                                    };
+                                    restore_mismatch = Some(combined);
+                                }
+                            }
+                            None => {
+                                if !hs.position.qty.is_zero() {
+                                    let detail = format!(
+                                        "HALTED_RESTORE: kernel hedge bacağında pozisyon var ({}) ama engine'de hedge bacağı yok — uzlaştırma gerekli",
+                                        hs.position.qty.to_half_even_display(8)
+                                    );
+                                    restore_mismatch = Some(match restore_mismatch {
+                                        Some(prev) => format!("{prev}; {detail}"),
+                                        None => detail,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(reason) = restore_mismatch {
+                    rt.stepper.halted = Some(reason.clone());
+                    persist_event(app, id, "CRITICAL", "RESTORE", &reason).await;
                 }
             }
             Err(e) => {
-                let _ = persist_event(app, id, "WARN", "RESTORE", &format!("runtime snapshot cozulemedi ({e}) — bot taze durumla baslatildi")).await;
+                // Faz 21 (N-1): çözülemeyen snapshot artık SESSİZ taze başlangıç
+                // değil — CRITICAL olay + bot PAUSED açılır (fail-closed).
+                // Kullanıcı durumu görür ve START ile bilinçli devam eder.
+                rt.status = "PAUSED".into();
+                let _ = persist_event(
+                    app,
+                    id,
+                    "CRITICAL",
+                    "RESTORE",
+                    &format!("runtime snapshot cozulemedi ({e}) — bot PAUSED acildi; taze baslatmak icin START, kalici durumu geri yuklemek icin snapshot'i kontrol edin"),
+                )
+                .await;
             }
         }
     }
@@ -864,6 +913,51 @@ pub async fn create_runtime(
 
 fn dca_exchange_gate_mode() -> dca_risk::CapitalShortfallMode {
     dca_risk::CapitalShortfallMode::Wait
+}
+
+/// Faz 21 (N-9): restore bacak tutarlılığı — (adet, yön, ortalama fiyat)
+/// üçlüsü. Ortalama fiyat için tolerans 1 tick (persist string yuvarlaması).
+/// Uyuşmazlıkta insan-okur gerekçe döner; uyumda None.
+fn position_leg_mismatch(
+    kernel: &dca_math::m04::PositionState,
+    engine: &dca_math::m04::PositionState,
+    tick: &Fraction,
+    leg: &str,
+) -> Option<String> {
+    let fmt = |v: &Fraction| v.to_half_even_display(8);
+    if Fraction::cmp(&kernel.qty, &engine.qty) != std::cmp::Ordering::Equal {
+        return Some(format!(
+            "HALTED_RESTORE: {leg} bacak ADÇ kernel={} ↔ engine={} — manuel uzlaştırma gerekli (kernel RESET action ile açılır)",
+            fmt(&kernel.qty),
+            fmt(&engine.qty)
+        ));
+    }
+    if kernel.direction != engine.direction {
+        return Some(format!(
+            "HALTED_RESTORE: {leg} bacak YÖN kernel={} ↔ engine={} — manuel uzlaştırma gerekli",
+            kernel.direction,
+            engine.direction
+        ));
+    }
+    let tick_up = tick.clone();
+    let tick_dn = tick.neg().unwrap_or_else(|_| tick.clone());
+    let avg_ok = match (&kernel.avg_price, &engine.avg_price) {
+        (None, None) => true,
+        (Some(k), Some(e)) => {
+            let d = k.sub(e).unwrap_or_else(|_| Fraction::zero());
+            Fraction::cmp(&d, &tick_up) != std::cmp::Ordering::Greater
+                && Fraction::cmp(&d, &tick_dn) != std::cmp::Ordering::Less
+        }
+        _ => false,
+    };
+    if !avg_ok {
+        return Some(format!(
+            "HALTED_RESTORE: {leg} bacak ORTALAMA kernel={} ↔ engine={} (±1 tick tolerans) — manuel uzlaştırma gerekli",
+            kernel.avg_price.as_ref().map(|v| fmt(v)).unwrap_or_else(|| "yok".into()),
+            engine.avg_price.as_ref().map(|v| fmt(v)).unwrap_or_else(|| "yok".into())
+        ));
+    }
+    None
 }
 
 /// Faz 4 (H-6): botun VENUE'undan enstrüman çözümü — OKX/BINANCE botu artık

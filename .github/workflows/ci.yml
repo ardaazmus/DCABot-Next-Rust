@@ -1,0 +1,44 @@
+# Faz 21 (P2-14): CI — "düzeltildi" ifadeleri beyan değil, kanıt olsun.
+# Dış doğrulama raporu (DENETIM_RAPORU_FAZ20_DOGRULAMA.md §8) bu bosun
+# ortamda derleme/test yapılamadığı için iddiaları "doğrulanamadı"
+# etiketlemişti; bu iş her push'ta kapıları gerçekten çalıştırır.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  engine:
+    name: Engine (cargo)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mini-services/dca-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mini-services/dca-core
+      - name: cargo test (workspace)
+        run: cargo test --workspace --locked
+      - name: cargo clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+  ui:
+    name: UI (tsc + eslint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: tsc --noEmit
+        run: npx tsc --noEmit --incremental false
+      - name: eslint
+        run: npx eslint src --quiet

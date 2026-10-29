@@ -68,12 +68,19 @@ pub struct DcaEngine {
     pub funding: Fraction,
     /// Faz 17 (P1-5): DEAL-bazlı funding — TP hesabı bunu kullanır; `funding`
     /// bot ömrü kümülatifi olarak raporlamada kalır. Deal açılışında sıfırlanır.
+    /// Faz 21 (N-1): eski snapshot'larla uyum için serde(default) — eksik alan
+    /// tüm RuntimeSnapshot parse'ını düşürüp botu sessiz taze başlatıyordu.
+    #[serde(default)]
     pub funding_deal: Fraction,
     /// Faz 17 (P1-16): yerleştirme imleci — `filled_safety` yalnız dolum sayacı;
     /// top-up artık `ladder[next_level_to_place]`'dan devam eder (çift yerleştirme yok).
+    /// Faz 21 (N-1): serde(default) — eski snapshot uyumu.
+    #[serde(default)]
     pub next_level_to_place: usize,
     /// Faz 17 (P0-6): Closing fazında beklenen bar sayısı — 3 barı aşarsa
     /// kapanış emri yeniden gönderilir (pozisyon korumasız kalmaz).
+    /// Faz 21 (N-1): serde(default) — eski snapshot uyumu.
+    #[serde(default)]
     pub closing_bars_waited: usize,
     pub cooldown_remaining: usize,
     pub close_orders_out: usize,
@@ -799,6 +806,29 @@ impl DcaEngine {
                 }
             }
             DcaPhase::Closing => {
+                // Faz 21 (N-6): "Tümünü Kapat" Closing fazında da YENIDEN GÖNDERIM
+                // tetikler — eski kod bayrağı yalnız Open'da okuduğundan, tam da
+                // "Closing'de takıldı" senaryosunda buton hiçbir şey yapmıyordu
+                // (Studio ipucu bunu vaat ediyordu).
+                if self.manual_close_requested && !self.mirror.qty.is_zero() {
+                    if let Some(rt) = self.resting_tp.take() {
+                        acts.push(Action::CancelResting { id: rt.order_id });
+                    }
+                    acts.push(Action::PlaceMarket {
+                        id: order_id(&self.next_seq_id(), "MANUAL", 0),
+                        side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
+                        qty: self.mirror.qty.clone(),
+                        role: "MANUAL",
+                    });
+                    self.close_orders_out += 1;
+                    self.closing_bars_waited = 0;
+                    self.manual_close_requested = false;
+                    acts.push(Action::Log {
+                        level: "INFO",
+                        message: "manuel kapanış Closing fazında yeniden gönderildi (N-6)".into(),
+                    });
+                    return acts;
+                }
                 // Faz 17 (P0-6): kapanış emri 3 bar dolmadıysa yeniden gönder —
                 // pozisyon korumasız kalmaz (bakım/reddetme senaryoları).
                 self.closing_bars_waited += 1;

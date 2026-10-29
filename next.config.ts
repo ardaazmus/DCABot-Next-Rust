@@ -12,6 +12,12 @@ const nextConfig: NextConfig = {
   },
   reactStrictMode: false,
   async rewrites() {
+    // Faz 21 (P0-9): /api/engine/* istemci çağrıları MIDDLEWARE'de yakalanıp
+    // Bearer'la motora taşınır (rewrites middleware'i geçer; route-handler
+    // yaklaşımı afterFiles rewrite dinamik route'lardan önce çalıştığı için
+    // işlemedi). Bu rewrite kalan /api/* yollarını taşır — tarayıcıdan gelen
+    // bu istekler anahtarsızdır, motor 401 verir; anahtar tarayıcıya asla
+    // girmez.
     return [
       {
         source: "/api/:path*",

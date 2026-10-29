@@ -404,6 +404,16 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
                     </div>
                   </div>
                   <StatusPill status={b.status} />
+                  {/* Faz 21 (N-8): kernel halt filoda GÖRÜNÜR — sessiz duran
+                      bot artık kırmızı rozetle işaretlenir. */}
+                  {b.kernelHalted && (
+                    <span
+                      className="rounded border border-rose-500/60 bg-rose-500/10 px-2 py-0.5 text-[10px] font-bold tracking-wider text-rose-400"
+                      title={b.kernelHaltedReason || "Kernel kalıcı halt — RESET_KERNEL ile açılır"}
+                    >
+                      KERNEL HALT
+                    </span>
+                  )}
                 </div>
 
                 <EntryTriggerNote bot={b} />

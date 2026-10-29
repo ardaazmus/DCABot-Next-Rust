@@ -61,7 +61,7 @@ const StudioBacktestRunner = dynamic(
   () => import("@/components/terminal/backtest-panel").then((m) => m.StudioBacktestRunner),
   { ssr: false, loading: () => <div className="p-6 text-xs text-slate-500">Backtest modülü yükleniyor…</div> },
 );
-import { apiAiProviders, apiBotGrid, apiBotMemoryGenerate, apiBotMemoryList, apiBotTick, apiCalcDca, apiDryRun, apiMarkets, apiParity, apiPatchBot, apiReconcile, getBotMeta, useBotDetail, useBotEvents, useFills } from "@/hooks/use-engine";
+import { apiAiProviders, apiBotAction, apiBotGrid, apiBotMemoryGenerate, apiBotMemoryList, apiBotTick, apiCalcDca, apiDryRun, apiMarkets, apiParity, apiPatchBot, apiReconcile, getBotMeta, useBotDetail, useBotEvents, useFills } from "@/hooks/use-engine";
 import { ForensicsTraces } from "@/components/terminal/forensics";
 import { fmtFrac, fmtNum, fmtTimeShort, fmtTs, fmtUsd, fmtUsdSigned, fracToNum, truncateMid } from "@/lib/format";
 import { MICRO_FALLBACK, microOf } from "@/lib/bot-defaults";
@@ -422,6 +422,34 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
 
         {/* ---------- Genel ---------- */}
         <TabsContent value="genel" className="mt-4 space-y-4">
+          {/* Faz 21 (N-8): kernel sticky-halt artık GÖRÜNÜR — kırmızı şerit +
+              açma düğmesi. Eski davranışta bot "görünmez şekilde duruyor",
+              faz rozeti Open kalıyor, hiçbir emir gitmiyordu. */}
+          {bot.kernelHalted && (
+            <div className="rounded-lg border border-rose-500/50 bg-rose-500/10 p-3" role="alert">
+              <div className="flex items-center gap-2 text-xs font-bold text-rose-300">
+                <TriangleAlert className="h-4 w-4" aria-hidden />
+                KERNEL DURDURULDU (GERÇEK VERİ BOZULMASI)
+              </div>
+              <p className="mt-1.5 text-[11px] leading-snug text-rose-200/80">
+                {bot.kernelHaltedReason || "Kernel kalıcı halt durumunda — hiçbir emir gönderilmiyor."} Reset
+                sonrası bot bir sonraki kapalı bardan warmup ile devam eder; gerekirse pozisyonu Filo&apos;dan
+                manuel kapatabilirsiniz.
+              </p>
+              <Button
+                size="sm"
+                variant="outline"
+                className="mt-2 min-h-9 border-rose-500/60 text-xs text-rose-300 hover:bg-rose-500/10"
+                onClick={() => {
+                  void apiBotAction(bot.id, "RESET_KERNEL")
+                    .then(() => toast({ title: "Kernel sıfırlandı", description: "Bir sonraki kapalı bardan devam eder." }))
+                    .catch((e) => toast({ title: "Sıfırlama başarısız", description: String(e) }));
+                }}
+              >
+                KERNEL&apos;İ SIFIRLA
+              </Button>
+            </div>
+          )}
           {riskWarnings.length > 0 && (
             <div className="rounded-lg border border-amber-500/50 bg-amber-500/5 p-3" role="status">
               <div className="flex items-center gap-2 text-xs font-bold text-amber-300">

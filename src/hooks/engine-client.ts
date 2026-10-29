@@ -20,33 +20,31 @@ export class EngineError extends Error {
   }
 }
 
+/**
+ * SSE özel durumu: EventSource özel başlık koyamaz → /api/stream route
+ * handler'ı sunucu tarafında Bearer'ı ekler (istekten gelen hiçbir veri
+ * hedef URL'ye girmez).
+ */
 export function engineUrl(path: string): string {
-  const sep = path.includes("?") ? "&" : "?";
-  return `${path}${sep}XTransformPort=${ENGINE_PORT}`;
+  void path;
+  return "/api/stream";
 }
 
 /**
- * C-1: motor SEC-01'den beri tüm yönetim uçlarında Bearer zorunlu tutuyor.
- * Anahtar build/dev-time env'den gelir (start-local.ps1 üretir, tarayıcıya
- * NEXT_PUBLIC_ önekiyle gömülür — yalnız localhost geliştirme kapsamında).
- * SSE özel durumu: EventSource özel başlık koyamaz → /api/stream route
- * handler'ı sunucu tarafında aynı başlığı ekler.
+ * Faz 21 (P0-9): motor anahtarı TARAYICIYA GİRMEZ. Tüm çağrılar aynı origin
+ * altındaki sunucu proxy'sinden (/api/engine/*) geçer; Bearer yalnız
+ * sunucuda env'den eklenir. Eski `NEXT_PUBLIC_ENGINE_API_KEY` gömülüsü
+ * kaldırıldı — dışa açılan her ziyaretçi motoru tam yetkiyle kullanamalı.
  */
-const ENGINE_API_KEY = process.env.NEXT_PUBLIC_ENGINE_API_KEY || "";
-
-export function engineAuthHeaders(): Record<string, string> {
-  return ENGINE_API_KEY ? { Authorization: `Bearer ${ENGINE_API_KEY}` } : {};
-}
-
 export async function engineFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const clean = path.startsWith("/") ? path : `/${path}`;
   let res: Response;
   try {
-    res = await fetch(engineUrl(path), {
+    res = await fetch(`/api/engine${clean}`, {
       cache: "no-store",
       ...init,
       headers: {
         "Content-Type": "application/json",
-        ...engineAuthHeaders(),
         ...(init?.headers ?? {}),
       },
     });
