@@ -63,6 +63,10 @@ export async function engineFetch<T>(path: string, init?: RequestInit): Promise<
       body && typeof body === "object" && "error" in body
         ? String((body as { error: unknown }).error)
         : `HTTP ${res.status}`;
+    // SEC-01: 401 yanıtı — anahtar eksik/yanlış; kullanıcıya net bildirim.
+    if (res.status === 401) {
+      throw new EngineError("Kimlik doğrulama gerekli — DCA_API_KEY ayarlanmış mı? (401)", 401, body);
+    }
     throw new EngineError(msg, res.status, body);
   }
   return body as T;

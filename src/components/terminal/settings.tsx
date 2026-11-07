@@ -17,6 +17,7 @@ import {
   Loader2,
   ShieldAlert,
   ShieldCheck,
+  Sparkles,
   Trash2,
   Webhook,
   Wrench,
@@ -44,11 +45,11 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { EmptyState, Panel, Spinner, VenueChip } from "@/components/terminal/bits";
-import { apiAddVaultKey, apiBlacklist, apiBlacklistAdd, apiBlacklistRemove, apiDeleteVaultKey, apiMaintenance, apiMaintenanceSet, apiSelfCheck, apiVaultKeys, useBnb, useEngineHealth } from "@/hooks/use-engine";
+import { apiAddVaultKey, apiAiProviders, apiBlacklist, apiBlacklistAdd, apiBlacklistRemove, apiDeleteVaultKey, apiMaintenance, apiMaintenanceSet, apiSelfCheck, apiVaultKeys, useAiConfig, useBnb, useEngineHealth } from "@/hooks/use-engine";
 import { toast } from "@/hooks/use-toast";
 import { fmtTs } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import type { BlacklistRow, BnbStatus, FaqEntry, GlossaryEntry, MaintenanceStatus, SelfCheckResult, VaultKey } from "@/lib/engine-types";
+import type { AiProvider, BlacklistRow, BnbStatus, FaqEntry, GlossaryEntry, MaintenanceStatus, SelfCheckResult, VaultKey } from "@/lib/engine-types";
 import glossaryJson from "@/data/glossary.json";
 import faqJson from "@/data/faq.json";
 
@@ -97,9 +98,31 @@ export function SettingsView() {
       setScBusy(false);
     }
   };
+  /* Faz 25 (UIX-23): ortak YZ sağlayıcı config — tek sahibi bu panel.
+     provider/model/baseUrl localStorage'da; anahtar sessionStorage'da. */
+  const ai = useAiConfig();
+  const [aiProviders, setAiProviders] = useState<AiProvider[]>([]);
+  useEffect(() => {
+    let alive = true;
+    apiAiProviders()
+      .then((r) => {
+        if (alive) setAiProviders(r.providers);
+      })
+      .catch(() => {
+        if (alive) setAiProviders([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+  const aiCfgNote = (() => {
+    const info = aiProviders.find((p) => p.id === ai.provider) ?? null;
+    if (!info) return null;
+    if (info.id === "builtin") return info.note || "Yerleşik sağlayıcı bu kurulumda paketlenmemiş — dış sağlayıcı seçin.";
+    return info.note;
+  })();
   /* P3-1 kara liste */
-  const [bl, setBl] = useState<BlacklistRow[]>([]);
-  const [blBusy, setBlBusy] = useState(false);
+  const [bl, setBl] = useState<BlacklistRow[]>([]);  const [blBusy, setBlBusy] = useState(false);
   const [blError, setBlError] = useState<string | null>(null);
   const [blPair, setBlPair] = useState("");
   const [blReason, setBlReason] = useState("");
@@ -436,6 +459,68 @@ export function SettingsView() {
               </div>
             </div>
           </div>
+        </Panel>
+        {/* Faz 25 (UIX-23): YZ sağlayıcı yapılandırması tek yer — Kokpit TR özeti,
+            Studio hafıza özeti ve Lab teşhisi bu ayarları paylaşır. Anahtar
+            yalnız bu sekmede (sessionStorage) yaşar; diske yazılmaz. */}
+        <Panel title="YZ Sağlayıcısı (Özetler & Teşhis)" icon={<Sparkles className="h-4 w-4 text-violet-400" aria-hidden />}>
+          <p className="text-[11px] leading-relaxed text-slate-400">
+            Haber TR özeti, bot hafıza özeti ve YZ teşhisi ortak bu ayarları kullanır. API anahtarı
+            <span className="font-semibold text-slate-300"> yalnız bu tarayıcı sekmesinde</span> tutulur — diske yazılmaz, motora istek gövdesi dışında taşınmaz.
+          </p>
+          <div className="mt-3 grid gap-2 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <Label className="text-xs text-slate-400">Sağlayıcı</Label>
+              <Select value={ai.provider} onValueChange={(v) => { ai.setProvider(v); ai.setModel(""); }}>
+                <SelectTrigger className="min-h-10 border-border-strong bg-surface text-xs text-slate-200" aria-label="YZ sağlayıcısı">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="border-border-strong bg-[#151a24]">
+                  {(aiProviders.length > 0
+                    ? aiProviders
+                    : [{ id: "builtin", label: "Yerleşik (paketlenmedi)", models: [], needsKey: false, note: "" } as AiProvider]
+                  ).map((p) => (
+                    <SelectItem key={p.id} value={p.id} className="text-xs text-slate-200">
+                      {p.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs text-slate-400">Model (boş = sağlayıcı varsayılanı)</Label>
+              <Input
+                value={ai.model}
+                onChange={(e) => ai.setModel(e.target.value)}
+                placeholder="örn. gpt-4o-mini"
+                aria-label="YZ modeli"
+                className="min-h-10 border-border-strong bg-surface text-xs text-slate-100"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs text-slate-400">API anahtarı (yalnız bu sekme)</Label>
+              <Input
+                type="password"
+                value={ai.apiKey}
+                onChange={(e) => ai.setApiKey(e.target.value)}
+                placeholder="sk-…"
+                autoComplete="off"
+                aria-label="YZ API anahtarı"
+                className="min-h-10 border-border-strong bg-surface text-xs text-slate-100"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs text-slate-400">Base URL (Ollama gibi yerel sağlayıcılar için)</Label>
+              <Input
+                value={ai.baseUrl}
+                onChange={(e) => ai.setBaseUrl(e.target.value)}
+                placeholder="http://localhost:11434/v1"
+                aria-label="YZ base URL"
+                className="min-h-10 border-border-strong bg-surface text-xs text-slate-100"
+              />
+            </div>
+          </div>
+          {aiCfgNote && <p className="mt-2 text-[10px] leading-relaxed text-slate-400">{aiCfgNote}</p>}
         </Panel>
         {/* P3-1: Kara Liste — bu sembollere yeni bot kurulamaz */}
         <Panel title="Kara Liste" icon={<Ban className="h-4 w-4 text-slate-500" aria-hidden />}>

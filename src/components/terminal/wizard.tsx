@@ -271,7 +271,7 @@ export function Wizard({ onCreated }: WizardProps) {
       title: "Lab konfigürasyonu yüklendi",
       description: `${c.symbol} · ${c.interval} — sapma, hedef kâr ve kademeler Lab koşusundan dolduruldu.`,
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, []);
 
   /* ---- markets fetch once strategy kind or venue is selected ---- */
@@ -1025,7 +1025,9 @@ export function Wizard({ onCreated }: WizardProps) {
         <nav className="flex flex-wrap items-center gap-1.5" aria-label="Bölüm gezinmesi">
           {STEPS.map((label, i) => {
             const n = i + 1;
-            const ok = secValid[i];
+            /* Faz 25 (UIX-29): erken ✓ düzeltildi — artık yalnız bölüm geçerli
+               VE önceki tüm bölümler geçerliyken görünür. */
+            const ok = secValid[i] && secValid.slice(0, i).every(Boolean);
             return (
               <button
                 key={label}
@@ -2575,7 +2577,9 @@ export function Wizard({ onCreated }: WizardProps) {
                     className="min-h-11 w-full bg-emerald-500 px-6 font-bold text-[#04150e] hover:bg-emerald-400"
                   >
                     {launching ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Rocket className="h-4 w-4" aria-hidden />}
-                    {launching ? "Launch ediliyor…" : "BOTU BAŞLAT"}
+                    {/* Faz 25 (UIX-29): CTA duruma sadık — önceki seçim eksikse
+                        düğme neyi beklediğini söyler. */}
+                    {launching ? "Launch ediliyor…" : !sec1Valid ? "ÖNCE STRATEJİ SEÇ" : !sec2Valid ? "ÖNCE SEMBOL SEÇ" : "BOTU BAŞLAT"}
                   </Button>
                 </span>
               </TooltipTrigger>

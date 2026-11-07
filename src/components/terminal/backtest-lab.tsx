@@ -16,11 +16,11 @@ import {
 } from "@/components/ui/select";
 import { Panel } from "@/components/terminal/bits";
 import { BacktestResultView, defaultDcaConfig } from "@/components/terminal/backtest-panel";
-import { apiAiDiagnose, apiAiProviders, apiBacktest, apiBacktestCert, apiCalibration, apiFuturesState, apiMarkets, apiNews, apiNewsAi, apiOrderbook, apiRegime, useBots } from "@/hooks/use-engine";
+import { apiAiDiagnose, apiBacktest, apiBacktestCert, apiCalibration, apiFuturesState, apiMarkets, apiNews, apiOrderbook, apiRegime, useAiConfig, useBots } from "@/hooks/use-engine";
 import { cn } from "@/lib/utils";
 import { DEFAULT_RISK_POLICY } from "@/lib/engine-types";
 import { saveCarriedConfig } from "@/lib/carry-config";
-import type { AiCallConfig, AiProvider, AiResult, BacktestCertResult, BacktestResult, BotKind, CalibrationResult, FillModel, FuturesStateResult, Instrument, Interval, NewsAiResult, NewsResult, OrderBookResult, RegimeResult, Venue } from "@/lib/engine-types";
+import type { AiResult, BacktestCertResult, BacktestResult, BotKind, CalibrationResult, FillModel, FuturesStateResult, Instrument, Interval, NewsResult, OrderBookResult, RegimeResult, Venue } from "@/lib/engine-types";
 
 const INTERVALS: Interval[] = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"];
 
@@ -153,44 +153,14 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
     return () => { alive = false; };
   }, [kind, symbol, venue]);
 
-  /* P4-1 haberler — sembol değişince tazelenir. */
+  /* P4-1 haberler — sembol değişince tazelenir. Faz 25 (UIX-22): liste
+     Lab'dan ÇIKARILDI (sonuçları ekranın altına itiyordu); delisting uyarısı —
+     işlem güvenliği için tek tutulan bilgi — kalır. */
   const [news, setNews] = useState<NewsResult | null>(null);
-  /* P4-2 haber TR-özetleri — öğe kimliğine göre (sekme içi, kalıcı değil). */
-  const [aiSums, setAiSums] = useState<Record<string, NewsAiResult>>({});
-  const [aiSumBusy, setAiSumBusy] = useState<string | null>(null);
-  /* P4-2 YZ sağlayıcı yapılandırması — sekme içi state; anahtar diske yazılmaz. */
-  const [aiProviders, setAiProviders] = useState<AiProvider[]>([]);
-  const [aiProvider, setAiProvider] = useState("builtin");
-  const [aiModel, setAiModel] = useState("");
-  const [aiKey, setAiKey] = useState("");
-  const [aiBaseUrl, setAiBaseUrl] = useState("");
-  useEffect(() => {
-    let alive = true;
-    apiAiProviders()
-      .then((r) => { if (alive) setAiProviders(r.providers); })
-      .catch(() => { if (alive) setAiProviders([]); });
-    return () => { alive = false; };
-  }, []);
-  const aiConfig = useMemo<AiCallConfig>(
-    () => ({
-      provider: aiProvider,
-      model: aiModel.trim() || undefined,
-      apiKey: aiKey || undefined,
-      baseUrl: aiBaseUrl.trim() || undefined,
-    }),
-    [aiProvider, aiModel, aiKey, aiBaseUrl],
-  );
-  const runNewsAi = async (id: string) => {
-    setAiSumBusy(id);
-    try {
-      const r = await apiNewsAi(id, aiConfig);
-      setAiSums((m) => ({ ...m, [id]: r }));
-    } catch (e) {
-      setAiSums((m) => ({ ...m, [id]: { ok: false, summaryTr: null, reason: e instanceof Error ? e.message : "Özet alınamadı", cached: false } }));
-    } finally {
-      setAiSumBusy(null);
-    }
-  };
+  /* P4-2 YZ sağlayıcı config — Faz 25 (UIX-23): Ayarlar'da tek yer,
+     ortak store'dan okunur; bu panelde yalnız "kullan" tarafı var. */
+  const ai = useAiConfig();
+  const aiCfgLabel = ai.provider === "builtin" ? "Yerleşik (paketlenmedi)" : ai.provider;
   useEffect(() => {
     let alive = true;
     const sym = symbol.trim().toUpperCase() || "BTCUSDT";
@@ -215,8 +185,8 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
     try {
       const sym = symbol.trim().toUpperCase() || "BTCUSDT";
       const body = aiMode === "chat"
-        ? { mode: "chat" as const, message: aiMsg, history: aiHist.slice(-6), symbol: sym, config: aiConfig }
-        : { mode: "diagnose" as const, bot_id: aiBot || undefined, symbol: sym, config: aiConfig };
+        ? { mode: "chat" as const, message: aiMsg, history: aiHist.slice(-6), symbol: sym, config: ai.config }
+        : { mode: "diagnose" as const, bot_id: aiBot || undefined, symbol: sym, config: ai.config };
       if (aiMode === "chat" && !aiMsg.trim()) throw new Error("Soru boş");
       if (aiMode === "diagnose" && !aiBot) throw new Error("Teşhis için bot seçin");
       const r = await apiAiDiagnose(body);
@@ -232,7 +202,6 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
       setAiBusy(false);
     }
   };
-  const aiProviderInfo = aiProviders.find((p) => p.id === aiProvider) ?? null;
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -664,12 +633,14 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
               className="num min-h-11 border-border-strong bg-surface text-slate-100"
             />
           </div>
-          <div className="flex items-end gap-2 lg:col-span-2">
-            <Button onClick={() => void run()} disabled={busy || certBusy} className="min-h-11 flex-1 bg-cyan-500/90 font-bold text-[#02171b] hover:bg-cyan-500 lg:w-36">
+          {/* Faz 25 (UIX-30): sabit lg:w-* genişlikler 1440px'te yatay
+              overflow üretiyordu — min-w + flex-wrap ile sarmalanır. */}
+          <div className="flex flex-wrap items-end gap-2 lg:col-span-2">
+            <Button onClick={() => void run()} disabled={busy || certBusy} className="min-h-11 min-w-36 flex-1 bg-cyan-500/90 font-bold text-[#02171b] hover:bg-cyan-500">
               {busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Play className="h-4 w-4" aria-hidden />}
               {busy ? "Koşuyor…" : "BACKTEST"}
             </Button>
-            <div className="flex min-h-11 flex-1 flex-col justify-center rounded-lg border border-border bg-surface px-3 py-1.5 lg:w-40 lg:flex-none">
+            <div className="flex min-h-11 min-w-40 flex-1 flex-col justify-center rounded-lg border border-border bg-surface px-3 py-1.5">
               <label htmlFor="cert-attempts" className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
                 Deneme sayısı (DSR)
               </label>
@@ -687,7 +658,7 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
               onClick={() => void runCert()}
               disabled={certBusy || busy}
               variant="outline"
-              className="min-h-11 flex-1 border-amber-500/50 bg-amber-500/10 font-bold text-amber-300 hover:bg-amber-500/20 hover:text-amber-200 lg:w-44"
+              className="min-h-11 min-w-40 flex-1 border-amber-500/50 bg-amber-500/10 font-bold text-amber-300 hover:bg-amber-500/20 hover:text-amber-200"
             >
               {certBusy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <BadgeCheck className="h-4 w-4" aria-hidden />}
               {certBusy ? "Sertifikalanıyor…" : "SERTİFİKALA"}
@@ -711,7 +682,7 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
                 }}
                 variant="outline"
                 title="Bu ayarlarla Sihirbaz'ı aç (alanlar otomatik doldurulur)"
-                className="min-h-11 flex-1 border-violet-500/50 bg-violet-500/10 font-bold text-violet-300 hover:bg-violet-500/20 hover:text-violet-200 lg:w-44"
+                className="min-h-11 min-w-44 flex-1 border-violet-500/50 bg-violet-500/10 font-bold text-violet-300 hover:bg-violet-500/20 hover:text-violet-200"
               >
                 <Send className="h-4 w-4" aria-hidden />
                 SİHİRBAZA TAŞI
@@ -773,55 +744,13 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
             )}
           </div>
         )}
-        {/* P4-1 haberler */}
-        {news && news.count > 0 && (
-          <div className="mt-3 rounded-lg border border-border bg-surface p-3">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Haberler · {news.symbol}</span>
-              <span className={cn("num rounded px-1.5 py-0.5 font-mono text-[11px] font-bold", news.mean > 0.2 ? "bg-emerald-500/15 text-emerald-300" : news.mean < -0.2 ? "bg-rose-500/15 text-rose-300" : "bg-slate-500/15 text-slate-300")}>
-                {news.mean > 0 ? `+${news.mean}` : news.mean} ({news.bull}↑ {news.bear}↓)
-              </span>
-              <span className="text-[10px] text-slate-400">{news.sources.join(" · ")}{news.cached ? " · önbellek" : ""}</span>
-            </div>
-            {news.delisting.active && (
-              <p className="mt-1.5 rounded border border-rose-500/40 bg-rose-500/10 px-2 py-1 text-[11px] font-bold text-rose-300">
-                DELISTING UYARISI: {news.delisting.headline}
-              </p>
-            )}
-            <ul className="mt-2 max-h-40 space-y-1 overflow-y-auto">
-              {news.items.slice(0, 8).map((n) => (
-                <li key={n.id}>
-                  <div className="flex items-start gap-2 text-[11px]">
-                    <span className={cn("mt-0.5 shrink-0 rounded px-1 py-0.5 font-mono text-[10px] font-bold", n.sentiment > 0.2 ? "bg-emerald-500/15 text-emerald-300" : n.sentiment < -0.2 ? "bg-rose-500/15 text-rose-300" : "bg-slate-500/15 text-slate-400")}>
-                      {n.sentiment > 0 ? `+${n.sentiment}` : n.sentiment}
-                    </span>
-                    <a href={n.url} target="_blank" rel="noopener noreferrer" className="min-w-0 flex-1 truncate text-slate-300 hover:text-cyan-300 hover:underline" title={`${n.title} — ${n.source}`}>
-                      {n.title}
-                    </a>
-                    <button
-                      type="button"
-                      onClick={() => void runNewsAi(n.id)}
-                      disabled={aiSumBusy === n.id}
-                      title="Tek cümlelik Türkçe özet üret (öğe başına bir kez, önbellekli)"
-                      className="shrink-0 rounded border border-violet-500/40 bg-violet-500/10 px-1.5 py-0.5 text-[10px] font-bold text-violet-300 transition-colors hover:bg-violet-500/20 disabled:opacity-50"
-                    >
-                      {aiSumBusy === n.id ? "…" : (n.aiSummary || aiSums[n.id]?.summaryTr) ? (aiSums[n.id]?.cached || n.aiSummary ? "TR ✓" : "TR") : "TR"}
-                    </button>
-                    <span className="shrink-0 text-[10px] text-slate-400">{n.source}</span>
-                  </div>
-                  {(n.aiSummary || aiSums[n.id]?.summaryTr) && (
-                    <p className="ml-12 mt-0.5 text-[11px] leading-snug text-violet-200/90">
-                      <span className="mr-1 rounded bg-violet-500/15 px-1 text-[9px] font-bold text-violet-300">AI ÖZETİ</span>
-                      {n.aiSummary || aiSums[n.id]?.summaryTr}
-                    </p>
-                  )}
-                  {aiSums[n.id] && !aiSums[n.id].ok && !aiSums[n.id].summaryTr && (
-                    <p className="ml-12 mt-0.5 text-[10px] text-slate-400">{aiSums[n.id].reason}</p>
-                  )}
-                </li>
-              ))}
-            </ul>
-          </div>
+        {/* P4-1 → Faz 25 (UIX-22): haber listesi Lab'dan çıkarıldı — backtest
+            ekranında sonuç alanını itiyordu. İşlem güvenliği için tek tutulan
+            bilgi delisting uyarısı; tam liste Kokpit'te. */}
+        {news && news.delisting.active && (
+          <p className="mt-3 rounded border border-rose-500/40 bg-rose-500/10 px-2 py-1 text-[11px] font-bold text-rose-300">
+            DELISTING UYARISI: {news.delisting.headline}
+          </p>
         )}
         <p className="mt-3 text-[11px] text-slate-400">
           Simülasyon Gate 4 (no-lookahead) ve Gate 5 (realism: MARKETABLE / RESTING / GAP-BETTER fill etiketleri) ile koşar;
@@ -829,60 +758,14 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
         </p>
       </Panel>
 
-      {/* P4-2 YZ Yardımcı — salt-okunur teşhis kopyilotu (emir yetkisi yok) */}
+      {/* P4-2 YZ Yardımcı — salt-okunur teşhis kopyilotu (emir yetkisi yok).
+          Faz 25 (UIX-23): sağlayıcı/model/anahtar alanları bu panelden
+          KALDIRILDI — Ayarlar › YZ Sağlayıcısı tek sahibi. */}
       <Panel title="YZ Yardımcı · Teşhis & Sohbet" icon={<Sparkles className="h-4 w-4 text-violet-400" aria-hidden />}>
-        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
-          <div className="space-y-1.5">
-            <Label className="text-xs text-slate-400">Sağlayıcı</Label>
-            <Select value={aiProvider} onValueChange={(v) => { setAiProvider(v); setAiModel(""); }}>
-              <SelectTrigger className="min-h-11 w-full border-border-strong bg-surface text-slate-100">
-                <SelectValue placeholder="Sağlayıcı seç" />
-              </SelectTrigger>
-              <SelectContent className="border-border-strong bg-[#151a24]">
-                {(aiProviders.length > 0 ? aiProviders : [{ id: "builtin", label: "Yerleşik (paketlenmedi)", models: [] as string[], needsKey: false, note: "" }]).map((p) => (
-                  <SelectItem key={p.id} value={p.id} className="text-slate-200">
-                    {p.label}{p.needsKey ? " · anahtarlı" : ""}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="ai-model" className="text-xs text-slate-400">Model{aiProviderInfo && aiProviderInfo.models.length > 0 ? ` (varsayılan ${aiProviderInfo.models[0]})` : ""}</Label>
-            <Input
-              id="ai-model"
-              value={aiModel}
-              onChange={(e) => setAiModel(e.target.value)}
-              placeholder={aiProviderInfo?.models[0] ?? "model"}
-              className="num min-h-11 border-border-strong bg-surface text-slate-100"
-            />
-          </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="ai-key" className="text-xs text-slate-400">API anahtarı (yalnız bu sekmede)</Label>
-            <Input
-              id="ai-key"
-              type="password"
-              value={aiKey}
-              onChange={(e) => setAiKey(e.target.value)}
-              placeholder={aiProviderInfo?.needsKey ? "sk-…" : "gerekmez"}
-              disabled={!aiProviderInfo?.needsKey && aiProvider !== "ollama"}
-              autoComplete="off"
-              className="num min-h-11 border-border-strong bg-surface text-slate-100"
-            />
-          </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="ai-base" className="text-xs text-slate-400">Base URL (Ollama)</Label>
-            <Input
-              id="ai-base"
-              value={aiBaseUrl}
-              onChange={(e) => setAiBaseUrl(e.target.value)}
-              placeholder={aiProviderInfo?.defaultBaseUrl ?? "http://localhost:11434"}
-              disabled={aiProvider !== "ollama"}
-              className="num min-h-11 border-border-strong bg-surface text-slate-100"
-            />
-          </div>
-        </div>
-        {aiProviderInfo?.note && <p className="mt-1.5 text-[10px] text-slate-400">{aiProviderInfo.note} Anahtar diske yazılmaz, yanıta konmaz.</p>}
+        <p className="text-[11px] text-slate-400">
+          Sağlayıcı: <span className="font-semibold text-slate-300">{aiCfgLabel}</span> ·{" "}
+          <span className="text-slate-500">Ayarlar → YZ Sağlayıcısı&apos;ndan değiştirilir</span>
+        </p>
         <div className="mt-3 flex gap-1.5">
           {([{ v: "chat", l: "SOHBET" }, { v: "diagnose", l: "BOT TEŞHİSİ" }] as const).map((o) => (
             <button

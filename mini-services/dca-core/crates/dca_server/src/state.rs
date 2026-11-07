@@ -328,6 +328,12 @@ pub struct AppState {
     /// poll her turunda (runtime kilidi altında) hesaplanıp yazılır; emir öncesi
     /// kapı kilit çakışması olmadan buradan okur (ayrı kilit — deadlock yok).
     pub venue_live_load: Mutex<HashMap<String, Fraction>>,
+    /// Faz 27 (İ-1): portföy kapısı anlık görüntüsü — (ts_ms, nav, gross).
+    /// venue_live_load ile aynı desen: poll turunda runtime kilidi ALTINDA
+    /// hesaplanır, dispatch içindeki kapı ayrı std kilitten okur (tokio
+    /// kilidi yeniden istenmez — deadlock yok). Okuma tarafı 30 sn tazelik
+    /// penceresi aşarsa kapı o turu atlar (fail-open; bir sonraki tick'te gelir).
+    pub portfolio_cache: std::sync::Mutex<Option<(i64, Fraction, Fraction)>>,
     /// H-7 ince iş: webhook alert tekrar koruması — (botId+action+timestamp)
     /// karması → son görülme ms. 60 sn penceresi aşan ya da pencere içinde
     /// tekrar gelen aynı alert dürüstçe 400 DUPLICATE_ALERT alır.
@@ -375,6 +381,7 @@ impl AppState {
             maint_sim: Mutex::new(None),
             bnb_cache: Mutex::new(None),
             venue_live_load: Mutex::new(HashMap::new()),
+            portfolio_cache: std::sync::Mutex::new(None),
             webhook_seen: Mutex::new(HashMap::new()),
             tick_trace: Mutex::new(HashMap::new()),
         });

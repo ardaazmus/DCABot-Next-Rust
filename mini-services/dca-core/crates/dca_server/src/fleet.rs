@@ -425,6 +425,105 @@ pub async fn fleet_overview(State(app): State<Arc<AppState>>) -> Json<Value> {
     }))
 }
 
+/// Faz 27 (İ-1): portföy kapısı anlık görüntüsünü TAZELER. Yalnız runtime
+/// kilidi ZATEN tutulmuşken çağrılmalı (poll turu başı) — bu fn kendisi
+/// runtimes kilidini İSTEMEZ (tokio Mutex reentrant değil; dispatch içinde
+/// çağrılan kapı deadlock'ı tam olarak bu yüzden cache desenine gitti).
+/// NAV: bots.start_cash toplamı (db kilidi ayrı ve kısa — çakışmaz).
+/// Gross: snapshot'lardan qty × son-bar-kapanışı (mark yoksa deal sayılmaz).
+pub fn refresh_portfolio_cache(app: &crate::state::AppState, rts: &HashMap<String, crate::state::BotRuntime>) {
+    let nav = (|| -> Option<Fraction> {
+        let conn = app.db.conn.lock().ok()?;
+        let mut stmt = conn.prepare("SELECT start_cash FROM bots").ok()?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).ok()?;
+        let mut sum = Fraction::zero();
+        for row in rows.filter_map(|x| x.ok()) {
+            let v = Fraction::from_any_str(&row).unwrap_or_else(|_| Fraction::zero());
+            sum = sum.add(&v).unwrap_or_else(|_| sum.clone());
+        }
+        Some(sum)
+    })()
+    .unwrap_or_else(Fraction::zero);
+
+    let mut gross = Fraction::zero();
+    for rt in rts.values() {
+        if rt.status != "RUNNING" && rt.status != "FROZEN" && rt.status != "PAUSED" {
+            continue;
+        }
+        let snap = rt.engine_kind.snapshot();
+        if snap.deal_id.is_none() {
+            continue;
+        }
+        if let Some(mark_s) = rt.stepper.last_close.as_deref() {
+            if let Ok(mark) = Fraction::from_any_str(mark_s) {
+                let qty = parse_frac(&snap.position_qty);
+                let notional = qty.mul(&mark).unwrap_or_else(|_| Fraction::zero());
+                gross = gross.add(&notional).unwrap_or_else(|_| gross.clone());
+            }
+        }
+    }
+    if let Ok(mut slot) = app.portfolio_cache.lock() {
+        *slot = Some((crate::state::now_ms(), nav, gross));
+    }
+}
+
+/// Faz 27 (İ-1): kapının okuma tarafı — tazelik penceresi içindeyse (nav, gross).
+pub fn portfolio_cache_read(app: &crate::state::AppState, max_age_ms: i64) -> Option<(Fraction, Fraction)> {
+    let slot = app.portfolio_cache.lock().ok()?;
+    let (ts, nav, gross) = slot.as_ref()?;
+    if crate::state::now_ms() - ts > max_age_ms {
+        return None;
+    }
+    Some((nav.clone(), gross.clone()))
+}
+
+/// Faz 27 (İ-1): portföy-düzeyi max-total-notional kapısı — saf çekirdek.
+///
+/// Kural: (mevcut brüt açık notional + aday emir notional) / NAV × 100,
+/// cap_pct'i aşıyorsa emir yerleştirilmez (fail-closed). NAV = bots
+/// tablosundaki start_cash toplamı (fleet_overview ile aynı temel —
+/// unrealized PnL geri besleme döngüsü yaratmasın diye bilinçli tercih).
+///
+/// Dürüstlük kuralları:
+/// - NAV <= 0 → ölçülebilir temel yok, engelleme yok (create tarafındaki
+///   capital-guard zaten NAV'sız bot üretmez; burada çifte kilide gerek yok).
+/// - cap_pct <= 0 → kapı kapalı (explicit opt-out).
+/// - aday notional <= 0 → engelleme yok (reduce/kapanış sınıfı; savunma).
+pub fn portfolio_cap_exceeded(gross: &Fraction, candidate: &Fraction, nav: &Fraction, cap_pct: i64) -> bool {
+    if cap_pct <= 0 {
+        return false;
+    }
+    if nav.is_zero() || nav.is_negative() {
+        return false;
+    }
+    if candidate.is_negative() || candidate.is_zero() {
+        return false;
+    }
+    let total = gross.add(candidate).unwrap_or_else(|_| gross.clone());
+    // total × 100 > nav × cap_pct — bölmeden rasyonel karşılaştırma.
+    match total.mul(&Fraction::from_i64(100)) {
+        Ok(lhs) => match nav.mul(&Fraction::from_i64(cap_pct)) {
+            Ok(rhs) => lhs.cmp(&rhs) == std::cmp::Ordering::Greater,
+            Err(_) => false,
+        },
+        Err(_) => true, // üst taşma → güvenli tarafta reddet
+    }
+}
+
+/// Faz 27 (İ-1): kapı eşiği çözümü — env `DCA_PORTFOLIO_MAX_NOTIONAL_PCT`.
+/// Unset/geçersiz → 85 (kapı AÇIK varsayılan); "0" → kapalı (explicit opt-out);
+/// 1..=1000 arası geçerli; 1000 üstü geçersiz sayılır (85'e düşer).
+pub fn portfolio_cap_pct_from_env(raw: Option<&str>) -> i64 {
+    match raw {
+        None => 85,
+        Some(s) => match s.trim().parse::<i64>() {
+            Ok(0) => 0,
+            Ok(n) if (1..=1000).contains(&n) => n,
+            _ => 85,
+        },
+    }
+}
+
 #[cfg(test)]
 mod fleet_tests {
     use super::*;
@@ -453,5 +552,52 @@ mod fleet_tests {
     fn win_rate_empty_is_zero() {
         assert_eq!(win_rate_pct(0, 0), "0.00");
         assert_eq!(win_rate_pct(3, 4), "75.00");
+    }
+
+    // ---- Faz 27 (İ-1): portföy notional kapısı ----
+
+    #[test]
+    fn portfolio_cap_blocks_over_threshold() {
+        // gross 7000 + aday 1350 = 8350; NAV 10000, cap %80 → 8350 > 8000 → blok
+        assert!(portfolio_cap_exceeded(&f("7000"), &f("1350"), &f("10000"), 80));
+        // aday 1000 → 8000 == 8000 → sınırda, engelleme yok (eşitlik serbest)
+        assert!(!portfolio_cap_exceeded(&f("7000"), &f("1000"), &f("10000"), 80));
+        // altında rahat
+        assert!(!portfolio_cap_exceeded(&f("1000"), &f("500"), &f("10000"), 80));
+    }
+
+    #[test]
+    fn portfolio_cap_edge_and_nasty_numbers() {
+        // NAV sıfır → ölçülemez temel, engelleme yok (capital-guard'ın sahası)
+        assert!(!portfolio_cap_exceeded(&f("7000"), &f("1000"), &Fraction::zero(), 80));
+        assert!(!portfolio_cap_exceeded(&f("7000"), &f("1000"), &f("-100"), 80));
+        // cap 0 → explicit opt-out
+        assert!(!portfolio_cap_exceeded(&f("99999"), &f("99999"), &f("1"), 0));
+        // cap negatif (saldiri girdisi) → opt-out değil, kapatma yorumu yine geçersiz:
+        // negatif cap ile "her şey bloklansın" denemez — false döner (kapı kapalı).
+        assert!(!portfolio_cap_exceeded(&f("99999"), &f("1"), &f("100"), -50));
+        // aday sıfır/negatif → reduce sınıfı, engelleme yok
+        assert!(!portfolio_cap_exceeded(&f("7000"), &Fraction::zero(), &f("10000"), 80));
+        assert!(!portfolio_cap_exceeded(&f("7000"), &f("-50"), &f("10000"), 80));
+        // minik ondalık hassasiyet: gross 79.9999 + 0.0001 = 80.00 (sınır, geçer)
+        assert!(!portfolio_cap_exceeded(&f("79.9999"), &f("0.0001"), &f("100"), 80));
+        // minik aşım: 79.9999 + 0.0002 → blok
+        assert!(portfolio_cap_exceeded(&f("79.9999"), &f("0.0002"), &f("100"), 80));
+        // makro: yüz milyonlarca
+        assert!(portfolio_cap_exceeded(&f("900000000"), &f("200000000"), &f("1000000000"), 85));
+        assert!(!portfolio_cap_exceeded(&f("800000000"), &f("40000000"), &f("1000000000"), 85));
+    }
+
+    #[test]
+    fn portfolio_cap_env_parsing() {
+        assert_eq!(portfolio_cap_pct_from_env(None), 85);
+        assert_eq!(portfolio_cap_pct_from_env(Some(" 60 ")), 60);
+        assert_eq!(portfolio_cap_pct_from_env(Some("0")), 0);
+        assert_eq!(portfolio_cap_pct_from_env(Some("1000")), 1000);
+        // geçersizler varsayılana düşer — sessiz kapatma YOK
+        assert_eq!(portfolio_cap_pct_from_env(Some("abc")), 85);
+        assert_eq!(portfolio_cap_pct_from_env(Some("-5")), 85);
+        assert_eq!(portfolio_cap_pct_from_env(Some("2000")), 85);
+        assert_eq!(portfolio_cap_pct_from_env(Some("")), 85);
     }
 }

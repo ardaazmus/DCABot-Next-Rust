@@ -236,6 +236,20 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
   const { bots } = useBots();
   const { events, connected } = useEventStream();
   const { kill, freeze } = useHalt();
+  /* Faz 25 (UIX-19): SSE akışı ham mühendislik günlüğüydü — dakikada bir
+     tekrarlayan EQUITY tick'leri işleme-önemli olayları (FILL/RISK/TP...) ekrandan
+     itiyordu. Varsayılan filtre "İşlem-önemli"; EQUITY/LOG INFO opt-in.
+     Ayrıca botId taşıyan olaylara bot adı çipi eklenir (ham ID değil). */
+  const [onlyAction, setOnlyAction] = useState(true);
+  const nameById = useMemo(() => new Map(bots.map((b) => [b.id, b.name] as const)), [bots]);
+  const botNameOf = (id: unknown): string | null => {
+    const k = typeof id === "string" ? id : null;
+    return k ? nameById.get(k) ?? null : null;
+  };
+  const shownEvents = useMemo(
+    () => (onlyAction ? events.filter((e) => e.type !== "EQUITY" && !(e.type === "LOG" && e.payload.level === "INFO")) : events),
+    [events, onlyAction],
+  );
 
   /* ---- REAL 24h change: top-allocation symbol, 1d klines, close-over-close ---- */
   const topSymbol = useMemo(() => {
@@ -286,10 +300,12 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
   /* Render-time derivation: stale symbol (mid-refetch) shows "…", missing data shows "—". */
   const chgPct: number | null =
     topSymbol !== null && chg.symbol === topSymbol && chg.pct !== null ? chg.pct : null;
+  /* Faz 25 (UIX-34): yüzde de para konvansiyonuyla aynı ondalık noktayı
+     kullanır (en-US) — aynı kartta "+0,83%" ile "$-281.05" karışmıyordu. */
   const chgTxt = !topSymbol
     ? "—"
     : chgPct !== null
-      ? `${chgPct > 0 ? "+" : ""}${chgPct.toLocaleString("tr-TR", { maximumFractionDigits: 2, minimumFractionDigits: 2 })}%`
+      ? `${chgPct > 0 ? "+" : ""}${chgPct.toFixed(2)}%`
       : chg.symbol === topSymbol
         ? "—"
         : "…";
@@ -300,6 +316,14 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
     const lev = fracToNum(summary.longExposure) ?? 0;
     if (eq <= 0) return 0;
     return Math.min(100, (lev / eq) * 100);
+  }, [summary]);
+
+  const shortPct = useMemo(() => {
+    if (!summary) return 0;
+    const eq = fracToNum(summary.totalEquity) ?? 0;
+    const sh = fracToNum(summary.shortExposure) ?? 0;
+    if (eq <= 0) return 0;
+    return Math.min(100, (sh / eq) * 100);
   }, [summary]);
 
   const donutSlices: DonutSlice[] = useMemo(
@@ -352,16 +376,21 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
               <div className="num mt-2 text-3xl font-bold tracking-tight text-slate-50">
                 {fmtUsd(summary?.totalEquity, 2)}
               </div>
+              {/* Faz 25 (UIX-41): "24s Değişim" borsa verisiydi, portföy verisi
+                  gibi okunuyordu — etiket artık varlığı ve niteliği söylüyor. */}
               <div className="mt-1 text-xs text-slate-500">
-                24s Değişim{" "}
                 <span
-                  title={chgPct !== null ? `${chg.symbol} 1d close-over-close` : chg.symbol === topSymbol ? "veri yok" : "yükleniyor…"}
+                  title={chgPct !== null ? `${chg.symbol} 1d close-over-close — borsa fiyat değişimi, portföy getirisi değil` : chg.symbol === topSymbol ? "veri yok" : "yükleniyor…"}
+                >
+                  {topSymbol ?? "—"} 24s{" "}
+                </span>
+                <span
                   className={cn(
                     "num",
                     chgPct === null ? "text-slate-400" : chgPct >= 0 ? "text-emerald-400" : "text-rose-400",
                   )}
                 >
-                  {chgPct !== null ? `${chg.symbol} ${chgTxt}` : chgTxt}
+                  {chgPct !== null ? chgTxt : chgTxt}
                 </span>{" "}
                 · Gerçekleşen{" "}
                 <span className="num text-slate-400">{fmtUsdSigned(summary?.totalRealizedGross)}</span>
@@ -387,7 +416,7 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
         <div className="rounded-xl border border-border bg-[#151a24] p-4">
           <div className="flex items-center gap-2 text-[11px] uppercase tracking-wider text-slate-400">
             <TrendingUp className="h-3.5 w-3.5" aria-hidden />
-            Toplam Kâr/Zarar · Profit
+            Toplam Kâr/Zarar
           </div>
           <div
             className={cn(
@@ -412,9 +441,17 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
           <div className="mt-3">
             <ExposureBar longPct={longPct} shortPct={0} />
           </div>
-          <div className="num mt-2 flex justify-between text-[11px] text-slate-400">
-            <span>L {fmtUsd(summary?.longExposure, 0)}</span>
-            <span>S {fmtUsd(summary?.shortExposure, 0)}</span>
+          {/* Faz 25 (UIX-40): "L $3,230 / S $3,086" neyin değeri belirsizdi —
+              açık pozisyon notional'ı + özkaynağa oranı net etiketle. */}
+          <div className="num mt-2 flex justify-between text-[11px] text-slate-400" title="Açık pozisyonların notional toplamı ve özkaynağa oranı">
+            <span>
+              Long <span className="text-slate-200">{fmtUsd(summary?.longExposure, 0)}</span>
+              <span className="text-slate-500"> · %{Math.round(longPct)}</span>
+            </span>
+            <span>
+              Short <span className="text-slate-200">{fmtUsd(summary?.shortExposure, 0)}</span>
+              <span className="text-slate-500"> · %{Math.round(shortPct)}</span>
+            </span>
           </div>
         </div>
       </div>
@@ -428,16 +465,50 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
       {/* Middle: allocation + fleet */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         <Panel title="Tahsis Dağılımı" icon={<Coins className="h-4 w-4 text-slate-500" aria-hidden />}>
-          <Donut
-            slices={donutSlices}
-            centerLabel={fmtUsd(summary?.totalEquity, 0)}
-            centerSub="TOPLAM"
-          />
+          {/* Faz 25 (UIX-32): tek varlıkta donut bilgi taşımaz — ölü alanı
+              işletme özetiyle değiştir; çok varlıkta donut kalır. */}
+          {donutSlices.length <= 1 ? (
+            <div className="num grid grid-cols-2 gap-3 text-xs">
+              <div>
+                <div className="text-slate-500">AÇIK DEAL</div>
+                <div className="mt-0.5 text-lg font-semibold text-cyan-400">{summary?.activeDeals ?? 0}</div>
+              </div>
+              <div>
+                <div className="text-slate-500">AKTİF BOT</div>
+                <div className="mt-0.5 text-lg font-semibold text-slate-200">
+                  {summary?.activeBots ?? 0}
+                  <span className="text-sm text-slate-500">/{summary?.totalBots ?? 0}</span>
+                </div>
+              </div>
+              <div>
+                <div className="text-slate-500">LONG MARJ</div>
+                <div className="mt-0.5 text-slate-200">{fmtUsd(summary?.longExposure, 0)}</div>
+              </div>
+              <div>
+                <div className="text-slate-500">SHORT MARJ</div>
+                <div className="mt-0.5 text-slate-200">{fmtUsd(summary?.shortExposure, 0)}</div>
+              </div>
+              <div className="col-span-2">
+                <div className="text-slate-500">TAHSİS</div>
+                <div className="mt-0.5 text-slate-300">
+                  {donutSlices.length === 1
+                    ? `${donutSlices[0].label} — tek varlık (%100)`
+                    : "pozisyon yok"}
+                </div>
+              </div>
+            </div>
+          ) : (
+            <Donut
+              slices={donutSlices}
+              centerLabel={fmtUsd(summary?.totalEquity, 0)}
+              centerSub="TOPLAM"
+            />
+          )}
         </Panel>
 
         <Panel
           className="lg:col-span-2"
-          title="Botlarım · My Bots"
+          title="Botlarım"
           icon={<Bot className="h-4 w-4 text-slate-500" aria-hidden />}
           right={
             <Button size="sm" variant="outline" className="min-h-9 border-border-strong text-xs text-slate-300 hover:bg-secondary" onClick={onNewBot}>
@@ -481,7 +552,7 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
                     </div>
                   </div>
                   <div className="hidden shrink-0 text-right sm:block">
-                    <div className="text-[10px] uppercase text-slate-400">Kâr/Zarar · Profit</div>
+                    <div className="text-[10px] uppercase text-slate-400">Kâr/Zarar</div>
                     <div
                       className={cn(
                         "num text-lg font-bold",
@@ -503,72 +574,96 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         <Panel
           className="lg:col-span-2"
-          title="Canlı Olay Akışı (SSE)"
+          title="Canlı Olay Akışı"
           icon={<Radio className="h-4 w-4 text-slate-500" aria-hidden />}
           right={
-            <span
-              className={cn(
-                "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-semibold",
-                connected ? "border-emerald-500/40 text-emerald-400" : "border-slate-600 text-slate-500",
-              )}
-            >
-              <StatusDot status={connected ? "RUNNING" : "STOPPED"} />
-              {connected ? "STREAM LIVE" : "STREAM OFF"}
+            <span className="flex items-center gap-1.5">
+              <span
+                className={cn(
+                  "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-semibold",
+                  connected ? "border-emerald-500/40 text-emerald-400" : "border-slate-600 text-slate-500",
+                )}
+              >
+                <StatusDot status={connected ? "RUNNING" : "STOPPED"} />
+                {connected ? "STREAM LIVE" : "STREAM OFF"}
+              </span>
+              {/* Faz 25 (UIX-19): equity tick gürültüsü kapalı-default; isteyen
+                  ham akışı açabilir. */}
+              <button
+                type="button"
+                aria-pressed={onlyAction}
+                title={onlyAction ? "Yalnız işlem-önemli olaylar (FILL, RISK, TP/SL, HALT…) — equity tick'leri gizli" : "Tüm olaylar: equity tick'leri ve INFO günlükleri dahil"}
+                onClick={() => setOnlyAction((v) => !v)}
+                className={cn(
+                  "inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold transition-colors",
+                  onlyAction ? "border-cyan-500/40 bg-cyan-500/10 text-cyan-300" : "border-slate-600 text-slate-500 hover:text-slate-300",
+                )}
+              >
+                {onlyAction ? "İŞLEM-ÖNEMLİ" : "TÜM OLAYLAR"}
+              </button>
             </span>
           }
           bodyClassName="p-0"
         >
           <div className="thin-scroll max-h-96 overflow-y-auto p-3 font-mono text-xs" aria-live="polite">
-            {events.length === 0 ? (
-              <EmptyState icon={Radio} title="Olay bekleniyor…" hint="SSE akışı bağlandığında fill'ler ve equity güncellemeleri burada belirir." />
+            {shownEvents.length === 0 ? (
+              <EmptyState
+                icon={Radio}
+                title={events.length === 0 ? "Olay bekleniyor…" : "Filtrede eşleşen olay yok"}
+                hint={
+                  events.length === 0
+                    ? "SSE akışı bağlandığında fill'ler ve önemli durum değişimleri burada belirir."
+                    : "Equity tick'leri ve INFO günlükleri filtreli — görmek için TÜM OLAYLAR'a geç."
+                }
+              />
             ) : (
               <ul className="space-y-1">
-                {events.map((e) => (
-                  <li key={e.id} className="flex items-start gap-2 rounded px-1 py-0.5 hover:bg-surface-2">
-                    <span className="shrink-0 text-slate-500">{fmtTimeShort(e.at)}</span>
-                    <StreamTypeChip type={e.type} payload={e.payload} />
-                    <span
-                      className={cn(
-                        "min-w-0 flex-1 break-words",
-                        e.type === "LOG" && e.payload.level === "ERROR"
-                          ? "text-rose-400"
-                          : e.type === "LOG" && e.payload.level === "WARN"
-                            ? "text-amber-400"
-                            : e.type === "RISK"
-                              ? "text-amber-400"
-                              : "text-slate-300",
+                {shownEvents.map((e) => {
+                  const bn = botNameOf(e.payload.botId);
+                  return (
+                    <li key={e.id} className="flex items-start gap-2 rounded px-1 py-0.5 hover:bg-surface-2">
+                      <span className="shrink-0 text-slate-500">{fmtTimeShort(e.at)}</span>
+                      <StreamTypeChip type={e.type} payload={e.payload} />
+                      {bn && (
+                        <span className="shrink-0 rounded bg-secondary px-1.5 py-0.5 text-[10px] font-semibold text-slate-300" title={String(e.payload.botId ?? "")}>
+                          {bn}
+                        </span>
                       )}
-                    >
-                      {streamMessage(e.type, e.payload)}
-                    </span>
-                  </li>
-                ))}
+                      <span
+                        className={cn(
+                          "min-w-0 flex-1 break-words",
+                          e.type === "LOG" && e.payload.level === "ERROR"
+                            ? "text-rose-400"
+                            : e.type === "LOG" && e.payload.level === "WARN"
+                              ? "text-amber-400"
+                              : e.type === "RISK"
+                                ? "text-amber-400"
+                                : "text-slate-300",
+                        )}
+                      >
+                        {streamMessage(e.type, e.payload)}
+                      </span>
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </div>
         </Panel>
 
         <Panel title="Acil Durum Killswitch" icon={<Power className="h-4 w-4 text-rose-400" aria-hidden />}>
-          <div className="flex h-full flex-col justify-between gap-4">
-            <p className="text-xs leading-relaxed text-slate-400">
-              Tüm botları tek seferde durdurur. Killswitch, <span className="text-rose-400">çift aşamalı onay</span> gerektirir:
-              önce niyet, sonra <span className="num">KILL</span> ifadesi. Açık pozisyonlar korunur; yalnızca yeni emir
-              üretimi durur.
+          {/* Faz 25 (UIX-27): kart belge gibiydi — gate listesi + "kullanıcı
+              patron" sohbet tonu. Tehlike bölgesi tek net cümle + tek yönlendirme. */}
+          <div className="flex h-full flex-col gap-3">
+            <p className="text-xs leading-relaxed text-slate-300">
+              Tüm botları tek seferde durdurur: açık pozisyonlar korunur, yeni emir üretimi durur.
+              Onay çift aşamalıdır — önce niyet, sonra <span className="num font-bold text-rose-400">KILL</span> yazımı (sağ üst düğme).
             </p>
-            <div className="rounded-lg border border-rose-500/20 bg-rose-500/5 p-3 text-[11px] text-slate-400">
-              <div className="mb-1 flex items-center gap-1.5 font-semibold text-rose-400">
-                <TrendingUp className="h-3.5 w-3.5" aria-hidden />
-                Risk İlkeleri
-              </div>
-              <ul className="list-inside list-disc space-y-0.5">
-                <li>8 gate aktif — yapısal ihlalde emir reddi (Gate 6/Zero-Withdrawal değişmez)</li>
-                <li>10 piyasa koruması advisory: uyarı + onay, işlem engellemez (SIFIR İŞLEM ENGELİ)</li>
-                <li>RISK olayları canlı akışta rozetle bildirilir — kullanıcı patron, risk kendi sorumluluğunda</li>
-              </ul>
+            <div className="rounded-lg border border-rose-500/20 bg-rose-500/5 p-3 text-[11px] leading-relaxed text-slate-400">
+              <span className="font-semibold text-rose-400">Koruma katmanı:</span>{" "}
+              8 zorunlu kapı (yapısal ihlalde emir reddi) · 10 piyasa koruması uyarı+onay (işlem engellemez).
+              Ayrıntı: <span className="font-semibold text-slate-300">Ayarlar → 8 Fail-Closed Gate</span>.
             </div>
-            {/* Faz 22 (UIX-13): KillButton tekrarı kaldırıldı — global kill
-                anahtarı header'da tek yerde (page.tsx); kokpitte iki aynı
-                yıkıcı-buton fark edilmemiş tıklamaya davetiydi. */}
           </div>
         </Panel>
       </div>

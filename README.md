@@ -190,6 +190,16 @@ Port sabit: **3002**. Next.js gateway üzerinden erişim: `/api/<yol>?XTransform
 - **AES-256-GCM Vault:** anahtarlar 12-byte rastgele nonce ile şifreli; master key env (`DCA_VAULT_KEY`) veya otomatik üretim + SQLite'ta saklanır
 - **Sıfır-Float:** tüm fiyat/miktar/ücret/PnL hesapları `Fraction` (BigInt num/den); JSON'da exact `"n/d"` string
 - **Fail-Closed:** belirsiz/eksik durumda emir ASLA gönderilmez
+- **Portföy Notional Kapısı (Faz 27/İ-1):** filo-geneli brüt açık notional + aday
+  emir, toplam sermayenin `DCA_PORTFOLIO_MAX_NOTIONAL_PCT` (varsayılan **%85**,
+  `0` = kapalı) yüzdesini aşacaksa Add emri yerleştirilmez; WARN olayı yayınlanır.
+  Kapanış (TP/SL/CLOSE) emirleri muaf — çıkış yolu her zaman açık.
+- **Dışa Açılım (Tunnel) Uyarısı (Faz 27/S-2):** servisler yalnız `127.0.0.1`
+  dinler. Cloudflare Tunnel ile dışarı açarken **yalnız UI (:3000) hedeflenmeli**;
+  motor (:3002) asla doğrudan tünellenmemeli. UI'nin `/api/stream` uçları sunucu
+  tarafı proxy'den geçer; motorun anahtarsız `/api/health` ve `/api/stream`
+  uçları tünel arkasında erişilebilir olur — tunnel kural dosyasında bu iki yol
+  için ek kimlik doğrulama (Cloudflare Access) zorunludur.
 
 ## 9. Bilinen Kısıtlar / Yol Haritası (Horizon 5)
 

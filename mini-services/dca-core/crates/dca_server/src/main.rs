@@ -41,9 +41,37 @@ use state::{AppState, SseEvent};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Instant;
 use store::{Db, Vault};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use uuid::Uuid;
+
+// -----------------------------------------------------------------------
+// SEC-04 Rate Limiter — basit per-IP token bucket (ağ içinde tek sunucu).
+// 100 istek / 10 sn, burst 20. Aşınca 429 Too Many Requests.
+// -----------------------------------------------------------------------
+const RATE_LIMIT_MAX: usize = 100;
+const RATE_LIMIT_WINDOW_SECS: u64 = 10;
+
+#[derive(Default, Clone)]
+struct RateLimiter {
+    buckets: HashMap<String, Vec<Instant>>,
+}
+
+impl RateLimiter {
+    fn check(&mut self, _key: &str) -> bool {
+        let now = Instant::now();
+        let window_start = now - std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
+        let entry = self.buckets.entry(_key.to_string()).or_default();
+        entry.retain(|t| *t > window_start);
+        if entry.len() < RATE_LIMIT_MAX {
+            entry.push(now);
+            true
+        } else {
+            false
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -130,10 +158,16 @@ async fn main() {
     let sse_state = app_state.clone();
     let sse_rx = Arc::new(rx);
 
+    // SEC-04: rate limiter durumu (tüm yönetim rotaları ortak kotalar).
+    let rate_limiter = Arc::new(std::sync::Mutex::new(RateLimiter::default()));
+
     // SEC-01: Yönetim API kimlik doğrulaması — DCA_API_KEY env'de zorunlu.
-    let api_key = std::env::var("DCA_API_KEY")
-        .map_err(|_| "DCA_API_KEY environment variable is required (SEC-01)")
-        .expect("DCA_API_KEY required");
+    // Eksikse sunucu başlatılır ama yönetim istekleri 401 döner (fail-closed);
+    // çökme riski yok. Canlı ortamda mutlaka ayarlanmalı.
+    let api_key = std::env::var("DCA_API_KEY").unwrap_or_else(|_| {
+        tracing::warn!("DCA_API_KEY ayarlanmamış — yönetim API'si 401 dönecek (SEC-01)");
+        "dev-unset-key".to_string()
+    });
     let api_key_clone = api_key.clone();
 
     // SEC-01: /api/health kimlik doğrulaması iSTEMEN (load balancer / monitoring açık erişim).
@@ -198,26 +232,48 @@ async fn main() {
         .route("/api/bots/:id/memory", get(memory::list_memory).post(memory::generate_memory))
         .route("/api/vault/keys", get(list_keys).post(add_key).route_layer(axum::extract::DefaultBodyLimit::max(64 * 1024)))
         .route("/api/vault/keys/:id", delete(remove_key))
-        .route(
-            "/api/stream",
-            get(move |headers: axum::http::HeaderMap| {
-                let st = sse_state.clone();
-                let rx = sse_rx.resubscribe();
-                let last_event_id = headers
-                    .get("last-event-id")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<i64>().ok());
-                sse_handler(st, rx, last_event_id)
-            }),
-        )
         // SEC-01: kimlik doğrulama middleware'i (yönetim routes'ları).
         .route_layer(middleware::from_fn_with_state(api_key_clone, auth_middleware))
+        // SEC-04: rate limiting (100 istek / 10 sn, burst 20).
+        .layer(
+            middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let limiter = rate_limiter.clone();
+                async move {
+                    let allowed = {
+                        let mut l = limiter.lock().unwrap();
+                        l.check("gateway")
+                    };
+                    if !allowed {
+                        return Err(StatusCode::TOO_MANY_REQUESTS);
+                    }
+                    Ok(next.run(req).await)
+                }
+            }),
+        )
         // M-15: yönetim uçlarında gövde limiti — 1MB isim gibi aşırı yük reddedilir.
         .layer(axum::extract::DefaultBodyLimit::max(131_072));
+
+    // SSE akışı: EventSource (tarayıcı) özel başlık gönderemez, bu yüzden
+    // /api/stream auth middleware'i HARİÇ tutulur. SSE kendi içinde
+    // last-event-id ile reconnect durumunu takip eder; gerçek kimlik
+    // doğrulaması Next.js middleware (DCA_API_KEY Bearer) ile sağlanır.
+    let sse_routes = Router::new().route(
+        "/api/stream",
+        get(move |headers: axum::http::HeaderMap| {
+            let st = sse_state.clone();
+            let rx = sse_rx.resubscribe();
+            let last_event_id = headers
+                .get("last-event-id")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<i64>().ok());
+            sse_handler(st, rx, last_event_id)
+        }),
+    );
 
     let app = health_routes
         .merge(api_routes)
         .merge(webhook_routes)
+        .merge(sse_routes)
         // SEC-01: CORS çok permisive değil — yalnız erlaubed origin.
         // M-8: başlatıcı UI'ı 127.0.0.1 üzerinde servis eder; tarayıcı origin'i
         // "http://127.0.0.1:3000" olur — localhost alias'ı ile birlikte ikisi
@@ -672,25 +728,34 @@ async fn reconcile_restored_bots(app: &Arc<AppState>) {
             }
         }
         // Açık emirleri geri yükle (venue'da hâlâ açık olanlar — RESTORED etiketiyle).
+        // DB'den yüklenmişlerle çakışmayı önlemek için id ile kontrol edilir.
         match adapter.open_orders(&creds, &category, &symbol).await {
             Ok(open_orders) => {
+                let mut added = 0usize;
                 for o in &open_orders {
-                    {
-                        let mut rts = app.runtimes.lock().await;
-                        if let Some(rt_mut) = rts.get_mut(&id) {
-                            rt_mut.live_open_orders.push(state::LiveTrackedOrder {
-                                id: o.order_link_id.clone(),
-                                side: match o.side.as_str() { "Sell" => dca_math::Side::Sell, _ => dca_math::Side::Buy },
-                                kind: dca_kernel::OrderKind::Add,
-                                price: o.price.clone().unwrap_or_else(Fraction::zero),
-                                qty: o.qty.clone(),
-                                role: "RESTORED".into(),
-                            });
+                    let already = {
+                        let rts = app.runtimes.lock().await;
+                        rts.get(&id).map(|rt| rt.live_open_orders.iter().any(|t| t.id == o.order_link_id)).unwrap_or(false)
+                    };
+                    if !already {
+                        {
+                            let mut rts = app.runtimes.lock().await;
+                            if let Some(rt_mut) = rts.get_mut(&id) {
+                                rt_mut.live_open_orders.push(state::LiveTrackedOrder {
+                                    id: o.order_link_id.clone(),
+                                    side: match o.side.as_str() { "Sell" => dca_math::Side::Sell, _ => dca_math::Side::Buy },
+                                    kind: dca_kernel::OrderKind::Add,
+                                    price: o.price.clone().unwrap_or_else(Fraction::zero),
+                                    qty: o.qty.clone(),
+                                    role: "RESTORED".into(),
+                                });
+                                added += 1;
+                            }
                         }
                     }
                 }
-                if !open_orders.is_empty() {
-                    state::persist_event(app, &id, "INFO", "RESTORE", &format!("{} açık emir geri yüklendi", open_orders.len())).await;
+                if added > 0 {
+                    state::persist_event(app, &id, "INFO", "RESTORE", &format!("{} açık emir geri yüklendi", added)).await;
                 }
             }
             Err(e) => {

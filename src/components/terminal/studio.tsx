@@ -71,6 +71,7 @@ import { DEFAULT_RISK_POLICY } from "@/lib/engine-types";
 import type { GridMeshResult, AdvisoryWarning, AiProvider, BotConfig, BotDetail, BotMemory, DryRunRequest, DryRunResult, Fill, GuardAction, ParityResult, ReconcileResult, UserRiskPolicy } from "@/lib/engine-types";
 import { HedgeTab } from "@/components/terminal/studio/hedge-tab";
 import { ConfigTab } from "@/components/terminal/studio/config-tab";
+import { useAiConfig } from "@/hooks/use-ai-config";
 
 /* ------------------------------------------------------------------ */
 
@@ -84,8 +85,8 @@ function StatCell({ label, value, className }: { label: string; value: React.Rea
 }
 
 
-/* Task 16 — Risk Motoru presentation helpers (Genel tab) */
-
+/* Task 16 — Risk Motoru presentation helpers (Genel tab).
+   Faz 25 (UIX-31): gate kodlarına insan açıklaması tooltip olarak eklendi. */
 type GuardKey =
   | "session_guard"
   | "opening_salvo_buffer"
@@ -95,14 +96,14 @@ type GuardKey =
   | "m20_sl_ladder_guard"
   | "grid_fee_breaker";
 
-const RISK_GUARDS: { label: string; key: GuardKey }[] = [
-  { label: "W1 SEANS", key: "session_guard" },
-  { label: "W8a SALVO", key: "opening_salvo_buffer" },
-  { label: "W8b GAP", key: "gap_consolidation" },
-  { label: "MAKRO", key: "macro_blackout" },
-  { label: "REJİM", key: "regime_filter" },
-  { label: "M20", key: "m20_sl_ladder_guard" },
-  { label: "G_MIN", key: "grid_fee_breaker" },
+const RISK_GUARDS: { label: string; key: GuardKey; hint: string }[] = [
+  { label: "W1 SEANS", key: "session_guard", hint: "Borsa kapalıyken emir üretimi durur (seans takvimi)." },
+  { label: "W8a SALVO", key: "opening_salvo_buffer", hint: "Bar açılış salvosu tamponu — ilk dolumları konsolide eder." },
+  { label: "W8b GAP", key: "gap_consolidation", hint: "Fiyat boşluklarını tek dolumda birleştirir." },
+  { label: "MAKRO", key: "macro_blackout", hint: "Makro kara pencerelerinde yeni emir açılmaz." },
+  { label: "REJİM", key: "regime_filter", hint: "Piyasa rejimi filtresi — uyarı + onay." },
+  { label: "M20 SL", key: "m20_sl_ladder_guard", hint: "SL ↔ güvenlik merdiveni çatışma denetimi." },
+  { label: "G_MIN", key: "grid_fee_breaker", hint: "Grid spread'inin maker ücretini karşılamama denetimi." },
 ];
 
 function guardBadge(act: GuardAction): { text: string; cls: string } {
@@ -145,16 +146,16 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
   const [recon, setRecon] = useState<ReconcileResult | null>(null);
   const [reconBusy, setReconBusy] = useState(false);
   const [reconErr, setReconErr] = useState<string | null>(null);
-  /* Faz 2.3 bot hafızası — ölçülen bağlamın LLM özeti (ABSTAIN sözleşmeli). */
+  /* Faz 2.3 bot hafızası — ölçülen bağlamın LLM özeti (ABSTAIN sözleşmeli).
+     Faz 25 (UIX-23): sağlayıcı config ortak store'dan (Ayarlar'da tek yer). */
+  const ai = useAiConfig();
   const [memories, setMemories] = useState<BotMemory[]>([]);
   const [memBusy, setMemBusy] = useState(false);
   const [memGenBusy, setMemGenBusy] = useState(false);
   const [memErr, setMemErr] = useState<string | null>(null);
   const [memProviders, setMemProviders] = useState<AiProvider[]>([]);
-  const [memProvider, setMemProvider] = useState("builtin");
-  const [memModel, setMemModel] = useState("");
-  const [memKey, setMemKey] = useState("");
-  const [memBase, setMemBase] = useState("");
+  const memProviderLabel =
+    memProviders.find((p) => p.id === ai.provider)?.label ?? (ai.provider === "builtin" ? "Yerleşik (paketlenmedi)" : ai.provider);
   const loadMemories = async () => {
     setMemBusy(true);
     setMemErr(null);
@@ -172,10 +173,10 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
     setMemErr(null);
     try {
       await apiBotMemoryGenerate(botId, {
-        provider: memProvider,
-        model: memModel.trim() || undefined,
-        apiKey: memKey || undefined,
-        baseUrl: memBase.trim() || undefined,
+        provider: ai.provider,
+        model: ai.model.trim() || undefined,
+        apiKey: ai.apiKey || undefined,
+        baseUrl: ai.baseUrl.trim() || undefined,
       });
       await loadMemories();
     } catch (e) {
@@ -265,7 +266,7 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
   };
   useEffect(() => {
     void loadMemories();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, [botId]);
   useEffect(() => {
     let alive = true;
@@ -327,7 +328,7 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
     // tüm `bot` nesnesine bağlıydı; her 5 sn poll + her SSE dataVer'da yeni
     // nesne kimliği efektin TEKRAR TEKRAR ateşlenmesi demekti (poll başına
     // markets+calc istek çifti motoru gereksiz yoruyordu).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, [bot?.kind, bot?.symbol, bot?.ladder, bot?.stats.avg_price, configHint]);
 
   if (loading && !bot) {
@@ -407,7 +408,7 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
           {([
             ["genel", "Genel", <Bot key="i" className="h-3.5 w-3.5" />],
             ...(isHedge ? ([["hedge", "Hedge", <ShieldHalf key="ih" className="h-3.5 w-3.5" />]] as [string, string, React.ReactNode][]) : []),
-            ["fills", "Fill'ler", <ListTree key="i2" className="h-3.5 w-3.5" />],
+            ["fills", "Dolumlar", <ListTree key="i2" className="h-3.5 w-3.5" />],
             ["ladder", "Ladder", <ListTree key="i3" className="h-3.5 w-3.5" />],
             ["ayarlar", "Ayarlar", <Settings2 key="i4" className="h-3.5 w-3.5" />],
             ["olaylar", "Olaylar", <Radio key="i5" className="h-3.5 w-3.5" />],
@@ -478,6 +479,24 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
             </div>
           )}
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
+            {/* Faz 25 (UIX-21): botun kendi K/Z'si Genel'de YOKTU — kullanıcı #1
+                metriği Özet sekmesine saklanmıştı. Birinci kademeye taşındı. */}
+            <StatCell
+              label="K/Z (GERÇEKLEŞEN)"
+              value={
+                <span className={(fracToNum(s.realized_gross) ?? 0) >= 0 ? "text-emerald-400" : "text-rose-400"}>
+                  {fmtUsdSigned(s.realized_gross)}
+                </span>
+              }
+            />
+            <StatCell
+              label="AÇIK DEAL PnL"
+              value={
+                <span className={(fracToNum(bot.unrealizedNow) ?? 0) >= 0 ? "text-emerald-400" : "text-rose-400"}>
+                  {bot.unrealizedNow ? fmtUsdSigned(bot.unrealizedNow) : "—"}
+                </span>
+              }
+            />
             <StatCell label="FAZ" value={<span className="text-cyan-300">{s.phase}</span>} />
             <StatCell label="DEAL ID" value={<span title={s.deal_id ?? ""}>{truncateMid(s.deal_id ?? "—", 12, 6)}</span>} />
             <StatCell label="POZİSYON" value={fmtFrac(s.position_qty)} />
@@ -495,7 +514,7 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
                 <StatCell label="MARJİN MODU" value={<span className="text-amber-400">{`İZOLE ${fmtNum(fracToNum(bot.leverage), 0)}x`}</span>} />
                 <StatCell label="KOMİSYE MARJİN (IM)" value={<span className="text-amber-300">{fmtUsd(bot.imUsed)}</span>} />
                 <StatCell
-                  label="LİKİDASYON (M07)"
+                  label="LİKİDASYON"
                   value={bot.liqPrice ? <span className="text-rose-400">{fmtFrac(bot.liqPrice)}</span> : "—"}
                 />
               </>
@@ -537,6 +556,7 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
                 return (
                   <span
                     key={g.key}
+                    title={g.hint}
                     className="inline-flex items-center gap-1 rounded border border-border bg-surface px-1.5 py-0.5 text-[10px] font-semibold"
                   >
                     <span className="text-slate-500">{g.label}</span>
@@ -599,14 +619,23 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
             )}
           </Panel>
           <Panel title="Deal Durumu" icon={<Percent className="h-4 w-4 text-slate-500" aria-hidden />}>
+            {/* Faz 25 (UIX-20): metin FAZA göre üretilir — eski sabit cümle açık
+                deal yokken "base doldu" diyordu (Cooldown'da yanlış bilgi) ve
+                "invariant" jargonu taşıyordu. */}
             <p className="text-xs leading-relaxed text-slate-400">
               {isHedge
                 ? `Hedge motoru (${s.hedge?.mode === "DUAL" ? "çift bacak" : "koruma"} modu): ana bacak ${s.position_qty === "0" ? "pozisyonsuz" : "pozisyonda"}, hedge bacağı ${s.hedge?.hedge_leg ? "AÇIK" : "yok"}. Birleşik k/z ${fmtUsdSigned(s.hedge?.combined_pnl ?? "0", 4)} · hedef ${fmtUsd(s.hedge?.combined_target ?? "0")}. Bacak kartları, tetikleyici takibi ve spawn geçmihi Hedge sekmesinde.`
                 : isGrid
                   ? "Grid stratejisi: mesh seviyeleri ARMED durumda bekler; fiyat dokunuşu offset fill üretir."
-                  : `Tek aktif deal invariant: base doldu, ${s.safety_triggered} güvenlik emri tetiklendi. Sonraki güvenlik L${
-                      s.next_safety_level ?? "—"
-                    } seviyesinde ${fmtFrac(s.next_safety_price)} fiyatında bekliyor. Net TP hedefi ${fmtFrac(s.tp_price)}.`}
+                  : s.phase === "Open"
+                    ? `Açık deal var: base emri doldu, ${s.safety_triggered} güvenlik emri tetiklendi. Sonraki güvenlik L${s.next_safety_level ?? "—"} seviyesinde ${fmtFrac(s.next_safety_price)} fiyatında bekliyor. Kâr alma hedefi ${fmtFrac(s.tp_price)}.`
+                    : s.phase === "Closing"
+                      ? "Deal kapanıyor — kapanış emri piyasada; dolum Özet → Parite ve Filo tape'inden izlenebilir."
+                      : `Açık deal yok (faz: ${s.phase}).${
+                          (bot.config?.cooldown_bars ?? 0) > 0
+                            ? ` Yeni base emri ${bot.config?.cooldown_bars} bar sonra değerlendirilecek.`
+                            : " Yeni base emri başlangıç koşulu sağlandığında değerlendirilecek."
+                        } Merdiven ve sonraki güvenlik seviyesi deal açılınca burada görünür.`}
             </p>
           </Panel>
         </TabsContent>
@@ -618,14 +647,14 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
           </TabsContent>
         )}
 
-        {/* ---------- Fill'ler ---------- */}
+        {/* ---------- Dolumlar ---------- */}
         <TabsContent value="fills" className="mt-4">
           {fillsLoading && fills.length === 0 ? (
             <div className="flex justify-center py-10">
               <Spinner className="h-6 w-6" />
             </div>
           ) : fills.length === 0 ? (
-            <EmptyState icon={ListTree} title="Fill yok" hint="Emirler dolduğunda burada listelenir." />
+            <EmptyState icon={ListTree} title="Dolum yok" hint="Emirler dolduğunda burada listelenir." />
           ) : (
             <div className="thin-scroll max-h-96 overflow-y-auto rounded-lg border border-border">
               <Table>
@@ -678,7 +707,21 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
               {s.sl_price ? " · SL aktif (M20 denetimi creation'da yapıldı)" : ""}
             </span>
           </div>
-          <LadderTable rows={bot.ladder ?? []} currentLevel={s.next_safety_level} m20From={m20From} kind={bot.kind} />
+          <LadderTable
+            rows={bot.ladder ?? []}
+            currentLevel={s.next_safety_level}
+            m20From={m20From}
+            kind={bot.kind}
+            slPrice={fracToNum(s.sl_price)}
+            dir={bot.kind === "DCA_SHORT" ? "short" : "long"}
+            /* Faz 25 (UIX-38): boş durum faz-farkındalıklı — "üretilmedi"
+               yanıltıcıydı; asıl neden açık deal olmaması. */
+            emptyHint={
+              isGrid
+                ? "Grid mesh, motor bootstrap'ten sonra burada listelenir."
+                : "Açık deal yokken merdiven listelenmez; base emri dolduğunda güvenlik seviyeleri burada görünür."
+            }
+          />
         </TabsContent>
 
         {/* ---------- Ayarlar ---------- */}
@@ -818,7 +861,7 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
               label="WIN RATE"
               value={s.deals_closed > 0 ? `${Math.round((s.wins / s.deals_closed) * 100)}%` : "—"}
             />
-            <StatCell label="REALIZED GROSS" value={<span className="text-slate-100">{fmtUsdSigned(s.realized_gross)}</span>} />
+            <StatCell label="GERÇEKLEŞEN (GROSS)" value={<span className="text-slate-100">{fmtUsdSigned(s.realized_gross)}</span>} />
             <StatCell label="KÜMÜLATİF ÜCRET" value={<span className="text-amber-400">{fmtUsd(bot.cumulativeFees, 4)}</span>} />
           </div>
           <div className="grid gap-3 lg:grid-cols-2">
@@ -896,31 +939,13 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
               )}
             </Panel>
             <Panel title="Hafıza · AI Durum Özeti" icon={<History className="h-4 w-4 text-slate-500" aria-hidden />}>
+              {/* Faz 25 (UIX-23): sağlayıcı/model/anahtar alanları bu panelde
+                  değil — Ayarlar › YZ Sağlayıcısı. Burada yalnız "Özet Üret". */}
               <p className="text-[11px] text-slate-400">Ölçülen bağlamın Türkçe özeti — model yalnız motor verisini görür, anahtar gövdede yaşar (saklanmaz). Veri yoksa içerik üretilmez.</p>
-              <div className="mt-2 grid grid-cols-2 gap-2">
-                <div>
-                  <Label className="text-[10px] text-slate-400">Sağlayıcı</Label>
-                  <select value={memProvider} onChange={(e) => setMemProvider(e.target.value)} className="mt-1 w-full rounded border border-border-strong bg-surface px-2 py-1.5 text-xs text-slate-200" aria-label="Hafıza sağlayıcısı">
-                    {(memProviders.length > 0 ? memProviders : [{ id: "builtin", label: "Yerleşik" } as AiProvider]).map((p) => (
-                      <option key={p.id} value={p.id}>{p.label}</option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <Label className="text-[10px] text-slate-400">Model (boş → varsayılan)</Label>
-                  <Input value={memModel} onChange={(e) => setMemModel(e.target.value)} placeholder="gpt-4o-mini" className="mt-1 border-border-strong bg-surface text-xs" aria-label="Hafıza modeli" />
-                </div>
-                <div>
-                  <Label className="text-[10px] text-slate-400">API anahtarı (saklanmaz)</Label>
-                  <Input type="password" value={memKey} onChange={(e) => setMemKey(e.target.value)} placeholder="••••" className="mt-1 border-border-strong bg-surface text-xs" aria-label="Hafıza API anahtarı" />
-                </div>
-                <div>
-                  <Label className="text-[10px] text-slate-400">Base URL (yerel için)</Label>
-                  <Input value={memBase} onChange={(e) => setMemBase(e.target.value)} placeholder="http://localhost:11434" className="mt-1 border-border-strong bg-surface text-xs" aria-label="Hafıza base URL" />
-                </div>
-              </div>
               <div className="mt-2 flex items-center justify-between gap-2">
-                <span className="text-[10px] text-slate-400">{memories.length > 0 ? `${memories.length} kayıt` : memBusy ? "yükleniyor…" : "henüz kayıt yok"}</span>
+                <span className="text-[10px] text-slate-400">
+                  Sağlayıcı: <span className="font-semibold text-slate-300">{memProviderLabel}</span> · Ayarlar&apos;dan değiştirilir
+                </span>
                 <Button size="sm" onClick={() => void runMemory()} disabled={memGenBusy} className="min-h-9 shrink-0">
                   {memGenBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Özet Üret"}
                 </Button>

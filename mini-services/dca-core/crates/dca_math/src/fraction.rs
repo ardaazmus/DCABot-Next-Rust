@@ -191,9 +191,16 @@ impl Fraction {
     }
 
     /// Integer exponentiation (exp >= 0). 0^0 = 1 by convention.
+    /// SEC-04: eks parantezli gigantik üsler ile bellek tüketimi saldırısı
+    /// engellenir — üst sınır 10_000 (≈ 40KB temel BigInt boyutunda).
     pub fn pow_u(&self, exp: u32) -> Result<Self, MathError> {
         if exp == 0 {
             return Ok(Self::one());
+        }
+        if exp > 10_000 {
+            return Err(MathError::DomainViolation(format!(
+                "exponent {exp} exceeds SEC-04 limit 10_000"
+            )));
         }
         Self::new(self.num.pow(exp), self.den.pow(exp))
     }

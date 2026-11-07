@@ -314,19 +314,24 @@ pub struct TrackedOrder {
     pub price: Fraction,
 }
 
-/// A tracked resting order that vanished from the venue book — treated as
-/// filled by the caller (kernel synthesizes a maker fill at the limit price).
+/// A tracked resting order that vanished from the venue book.
+/// EX-03 düzeltmesi: sadece FILLED/PARTIALLY_FILLED durumundaki emirler
+/// sentezik fill olarak döner; CANCELLED/EXPIRED/REJECTED emirler REDDEDİLİR.
+/// `executed_qty` Gerçekte yürütülen miktardır (query_order'dan cum_exec_qty).
 #[derive(Debug, Clone)]
 pub struct MissingFill {
     pub order_id: String,
     pub price: Fraction,
     pub side: dca_math::Side,
+    /// Gerçekte yürütülen miktar (None = durum bilinmiyor → fail-closed, fill üretilmez).
+    pub executed_qty: Option<Fraction>,
 }
 
 /// Fetch the venue's open orders and return every tracked resting order that
-/// is no longer visible there (i.e. it was filled or cancelled venue-side).
-/// Pure diff over `order_link_id`s; network errors propagate to the caller,
-/// which must treat them as non-fatal (log + skip).
+/// is no longer visible there. EX-03: her kaybolan emrin `query_order` ile
+/// gerçek durumu kontrol edilir — yalnız FILLED/PARTIALLY_FILLED durumunda
+/// sentezik fill üretilir; CANCELLED/EXPIRED/REJECTED reddedilir.
+/// Ağ hataları çağıcıya yayılır (non-fatal: log + skip).
 pub async fn sweep_missing_fills(
     adapter: &dyn VenueAdapter,
     creds: &VenueCreds,
@@ -336,11 +341,36 @@ pub async fn sweep_missing_fills(
 ) -> Result<Vec<MissingFill>, String> {
     let open = adapter.open_orders(creds, category, symbol).await?;
     let live_links: std::collections::HashSet<&str> = open.iter().map(|o| o.order_link_id.as_str()).collect();
-    Ok(tracked
-        .iter()
-        .filter(|t| !live_links.contains(t.id.as_str()))
-        .map(|t| MissingFill { order_id: t.id.clone(), price: t.price.clone(), side: t.side })
-        .collect())
+    let mut missing = Vec::new();
+    for t in tracked {
+        if live_links.contains(t.id.as_str()) {
+            continue; // hala açık — atla
+        }
+        // EX-03: gerçek durumu sor — olmayan/iptal edilmiş emir fill üretmez.
+        match adapter.query_order(creds, category, symbol, &t.id).await {
+            Ok(Some(st)) => {
+                let status = st.status.as_str();
+                let is_terminal_filled = status == "Filled" || status == "PartiallyFilled";
+                if is_terminal_filled && !st.cum_exec_qty.is_zero() {
+                    missing.push(MissingFill {
+                        order_id: t.id.clone(),
+                        price: st.price.unwrap_or_else(|| t.price.clone()),
+                        side: t.side,
+                        executed_qty: Some(st.cum_exec_qty.clone()),
+                    });
+                }
+                // Cancelled/Expired/Rejected → fill ÜRETİLMEZ (fail-closed)
+            }
+            Ok(None) => {
+                // Order book'ta veya geçmişte yok — iptal edilmiş olabilir,
+                // fail-closed: fill üretme.
+            }
+            Err(_) => {
+                // Ağ hatası — fail-closed: fill üretme, çağıcıya log bırakır.
+            }
+        }
+    }
+    Ok(missing)
 }
 
 #[cfg(test)]
@@ -349,6 +379,9 @@ mod live_sweep_tests {
 
     struct StubVenue {
         open_link_ids: Vec<String>,
+        // query_order döndürülecek durum: None = bulunamadı (fail-closed),
+        // Some(Filled) = gerçekten doldu, Some(Cancelled) = iptal edildi.
+        query_result: std::collections::HashMap<String, VenueOrderState>,
     }
 
     #[async_trait::async_trait]
@@ -403,6 +436,15 @@ mod live_sweep_tests {
                 })
                 .collect())
         }
+        async fn query_order(
+            &self,
+            _c: &VenueCreds,
+            _cat: &str,
+            _sym: &str,
+            link: &str,
+        ) -> Result<Option<VenueOrderState>, String> {
+            Ok(self.query_result.get(link).cloned())
+        }
         async fn positions(&self, _c: &VenueCreds, _sym: &str) -> Result<Vec<PositionSnapshot>, String> {
             Ok(vec![])
         }
@@ -413,22 +455,38 @@ mod live_sweep_tests {
 
     #[tokio::test]
     async fn sweep_flags_vanished_orders_as_filled() {
-        let adapter = StubVenue { open_link_ids: vec!["still-open".into()] };
+        let mut query_result = std::collections::HashMap::new();
+        query_result.insert(
+            "vanished".into(),
+            VenueOrderState {
+                order_id: "vid-vanished".into(),
+                order_link_id: "vanished".into(),
+                symbol: "TESTUSDT".into(),
+                side: "Buy".into(),
+                price: Some(Fraction::from_u64(100)),
+                qty: Fraction::from_u64(1),
+                cum_exec_qty: Fraction::from_u64(1),
+                cum_exec_fee: None,
+                status: "Filled".into(),
+            },
+        );
+        let adapter = StubVenue { open_link_ids: vec!["still-open".into()], query_result };
         let tracked = vec![
             TrackedOrder { id: "vanished".into(), side: dca_math::Side::Buy, price: Fraction::from_u64(100) },
             TrackedOrder { id: "still-open".into(), side: dca_math::Side::Sell, price: Fraction::from_u64(110) },
         ];
         let creds = VenueCreds { key: "k".into(), secret: "s".into(), passphrase: None };
         let missing = sweep_missing_fills(&adapter, &creds, "spot", "TESTUSDT", &tracked).await.unwrap();
-        assert_eq!(missing.len(), 1, "exactly the vanished order is synthesized");
+        assert_eq!(missing.len(), 1, "sadece FILLED olan vanished order üretilir");
         assert_eq!(missing[0].order_id, "vanished");
         assert_eq!(missing[0].price.to_string(), "100");
         assert_eq!(missing[0].side, dca_math::Side::Buy);
+        assert_eq!(missing[0].executed_qty, Some(Fraction::from_u64(1)));
     }
 
     #[tokio::test]
     async fn sweep_empty_when_all_orders_still_resting() {
-        let adapter = StubVenue { open_link_ids: vec!["a".into(), "b".into()] };
+        let adapter = StubVenue { open_link_ids: vec!["a".into(), "b".into()], query_result: std::collections::HashMap::new() };
         let tracked = vec![
             TrackedOrder { id: "a".into(), side: dca_math::Side::Buy, price: Fraction::one() },
             TrackedOrder { id: "b".into(), side: dca_math::Side::Sell, price: Fraction::one() },
@@ -436,5 +494,29 @@ mod live_sweep_tests {
         let creds = VenueCreds { key: "k".into(), secret: "s".into(), passphrase: None };
         let missing = sweep_missing_fills(&adapter, &creds, "spot", "TESTUSDT", &tracked).await.unwrap();
         assert!(missing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sweep_cancelled_order_does_not_produce_fill() {
+        let mut query_result = std::collections::HashMap::new();
+        query_result.insert(
+            "cancelled".into(),
+            VenueOrderState {
+                order_id: "vid-cancelled".into(),
+                order_link_id: "cancelled".into(),
+                symbol: "TESTUSDT".into(),
+                side: "Buy".into(),
+                price: Some(Fraction::from_u64(100)),
+                qty: Fraction::from_u64(1),
+                cum_exec_qty: Fraction::zero(),
+                cum_exec_fee: None,
+                status: "Cancelled".into(),
+            },
+        );
+        let adapter = StubVenue { open_link_ids: vec![], query_result };
+        let tracked = vec![TrackedOrder { id: "cancelled".into(), side: dca_math::Side::Buy, price: Fraction::from_u64(100) }];
+        let creds = VenueCreds { key: "k".into(), secret: "s".into(), passphrase: None };
+        let missing = sweep_missing_fills(&adapter, &creds, "spot", "TESTUSDT", &tracked).await.unwrap();
+        assert!(missing.is_empty(), "iptal edilmiş emir fill üretmez (EX-03)");
     }
 }

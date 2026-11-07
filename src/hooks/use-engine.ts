@@ -9,3 +9,4 @@ export * from "./engine-client";
 export * from "./engine-stream";
 export * from "./use-bots";
 export * from "./api-analysis";
+export * from "./use-ai-config";

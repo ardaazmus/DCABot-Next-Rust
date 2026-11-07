@@ -215,10 +215,15 @@ export default function Page() {
               </div>
             ))}
           </nav>
+          {/* Faz 25 (UIX-28): burada modül kodlarıydı ("FAIL-CLOSED GATES /
+              RATIONAL CORE / M01–M20") — tüm UI'da 3 kez tekrarlanıyordu.
+              Artık: operasyonel filo özeti + koruma tek yerde, insan diliyle. */}
           <div className="mt-auto rounded-lg border border-border bg-surface p-3 text-[10px] leading-relaxed text-slate-400">
-            <div className="num text-emerald-500/80">{health ? `${health.gates} FAIL-CLOSED GATES` : "GATES —"}</div>
-            <div className="num">4096-bit RATIONAL CORE</div>
-            <div className="num">M01–M20 MODULES</div>
+            <div className="num text-emerald-500/80">
+              BOT {online && health?.readiness ? `${health.readiness.activeBots}/${health.readiness.totalBots} AKTİF` : "—"}
+            </div>
+            <div className="num">{online && health ? "tick hattı canlı" : "motor çevrimdışı"}</div>
+            <div className="num mt-1 text-slate-500">Koruma: {health?.gates ?? "—"} zorunlu kapı</div>
           </div>
         </aside>
 
@@ -254,11 +259,10 @@ export default function Page() {
           <span className="num shrink-0 text-slate-500">
             UPTIME <span className="text-slate-300">{online ? fmtDur(health?.uptime_s) : "—"}</span>
           </span>
-          <span className="shrink-0 rounded border border-amber-500/30 bg-amber-500/5 px-2 py-0.5 font-bold tracking-wider text-amber-400">
-            {online && health ? `${health.gates} FAIL-CLOSED GATES ACTIVE` : "GATES — (motor çevrimdışı)"}
-          </span>
-          <span className="shrink-0 rounded border border-cyan-500/30 bg-cyan-500/5 px-2 py-0.5 font-bold tracking-wider text-cyan-400">
-            4096-BIT RATIONAL ARITHMETIC · ZERO FLOAT
+          {/* Faz 25 (UIX-28): iki mühendislik rozeti tüm UI'da tekrar ediyordu
+              → tek satırda birleşti, insan diliyle. */}
+          <span className="shrink-0 rounded border border-border-strong bg-surface px-2 py-0.5 font-bold tracking-wider text-slate-300">
+            {online && health ? `KORUMA: ${health.gates} ZORUNLU KAPI · TAM-RASYONEL MUHASEBE` : "KORUMA — (motor çevrimdışı)"}
           </span>
           <span className="ml-auto flex shrink-0 items-center gap-1.5">
             <span

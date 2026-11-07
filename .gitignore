@@ -63,3 +63,4 @@ mini-services/dca-core/.mimosa/
 __pycache__/
 *.pyc
 3100
+.zcode/

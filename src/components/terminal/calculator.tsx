@@ -384,7 +384,7 @@ function DcaCalc({
           <SlideField label="Maks. Güvenlik" value={maxSafety} min={0} max={10} step={1} onChange={(v) => setMaxSafety(Math.round(v))} />
           <SlideField label="Hedef Kâr %" value={tp} min={0.2} max={10} step={0.1} fmt={(v) => `${v.toFixed(1)}%`} onChange={setTp} />
           <div className="flex items-center justify-between rounded-lg border border-border bg-surface p-2.5">
-            <span className="text-xs text-slate-300">Net TP (M05)</span>
+            <span className="text-xs text-slate-300">Net TP (ücret sonrası)</span>
             <Switch checked={netTp} onCheckedChange={setNetTp} aria-label="Net TP" />
           </div>
           <div className="flex items-center justify-between rounded-lg border border-border bg-surface p-2.5">
@@ -393,9 +393,10 @@ function DcaCalc({
           </div>
           {slOn && <SlideField label="SL %" value={sl} min={0.5} max={30} step={0.1} fmt={(v) => `${v.toFixed(1)}%`} onChange={setSl} />}
           {slOn && deviation > 0 && sl <= deviation && (
+            /* Faz 25 (UIX-31): "M20 CONFLICT RISK" → insan dili. */
             <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-2.5 text-[11px] text-amber-300">
               <AlertTriangle className="mr-1 inline h-3.5 w-3.5" aria-hidden />
-              M20 CONFLICT RISK: SL {sl}% ≤ deviation {deviation}%
+              SL %{sl}, güvenlik merdiveninden önce tetikleniyor (sapma %{deviation}) — Risk Motoru bölümünde onay istenecek.
             </div>
           )}
           <div className="flex gap-2">
@@ -443,11 +444,19 @@ function DcaCalc({
               }
               bodyClassName="p-0 px-2 py-2"
             >
-              <LadderTable rows={res.levels} m20From={m20From} />
+              <LadderTable
+                rows={res.levels}
+                m20From={m20From}
+                /* Faz 25 (UIX-31): SL altı seviyeler artık kırmızı alarm DEĞİL —
+                    "SL ALTINDA" nötr (beklenen davranış); kırmızı yalnız gerçek
+                    çatışma için. */
+                slPrice={slOn ? (fracToNum(anchor) ?? 0) * (1 - sl / 100) : null}
+                dir="long"
+              />
               {m20From !== null && (
                 <p className="px-2 pb-1 pt-2 text-[11px] text-rose-400">
                   <AlertTriangle className="mr-1 inline h-3 w-3" aria-hidden />
-                  M20: L{m20From}&apos;den itibaren seviyeler SL öncesinde erişilemez — ladder bunları kırmızı işaretler.
+                  L{m20From}&apos;den itibaren seviyeler SL öncesinde erişilemez: SL altındakiler nötr &quot;SL ALTINDA&quot;, geride kalan gerçek çatışmalar kırmızı işaretlenir.
                 </p>
               )}
             </Panel>
@@ -748,7 +757,8 @@ export function CalculatorView() {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
           <TrendingDown className="h-3.5 w-3.5 shrink-0 text-cyan-400" aria-hidden />
-          Sandbox hesaplayıcı — motorla birebir aynı exact rational çekirdek (M02 ladder, M15 mesh, M20 conflict).
+          {/* Faz 25 (UIX-31): modül kodları kullanıcıya sızmıyordu — tek cümle. */}
+          Sandbox hesaplayıcı — motorla birebir aynı hesap çekirdeği (tam-rasyonel aritmetik).
           {dcaAnchor && (
             <span className="rounded border border-border-strong bg-surface px-2 py-0.5 font-mono text-[10px] text-slate-400">
               {symbol} 1h close: {dcaAnchor}

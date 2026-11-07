@@ -11,6 +11,14 @@ export interface Health {
   gates: number;
   venues: string[];
   uptime_s: number;
+  /** Faz 25 (UIX-28): motorun readiness'ından filo durumu (aktif/toplam). */  readiness?: {
+    activeBots: number;
+    totalBots: number;
+    db: string;
+    lastTickAgeS: number;
+    lastTickMs: number;
+    note?: string;
+  } | null;
 }
 
 export interface Allocation {

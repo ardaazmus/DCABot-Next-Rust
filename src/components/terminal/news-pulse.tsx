@@ -1,24 +1,25 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { Newspaper } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Info, Newspaper } from "lucide-react";
 import { EmptyState, Panel, Spinner } from "@/components/terminal/bits";
 import {
   apiAiProviders,
   apiNews,
   apiNewsAi,
+  useAiConfig,
 } from "@/hooks/use-engine";
-import type { AiCallConfig, AiProvider, NewsAiResult, NewsResult } from "@/lib/engine-types";
+import type { AiProvider, NewsAiResult, NewsResult } from "@/lib/engine-types";
 import { fmtTimeShort } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 /**
- * Piyasa Nabzı — açılışta (Dashboard) haber + sentiment şeridi.
- * v3'teki başlangıç görünümündeki haber/sentiment kartlarının karşılığı:
- * motorun /api/market/news ucu (duyarlılık [-1,+1] + delisting kapısı, 5 dk
- * önbellek) + öğe başına tek-cümlelik TR özet (/api/market/news-ai).
- * Salt-okunurdur; emir yetkisi yoktur. YZ anahtarı sekme-içi state'te yaşar,
- * diske yazılmaz.
+ * Borsa Duyuruları — açılış (Kokpit) haber şeridi.
+ * Faz 25 (UIX-36): başlık "Piyasa Nabzı · BTCUSDT"ti ama liste borsa-geneli
+ * duyuruydu — çelişki giderildi. Sentiment çipine açıklama tooltip'i eklendi.
+ * Faz 25 (UIX-23/35): sağlayıcı yapılandırması Ayarlar'da tek yer; TR özet
+ * düğmeleri yalnız kullanılabilir bir sağlayıcı seçiliyken görünür.
+ * Salt-okunurdur; emir yetkisi yoktur.
  */
 export function NewsPulse({ symbol }: { symbol: string }) {
   const [news, setNews] = useState<NewsResult | null>(null);
@@ -26,10 +27,7 @@ export function NewsPulse({ symbol }: { symbol: string }) {
   const [aiSums, setAiSums] = useState<Record<string, NewsAiResult>>({});
   const [aiSumBusy, setAiSumBusy] = useState<string | null>(null);
   const [providers, setProviders] = useState<AiProvider[]>([]);
-  const [provider, setProvider] = useState("builtin");
-  const [model, setModel] = useState("");
-  const [apiKey, setApiKey] = useState("");
-  const [baseUrl, setBaseUrl] = useState("");
+  const ai = useAiConfig();
 
   useEffect(() => {
     let alive = true;
@@ -71,20 +69,12 @@ export function NewsPulse({ symbol }: { symbol: string }) {
     };
   }, []);
 
-  const aiConfig = useMemo<AiCallConfig>(
-    () => ({
-      provider,
-      model: model.trim() || undefined,
-      apiKey: apiKey || undefined,
-      baseUrl: baseUrl.trim() || undefined,
-    }),
-    [provider, model, apiKey, baseUrl],
-  );
+  const aiUsable = ai.provider !== "builtin" || providers.some((p) => p.id === "builtin" && p.needsKey === false && (p.models?.length ?? 0) > 0);
 
   const runNewsAi = async (id: string) => {
     setAiSumBusy(id);
     try {
-      const r = await apiNewsAi(id, aiConfig);
+      const r = await apiNewsAi(id, ai.config);
       setAiSums((m) => ({ ...m, [id]: r }));
     } catch (e) {
       setAiSums((m) => ({
@@ -106,13 +96,17 @@ export function NewsPulse({ symbol }: { symbol: string }) {
 
   return (
     <Panel
-      title={`Piyasa Nabzı · ${symbol}`}
+      title="Borsa Duyuruları"
       icon={<Newspaper className="h-4 w-4 text-amber-400" aria-hidden />}
       right={
         news ? (
           <span className="flex items-center gap-2">
-            <span className={cn("num rounded px-1.5 py-0.5 font-mono text-[11px] font-bold", meanTone)}>
-              {(mean ?? 0) > 0 ? `+${mean}` : mean} ({news.bull}↑ {news.bear}↓)
+            <span
+              title={`Son haber penceresinin bileşik duyarlılık skoru (−1..+1): ${news.bull} olumlu, ${news.bear} olumsuz haber`}
+              className={cn("num inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[11px] font-bold", meanTone)}
+            >
+              {symbol} duyarlılık {(mean ?? 0) > 0 ? `+${mean}` : mean} ({news.bull}↑ {news.bear}↓)
+              <Info className="h-3 w-3 opacity-60" aria-hidden />
             </span>
             <span className="text-[10px] text-slate-400">
               {news.sources.join(" · ")}
@@ -124,16 +118,16 @@ export function NewsPulse({ symbol }: { symbol: string }) {
     >
       {!news && !failed ? (
         <div className="flex items-center gap-2 py-4">
-          <Spinner /> <span className="text-xs text-slate-500">Haberler yükleniyor…</span>
+          <Spinner /> <span className="text-xs text-slate-500">Duyurular yükleniyor…</span>
         </div>
       ) : !news || news.count === 0 ? (
         <EmptyState
           icon={Newspaper}
-          title={failed ? "Haber servisine ulaşılamadı" : "Haber yok"}
+          title={failed ? "Haber servisine ulaşılamadı" : "Duyuru yok"}
           hint={
             failed
               ? "Motor haber uçlarına erişemedi — yürütüm etkilenmez, 5 dk sonra otomatik tekrar denenecek."
-              : `${symbol} için son pencerede haber bulunamadı.`
+              : `Son pencerede borsa duyurusu bulunamadı.`
           }
         />
       ) : (
@@ -168,15 +162,19 @@ export function NewsPulse({ symbol }: { symbol: string }) {
                   >
                     {n.title}
                   </a>
-                  <button
-                    type="button"
-                    onClick={() => void runNewsAi(n.id)}
-                    disabled={aiSumBusy === n.id}
-                    title="Tek cümlelik Türkçe özet üret (öğe başına bir kez, önbellekli)"
-                    className="shrink-0 rounded border border-violet-500/40 bg-violet-500/10 px-1.5 py-0.5 text-[10px] font-bold text-violet-300 transition-colors hover:bg-violet-500/20 disabled:opacity-50"
-                  >
-                    {aiSumBusy === n.id ? "…" : n.aiSummary || aiSums[n.id]?.summaryTr ? "TR ✓" : "TR"}
-                  </button>
+                  {/* Faz 25 (UIX-35): sağlayıcı yoksa ölü TR düğmesi yerine
+                      tek seferlik yönlendirme satırı. */}
+                  {aiUsable ? (
+                    <button
+                      type="button"
+                      onClick={() => void runNewsAi(n.id)}
+                      disabled={aiSumBusy === n.id}
+                      title="Tek cümlelik Türkçe özet üret (öğe başına bir kez, önbellekli)"
+                      className="shrink-0 rounded border border-violet-500/40 bg-violet-500/10 px-1.5 py-0.5 text-[10px] font-bold text-violet-300 transition-colors hover:bg-violet-500/20 disabled:opacity-50"
+                    >
+                      {aiSumBusy === n.id ? "…" : n.aiSummary || aiSums[n.id]?.summaryTr ? "TR ✓" : "ÖZET (TR)"}
+                    </button>
+                  ) : null}
                   <span className="hidden shrink-0 text-[10px] text-slate-400 sm:inline">
                     {n.source} · {fmtTimeShort(n.publishedAt)}
                   </span>
@@ -195,59 +193,11 @@ export function NewsPulse({ symbol }: { symbol: string }) {
               </li>
             ))}
           </ul>
-          <details className="mt-2 rounded-lg border border-border bg-surface p-2">
-            <summary className="cursor-pointer text-[11px] font-semibold text-slate-400 hover:text-slate-200">
-              AI özet sağlayıcısı (isteğe bağlı — anahtar sekmeden çıkmaz)
-            </summary>
-            <div className="mt-2 grid gap-2 sm:grid-cols-2">
-              <label className="block text-[11px] text-slate-400">
-                Sağlayıcı
-                <select
-                  value={provider}
-                  onChange={(e) => setProvider(e.target.value)}
-                  className="mt-1 min-h-9 w-full rounded-md border border-border-strong bg-[#151a24] px-2 text-xs text-slate-200"
-                >
-                  {(providers.length > 0
-                    ? providers
-                    : [{ id: "builtin", label: "Yerleşik (paketlenmedi)" } as AiProvider]
-                  ).map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="block text-[11px] text-slate-400">
-                Model (boş = varsayılan)
-                <input
-                  value={model}
-                  onChange={(e) => setModel(e.target.value)}
-                  placeholder="örn. gpt-4o-mini"
-                  className="mt-1 min-h-9 w-full rounded-md border border-border-strong bg-[#151a24] px-2 text-xs text-slate-200"
-                />
-              </label>
-              <label className="block text-[11px] text-slate-400">
-                API anahtarı (yalnız bu istekte gider)
-                <input
-                  type="password"
-                  value={apiKey}
-                  onChange={(e) => setApiKey(e.target.value)}
-                  placeholder="sk-…"
-                  autoComplete="off"
-                  className="mt-1 min-h-9 w-full rounded-md border border-border-strong bg-[#151a24] px-2 text-xs text-slate-200"
-                />
-              </label>
-              <label className="block text-[11px] text-slate-400">
-                Base URL (boş = varsayılan, Ollama için gerekli)
-                <input
-                  value={baseUrl}
-                  onChange={(e) => setBaseUrl(e.target.value)}
-                  placeholder="http://localhost:11434/v1"
-                  className="mt-1 min-h-9 w-full rounded-md border border-border-strong bg-[#151a24] px-2 text-xs text-slate-200"
-                />
-              </label>
-            </div>
-          </details>
+          {!aiUsable && (
+            <p className="mt-2 text-[10px] text-slate-500">
+              Türkçe özetler için Ayarlar → YZ Sağlayıcısı&apos;ndan bir sağlayıcı seçin.
+            </p>
+          )}
         </>
       )}
     </Panel>

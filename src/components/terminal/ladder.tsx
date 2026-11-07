@@ -11,29 +11,42 @@ import {
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { EmptyState, ScrollTable } from "@/components/terminal/bits";
-import { fmtFrac, fmtPctFrac, kindLabel } from "@/lib/format";
+import { fmtFrac, fmtPctFrac, fracToNum, kindLabel } from "@/lib/format";
 import type { LadderRow } from "@/lib/engine-types";
 
 /**
  * DCA ladder table. currentLevel = engine's next_safety_level:
  * lower levels are already triggered, current is cyan "SIRADAKİ".
  * m20From: first unreachable level (M20 conflict) → rows from there render red.
+ * slPrice (+dir): SL fiyatı biliniyorsa M20-beyaz bayrak yerine ayırt edilir —
+ * SL ötesi seviyeler "SL ALTINDA" nötr gri gösterilir; kırmızı yalnız gerçek
+ * çatışma içindir (UIX-31: varsayılan yüklemede tüm satırların kırmızı duvarı).
  */
 export function LadderTable({
   rows,
   currentLevel,
   m20From,
   kind,
+  slPrice,
+  dir = "long",
+  emptyHint,
 }: {
   rows: LadderRow[];
   currentLevel?: number | null;
   m20From?: number | null;
   kind?: string;
+  slPrice?: number | null;
+  dir?: "long" | "short";
+  emptyHint?: string;
 }) {
   if (!rows || rows.length === 0) {
-    return <EmptyState icon={AlertTriangle} title="Ladder verisi yok" hint="Bu strateji için merdiven üretilmedi." />;
+    return <EmptyState icon={AlertTriangle} title="Ladder verisi yok" hint={emptyHint ?? "Bu strateji için merdiven üretilmedi."} />;
   }
   const hasAvg = rows.some((r) => r.avgAfter !== undefined);
+  const beyondSl = (price: number): boolean => {
+    if (slPrice == null || slPrice <= 0) return false;
+    return dir === "long" ? price < slPrice : price > slPrice;
+  };
   return (
     <ScrollTable>
       <Table>
@@ -51,7 +64,9 @@ export function LadderTable({
         <TableBody>
           {rows.map((r) => {
             const cumDev = r.cumDeviation ?? r.cumDev ?? null;
+            const p = fracToNum(r.price);
             const unreachable = m20From != null && r.level >= m20From;
+            const slBeyond = unreachable && p !== null && beyondSl(p);
             const triggered = currentLevel != null && r.level < currentLevel;
             const isCurrent = currentLevel != null && r.level === currentLevel;
             const isGrid = kind?.includes("GRID");
@@ -61,23 +76,32 @@ export function LadderTable({
                 className={
                   isCurrent
                     ? "border-border bg-cyan-500/10 hover:bg-cyan-500/10"
-                    : unreachable
+                    : unreachable && !slBeyond
                       ? "border-border bg-rose-500/5 hover:bg-rose-500/10"
                       : "border-border hover:bg-surface-2"
                 }
               >
                 <TableCell className="num py-2 text-slate-300">{r.level}</TableCell>
-                <TableCell className="num py-2 text-right text-slate-100">{r.priceDisplay ?? fmtFrac(r.price)}</TableCell>
+                <TableCell className="num py-2 text-right text-slate-100">{fmtFrac(r.price)}</TableCell>
                 <TableCell className="num py-2 text-right text-slate-400">{fmtFrac(r.qty)}</TableCell>
                 <TableCell className="num py-2 text-right text-slate-400">{fmtFrac(r.notional)}</TableCell>
                 <TableCell className="num py-2 text-right text-slate-400">{fmtPctFrac(cumDev)}</TableCell>
                 {hasAvg && (
                   <TableCell className="num py-2 text-right text-slate-300">
-                    {r.avgAfterDisplay ?? (r.avgAfter ? fmtFrac(r.avgAfter) : "—")}
+                    {/* UIX-31: fmtFrac adattivo — l'engine invia avgAfterDisplay a
+                        8 decimali; si mostra alla precisione di lettura (2 per
+                        i prezzi >=1000). */}
+                    {r.avgAfter ? fmtFrac(r.avgAfter) : "—"}
                   </TableCell>
                 )}
                 <TableCell className="py-2 text-right">
-                  {unreachable ? (
+                  {slBeyond ? (
+                    /* UIX-31: SL tetiklenmeden dolmayacak seviye — beklenen durum,
+                       alarm değil; kırmızı yerine nötr gri. */
+                    <Badge variant="outline" className="border-border-strong bg-surface text-[10px] text-slate-400" title="SL bu fiyatın ötesinde — SL tetiklenmeden bu seviye dolmaz (beklenen davranış)">
+                      SL ALTINDA
+                    </Badge>
+                  ) : unreachable ? (
                     <Badge variant="outline" className="border-rose-500/40 bg-rose-500/10 text-[10px] text-rose-400">
                       <AlertTriangle className="mr-1 h-3 w-3" aria-hidden />
                       M20 ULAŞILAMAZ
@@ -122,12 +146,12 @@ export function MeshTable({ rows }: { rows: LadderRow[] }) {
         <TableBody>
           {rows.map((r) => (
             <TableRow key={r.level} className="border-border hover:bg-surface-2">
-              <TableCell className="num py-2 text-slate-300">{r.level}</TableCell>
-              <TableCell className="num py-2 text-right text-slate-100">{r.priceDisplay ?? fmtFrac(r.price)}</TableCell>
-              <TableCell className="num py-2 text-right text-slate-400">{fmtFrac(r.qty)}</TableCell>
-              <TableCell className="num py-2 text-right text-slate-400">{fmtFrac(r.notional)}</TableCell>
-              <TableCell className="py-2 text-right">
-                {r.armed ? (
+                <TableCell className="num py-2 text-slate-300">{r.level}</TableCell>
+                <TableCell className="num py-2 text-right text-slate-100">{fmtFrac(r.price)}</TableCell>
+                <TableCell className="num py-2 text-right text-slate-400">{fmtFrac(r.qty)}</TableCell>
+                <TableCell className="num py-2 text-right text-slate-400">{fmtFrac(r.notional)}</TableCell>
+                <TableCell className="py-2 text-right">
+                  {r.armed ? (
                   <Badge variant="outline" className="border-cyan-500/50 bg-cyan-500/10 text-[10px] text-cyan-300">
                     ARMED
                   </Badge>

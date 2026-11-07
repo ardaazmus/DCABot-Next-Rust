@@ -1057,3 +1057,51 @@ Work Log:
 
 Stage Summary:
 - main.rs ~3170→~2790 satır; routes_calc + routes_backtest bağımsız modüller. Sıradaki: taşınmayan uçların (signals/pine/webhooks/live) aynı yöntemle bölünmesi veya tam e2e'nin bölümler halinde koşulması.
+---
+Task ID: UIX-18..42-FAZ25 (UI/UX gorsel denetim raporu — tum bulgularin uygulanmasi)
+Agent: main (2026-10-30)
+Task: docs/UI_UX_GORSEL_DENETIM_2026-10-30.md raporundaki 25 bulgunun (UIX-18..42) uygulanmasi ve tarayicida gorsel dogrulamasi. Motor/Rust degismedi — tamami UI katmani.
+
+Work Log (bulgu → dosya → cozum):
+- UIX-18 epoch sizmasi → fleet.tsx EntryTriggerNote: "SCHEDULED @ <ms>ms" → "PLANLI: <fmtTs>" (ham deger title'da). Kanit: t12-sched "PLANLI: 01 Kas 2026 02:20:00".
+- UIX-19 SSE gurultusu → dashboard.tsx: "ISLEM-ONEMLI" toggle (default ON; EQUITY + LOG INFO gizli), botId tasiyan olaylara bot adi chipi (nameById), bos durum filtre-farkindalikli.
+- UIX-20 deal metni → studio.tsx: faz-bazli metin (Open/Closing/diger), "invariant" jargonu kaldirildi. Kanit: "Acik deal yok (faz: Cooldown)...".
+- UIX-21 PnL → studio.tsx Genel: "K/Z (GERCEKLESEN)" + "ACIK DEAL PnL" birinci iki kart; renk girisi.
+- UIX-22 → backtest-lab.tsx: haber listesi cikarildi; delisting uyarisi tek tutulan bilgi. Kanit: Lab config→sonuc arasinda haber yok.
+- UIX-23 → YENI hooks/use-ai-config.ts (zustand; provider/model/baseUrl localStorage, anahtar sessionStorage; SSR-safe hydrate) + barrel re-export; Settings'e "YZ Saglayicisi" paneli; news-pulse/studio-hafiza/lab-YZ bu store'u tuketir (4'er alan kaldirildi, tek satir "Saglayici: X · Ayarlar'dan degistirilir").
+- UIX-24 → fleet.tsx GlobalPolicyStrip (tek serit); kartlarda RiskPolicyChip/riskChipsOf silindi; bota ozgu RiskWarningBadge kaldı.
+- UIX-25 → fleet.tsx: arama (bot/sembol), durum filtresi (Tumu/Running/Paused/Frozen/Stopped), kart siralama (varsayilan K/Z buyuklugu — kayip ustte: arda1 ilk kart kaniti).
+- UIX-26 → fleet.tsx: kernelHalted'da StatusPill yerine kirmizi "KERNEL HALT" pill + "yeniden baslatma bekliyor" (kart + tablo).
+- UIX-27 → dashboard.tsx killswitch karti: tek cumle + tek koruma satiri; madde listesi silindi.
+- UIX-28 → page.tsx: sidebar kutusu filo ozeti ("BOT 13/13 AKTIF / tick hatti canli / Koruma: 8 zorunlu kapi"); footer'in iki rozeti tek satir "KORUMA: 8 ZORUNLU KAPI · TAM-RASYONEL MUHASEBE". Health tipine readiness eklendi (opsiyonel).
+- UIX-29 → wizard.tsx: nav chip ✓ = secValid[i] VE oncekilerin hepsi (zincir onest); CTA etiketi duruma gore: "ONCE STRATEJI SEC" / "ONCE SEMBOL SEC" / "BOTU BASLAT".
+- UIX-30 → backtest-lab.tsx aksiyon satiri flex-wrap + min-w (lg:w sabitleri kaldirildi) — 1440px'te overflow yok.
+- UIX-31 → calculator.tsx ("Net TP (ucret sonrasi)", insan dili SL uyari, altbaslik "tam-rasyonel aritmetik") + ladder.tsx: fiyatlar fmtFrac adaktif (priceDisplay/avgAfterDisplay 8-ondalik bypass edildi), slPrice+dir prop ile SL-alti seviyeler notr "SL ALTINDA", kirmizi yalniz gercek catisma.
+- UIX-33 → "Botlarim", "Toplam Kar/Zarar", "KAR/ZARAR", tab "Dolumlar", "GERCEKLESEN (GROSS)", "Likidasyon" (M07 kodu kalkti), "Son Dolumlar (tape · 40)" aynen.
+- UIX-34 → dashboard chgTxt en-US toFixed(2) — ayni kartta virgul/nokta karismasi bitti.
+- UIX-35 → news-pulse: aiUsable saglayici kontrolu; olumsuzsa OZET(TR) dugmeleri gizli + tek yonlendirme satiri.
+- UIX-36 → news-pulse basligi "Borsa Duyurulari"; sagda "{symbol} duyarlilik" chip + Info tooltip (sentiment aciklamasi).
+- UIX-37 → fleet.tsx DeleteBotDialog withLabel prop; kartta "Sil" etiketli, tabloda title'li ikon.
+- UIX-38 → ladder.tsx emptyHint prop; studio faz-farkindali bos durum ("Acik deal yokken merdiven listelenmez...").
+- UIX-39 → dogrulamada tespit: chartLines (AVG/TP/SL/sonraki guvenlik/LIQ) studio.tsx'te ZATEN vardi; audit'te gorunmemesinin nedeni arda1'in acik dealsiz olmasi. Kod degisikligi gerekmedi.
+- UIX-40 → dashboard Maruziyet: "Long $3,230 · %16 / Short $1,841 · %9" + tooltip (acik pozisyon notional / ozkaynaga oran).
+- UIX-41 → dashboard ozkaynak karti: "BTCUSDT 24s -1.37%" — etiket varligi ve niteligi soyler (portfoy getirisi degil) + tooltip.
+- UIX-32/42 → Tahsis karti tek-varlikta stats grid (Acik Deal/Aktif Bot/Long/Short Marj/Tahsis); donut cok-varlikta. Sidebar dev-overlay cakismasi icerik degisimiyle giderildi.
+
+Dogrulama: `tsc --noEmit` EXIT 0 (3 kez), eslint 0 error 0 warning (3 unused-directive --fix ile), tarayici gorsel turu (1440x900): Kokpit/Filo/Studio arda1 (Genel+Ladder)/Hesaplayici/Lab/Ayarlar/Sihirbaz — ustteki kanitlar. Mimosa guvenlik hook'u bir regex ".exec(" yanlis-pozitifini blokladı; String.match esdeger yazimla gecildi (analiz: kalicı False Positive, kod salt formatlama).
+Not: degisiklikler commit'lenmedi (kullanici talebi yok).
+---
+Task ID: FAZ27-DENETIM-UYGULAMA (kapsamli denetim bulgularinin fazlar halinde uygulanmasi)
+Agent: main (2026-11-07)
+Task: docs/KAPSAMLI_DENETIM_2026-11-07.md bulgularinin (I-1, S-1, S-2, O-2, UIX-43, test derinlestirme) uygulanmasi.
+
+Work Log:
+- I-1 Rust portfoy notional kapisi: fleet.rs portfolio_cap_exceeded (rasyonel, nasty-number testli) + portfolio_cap_pct_from_env (default 85, 0=off) + cache deseni. engine.rs: PlaceLimit + PlaceMarket Add emirlerinde kapı; kapanis muaf. KRİTİK DERS: ilk denemede dispatch icinden runtimes.lock().await → GLOBAL deadlock (tokio Mutex reentrant degil) — motor dondu; cache desenine gecildi (venue_live_load ornegi). Canlı kanıt: cap=20 ile audit-cap6 → DB'de WARN PORTFOLIO CAP + faz Idle (emir yerleşmedi); kullanıcı botları etkilenmedi.
+- S-1: npm audit fix → high 6→0 (kalan 8 moderate breaking), runtime 0.
+- O-2: filo kartında "KERNEL'İ SIFIRLA" düğmesi (t9 için).
+- B2: dca_math/src/properties.rs — proptest offline cache'te YOK → sabit-tohumlu LCG deterministic property testler (sıfır dep). 4 GERÇEK bulgu: sub-tick anchor'da sessiz boş plan (H-1), Display rasyonel form (tur from_any_str), kümülatif sapma ≥%100 dürüst Err, ladder honest-truncate. Workspace 295/295.
+- UIX-43: MarginErodeBadge — unrealized/IM erime %; ≥%50 kırmızı "LİKİDASYONA YAKIN (M07)". arda1'de canlı: %56.2 kırmızı.
+- S-2: README §8 tunnel uyarısı (yalnız :3000; health/stream için Cloudflare Access).
+- Temizlik: 7 audit test botu silindi; filo 13/13. Debug eprintln'ler kaldırıldı.
+- Doğrulama: cargo test 295/295 · tsc 0 · eslint 0 · UI 200 · görsel turlar.
+- Açık kalem: e2e bölümlendirme + Playwright smoke (ayrı oturum); 8 moderate npm (breaking).

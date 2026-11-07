@@ -14,6 +14,10 @@ pub mod m16_m18;
 pub mod macro_calendar;
 pub mod sessions;
 
+/// Faz 27 (B2): deterministic property testleri — yalnız test derlemesi.
+#[cfg(test)]
+mod properties;
+
 pub use fraction::{Fraction, MathError, MAX_BITS};
 pub use instrument::{Instrument, MmrBracket};
 pub use m02::{build_dca_plan, qty_down, tick_down, tick_up, DcaLevel, Direction, SizingMode};

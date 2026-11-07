@@ -48,10 +48,10 @@ import {
   VenueChip,
 } from "@/components/terminal/bits";
 import { apiBotAction, apiDeleteBot, apiPatchBot, useBots, useFleetTape } from "@/hooks/use-engine";
-import { fmtFrac, fmtTimeShort, fmtUsdSigned, fracToNum, kindLabel } from "@/lib/format";
+import { fmtFrac, fmtTimeShort, fmtTs, fmtUsd, fmtUsdSigned, fracToNum, kindLabel } from "@/lib/format";
 import { toast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
-import type { Bot as BotRow, UserRiskPolicy } from "@/lib/engine-types";
+import type { Bot as BotRow } from "@/lib/engine-types";
 
 /* Task 16 — compact risk-policy chips for fleet cards/table (max 2). */
 const GUARD_KEYS = [
@@ -64,20 +64,29 @@ const GUARD_KEYS = [
   "grid_fee_breaker",
 ] as const;
 
-function riskChipsOf(b: BotRow): { label: string; warn: boolean }[] {
-  const chips: { label: string; warn: boolean }[] = [];
-  const rp: UserRiskPolicy | undefined = b.riskPolicy;
-  if (rp) {
-    const permissive = GUARD_KEYS.filter((k) => rp[k] === "PERMISSIVE_WITH_WARNING").length;
-    chips.push(
-      permissive > 0
-        ? { label: `${permissive} KORUMA UYARI`, warn: true }
-        : { label: "KORUMA ZORUNLU", warn: false },
-    );
-    if (rp.daily_dd_breaker_pct === "0") chips.push({ label: "DD KESİCİ KAPALI", warn: true });
-    else if (rp.fill_model === "OPTIMISTIC") chips.push({ label: "İYİMSER DOLUM", warn: true });
-  }
-  return chips.slice(0, 2);
+/// Faz 27 (UIX-43): izole marj erimesi rozeti — unrealized / IM oranı.
+/// %50 eşik: M07 likidasyon ~%100 IM erimesinde tetiklendiğinden, erimenin
+/// yarısı "likidasyona yakın" operasyonel uyarıdır (arda1 vakası dersi).
+function MarginErodeBadge({ bot }: { bot: BotRow }) {
+  const im = fracToNum(bot.imUsed) ?? 0;
+  if (!bot.marginMode || im <= 0) return null;
+  const unreal = fracToNum(bot.unrealizedNow) ?? 0;
+  const erode = unreal < 0 ? (-unreal / im) * 100 : 0;
+  const danger = erode >= 50;
+  return (
+    <div
+      className={cn(
+        "num mt-2 rounded-md border px-2 py-1.5 text-[10px] font-semibold",
+        danger
+          ? "border-rose-500/50 bg-rose-500/10 text-rose-300"
+          : "border-border bg-surface text-slate-400",
+      )}
+      title="Açık deal unrealized / komisye marj (IM) — %100 erime M07 likidasyonudur"
+    >
+      MARJ KULLANIMI {fmtUsd(bot.imUsed, 2)} · ERİME %{erode.toFixed(1)}
+      {danger && " — LİKİDASYONA YAKIN (M07)"}
+    </div>
+  );
 }
 
 function RiskWarningBadge({ bot, className }: { bot: BotRow; className?: string }) {
@@ -97,18 +106,23 @@ function RiskWarningBadge({ bot, className }: { bot: BotRow; className?: string 
   );
 }
 
-function RiskPolicyChip({ label, warn }: { label: string; warn: boolean }) {
+/* Faz 25 (UIX-24): "3 KORUMA UYARI" 13 kartın hepsinde aynıydı — bilgi değeri
+   sıfır, sarı alarm yorgunluğu üretiyordu. Politika filo-ortaktır; artık TEK
+   şeritte söylenir, kartta yalnız bota özgü RiskWarningBadge kalır. */
+function GlobalPolicyStrip({ bots }: { bots: BotRow[] }) {
+  const rp = bots[0]?.riskPolicy;
+  if (!rp) return null;
+  const permissive = GUARD_KEYS.filter((k) => rp[k] === "PERMISSIVE_WITH_WARNING").length;
   return (
-    <span
-      className={cn(
-        "inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-semibold",
-        warn
-          ? "border-amber-500/50 bg-amber-500/10 text-amber-300"
-          : "border-border-strong bg-surface text-slate-400",
-      )}
-    >
-      {label}
-    </span>
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-border bg-surface px-3 py-2 text-[11px] text-slate-400" role="note">
+      <span className="font-semibold text-slate-300">Piyasa koruması — tüm filoda aynı politika:</span>
+      <span className="num">
+        {permissive > 0 ? `${permissive} koruma uyarı+izin` : "tüm korumalar ZORUNLU"} · DD kesici{" "}
+        {rp.daily_dd_breaker_pct === "0" ? <span className="text-amber-400">KAPALI</span> : `%${rp.daily_dd_breaker_pct}`} · dolum{" "}
+        {rp.fill_model === "REALISTIC" ? "GERÇEKÇİ" : "İYİMSER"}
+      </span>
+      <span className="text-slate-500">bota özgü ayrıntı: İncele → Genel</span>
+    </div>
   );
 }
 
@@ -129,10 +143,16 @@ function BotIdentityBadges({ bot }: { bot: BotRow }) {
 function EntryTriggerNote({ bot, compact }: { bot: BotRow; compact?: boolean }) {
   const t = bot.stats.entry_trigger;
   if (!t || t === "INSTANT") return null;
+  /* Faz 25 (UIX-18): motor "SCHEDULED @ 1793488800000ms" diye ham epoch
+     basıyordu — insan tarihine çevrilir; ham değer title'da kalır.
+     (String.match — salt biçimlendirme, hiçbir kabuk/komut çağrısı yok.) */
+  const sched = t.trim().match(/^(SCHEDULED|SIGNAL)\s*@\s*(\d+)ms$/);
+  const shown = sched ? `${sched[1] === "SCHEDULED" ? "PLANLI" : "SİNYAL"}: ${fmtTs(Number(sched[2]))}` : t;
+  const rawTitle = sched ? `Ham değer: ${t}` : undefined;
   if (compact) {
     return (
-      <div className={cn("num mt-1 text-[10px] font-semibold", bot.stats.entry_trigger_met ? "text-emerald-400" : "text-amber-400")}>
-        {t}
+      <div className={cn("num mt-1 text-[10px] font-semibold", bot.stats.entry_trigger_met ? "text-emerald-400" : "text-amber-400")} title={rawTitle}>
+        {shown}
         {!bot.stats.entry_trigger_met && " · bekliyor"}
       </div>
     );
@@ -145,20 +165,25 @@ function EntryTriggerNote({ bot, compact }: { bot: BotRow; compact?: boolean }) 
           ? "border-emerald-500/40 bg-emerald-500/5 text-emerald-300"
           : "border-amber-500/40 bg-amber-500/5 text-amber-300",
       )}
+      title={rawTitle}
     >
       <Clock className="h-3 w-3 shrink-0" aria-hidden />
-      <span className="num truncate">BAŞLANGIÇ: {t}</span>
+      <span className="num truncate">BAŞLANGIÇ: {shown}</span>
       {!bot.stats.entry_trigger_met && <span className="ml-auto shrink-0">KOŞUL BEKLİYOR</span>}
     </div>
   );
 }
 
-function DeleteBotDialog({ bot, onRemove, triggerClassName, disabled }: { bot: BotRow; onRemove: (b: BotRow) => void; triggerClassName: string; disabled?: boolean }) {
+function DeleteBotDialog({ bot, onRemove, triggerClassName, disabled, withLabel = false }: { bot: BotRow; onRemove: (b: BotRow) => void; triggerClassName: string; disabled?: boolean; withLabel?: boolean }) {
   return (
     <AlertDialog>
       <AlertDialogTrigger asChild>
-        <Button size="sm" variant="outline" className={triggerClassName} disabled={disabled}>
+        {/* Faz 25 (UIX-37): "Kapat" (deal kapatma) ile "Sil" (bot+geçmiş) en
+            kritik yıkıcı ayırtım — sil düğmesi kartta etiketli, tabloda
+            başlıklı ikon. */}
+        <Button size="sm" variant="outline" className={triggerClassName} disabled={disabled} title="Botu ve geçmişini kalıcı sil">
           <Trash2 className="h-3.5 w-3.5" aria-hidden />
+          {withLabel && "Sil"}
         </Button>
       </AlertDialogTrigger>
       <AlertDialogContent className="border-border-strong bg-[#151a24]">
@@ -181,6 +206,41 @@ function DeleteBotDialog({ bot, onRemove, triggerClassName, disabled }: { bot: B
             }}
           >
             Sil
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
+function CloseAllDialog({ bot, onClose, triggerClassName, disabled }: { bot: import("@/lib/engine-types").Bot; onClose: (b: import("@/lib/engine-types").Bot) => void; triggerClassName: string; disabled?: boolean }) {
+  return (
+    <AlertDialog>
+      <AlertDialogTrigger asChild>
+        <Button size="sm" variant="outline" className={triggerClassName} disabled={disabled} title="Tüm açık emirleri iptal et ve pozisyonu kapat">
+          <XCircle className="h-3.5 w-3.5" aria-hidden />
+          Kapat
+        </Button>
+      </AlertDialogTrigger>
+      <AlertDialogContent className="border-border-strong bg-[#151a24]">
+        <AlertDialogHeader>
+          <AlertDialogTitle className="text-slate-100">Tüm emirleri kapat?</AlertDialogTitle>
+          <AlertDialogDescription className="text-slate-400">
+            <span className="font-semibold text-slate-200">{bot.name}</span> ({kindLabel(bot.kind)} · {bot.symbol}) için tüm açık limit emirleri iptal edilecek ve pozisyon pazarda kapatılmaya çalışılacak. Bu işlem geri alınamaz.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel className="border-border-strong bg-transparent text-slate-300 hover:bg-secondary hover:text-slate-100">
+            Vazgeç
+          </AlertDialogCancel>
+          <AlertDialogAction
+            className="bg-rose-500 text-white hover:bg-rose-600"
+            onClick={(e) => {
+              e.preventDefault();
+              void onClose(bot);
+            }}
+          >
+            Onayla ve Kapat
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
@@ -231,9 +291,40 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
   const { bots, loading, refetch } = useBots();
   const [view, setView] = useState<"cards" | "table">("cards");
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [closeAllDialogId, setCloseAllDialogId] = useState<string | null>(null);
   const [hedgeOnly, setHedgeOnly] = useState(false);
+  /* Faz 25 (UIX-25): filo arama + durum filtresi + kart sıralaması.
+     Varsayılan sıra = K/Z büyüklüğü (kayıp/kâr en büyük en üstte) —
+     sektör standardı (Bitsgap/3Commas) ve en büyük kayıp listede gömülü kalmasın. */
+  const [query, setQuery] = useState("");
+  const [statusF, setStatusF] = useState<"ALL" | "RUNNING" | "PAUSED" | "FROZEN" | "STOPPED">("ALL");
+  const [cardSort, setCardSort] = useState<"impact" | "pnl-asc" | "pnl-desc" | "name" | "symbol">("impact");
   const hedgeCount = bots.filter((b) => HEDGE_KINDS.has(b.kind)).length;
-  const shown = hedgeOnly ? bots.filter((b) => HEDGE_KINDS.has(b.kind)) : bots;
+  const shown = useMemo(() => {
+    const q = query.trim().toLocaleLowerCase("tr");
+    let list = bots;
+    if (hedgeOnly) list = list.filter((b) => HEDGE_KINDS.has(b.kind));
+    if (statusF !== "ALL") list = list.filter((b) => b.status === statusF);
+    if (q) list = list.filter((b) => b.name.toLocaleLowerCase("tr").includes(q) || b.symbol.toLocaleLowerCase("tr").includes(q));
+    if (view === "cards") {
+      const pnl = (b: BotRow) => fracToNum(b.stats.realized_gross) ?? 0;
+      list = [...list].sort((a, b) => {
+        switch (cardSort) {
+          case "impact":
+            return Math.abs(pnl(b)) - Math.abs(pnl(a));
+          case "pnl-asc":
+            return pnl(a) - pnl(b);
+          case "pnl-desc":
+            return pnl(b) - pnl(a);
+          case "name":
+            return a.name.localeCompare(b.name, "tr");
+          case "symbol":
+            return a.symbol.localeCompare(b.symbol, "tr") || a.name.localeCompare(b.name, "tr");
+        }
+      });
+    }
+    return list;
+  }, [bots, hedgeOnly, statusF, query, view, cardSort]);
   /* P7 — tablo sıralaması (aria-sort). Kart görünümü etkilenmez. */
   const [sortKey, setSortKey] = useState<"name" | "status" | "pnl" | null>(null);
   const [sortDir, setSortDir] = useState<1 | -1>(1);
@@ -312,11 +403,17 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
       toast({ title: `${b.name}`, description: action === "FREEZE" ? "Donduruldu — yeni emir üretilmez, açıklar korunur." : "Çözüldü → RUNNING" });
     });
 
-  const closeAll = (b: BotRow) =>
-    withBusy(b.id, async () => {
+  const closeAll = (b: BotRow) => {
+    setCloseAllDialogId(b.id);
+  };
+
+  const executeCloseAll = async (b: BotRow) => {
+    setCloseAllDialogId(null);
+    await withBusy(b.id, async () => {
       await apiBotAction(b.id, "CLOSE_ALL");
-      toast({ title: `${b.name}`, description: "CLOSE_ALL emri gönderildi." });
+      toast({ title: `${b.name}`, description: "CLOSE_ALL emri gönderildi — açık emirler iptal ediliyor, pozisyon kapatılıyor." });
     });
+  };
 
   const remove = (b: BotRow) =>
     withBusy(b.id, async () => {
@@ -327,10 +424,43 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
   return (
     <div className="space-y-4">
       <Panel
-        title={`Bot Filosu (${shown.length}${hedgeOnly ? ` hedge · toplam ${bots.length}` : ""})`}
+        title={`Bot Filosu (${shown.length}${shown.length !== bots.length ? ` / ${bots.length}` : ""})`}
         icon={<Bot className="h-4 w-4 text-slate-500" aria-hidden />}
         right={
-          <div className="flex items-center gap-1.5">
+          <div className="flex flex-wrap items-center justify-end gap-1.5">
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Ara: bot / sembol"
+              aria-label="Filo arama (bot adı veya sembol)"
+              className="h-9 w-36 rounded-lg border border-border-strong bg-surface px-2.5 font-mono text-[11px] text-slate-200 placeholder:text-slate-500 focus:outline-none focus:ring-1 focus:ring-emerald-500/40"
+            />
+            <select
+              value={statusF}
+              onChange={(e) => setStatusF(e.target.value as typeof statusF)}
+              aria-label="Durum filtresi"
+              className="h-9 rounded-lg border border-border-strong bg-surface px-2 text-[11px] font-semibold text-slate-300"
+            >
+              <option value="ALL">Durum: Tümü</option>
+              <option value="RUNNING">Running</option>
+              <option value="PAUSED">Paused</option>
+              <option value="FROZEN">Frozen</option>
+              <option value="STOPPED">Stopped</option>
+            </select>
+            {view === "cards" && (
+              <select
+                value={cardSort}
+                onChange={(e) => setCardSort(e.target.value as typeof cardSort)}
+                aria-label="Kart sıralaması"
+                className="h-9 rounded-lg border border-border-strong bg-surface px-2 text-[11px] font-semibold text-slate-300"
+              >
+                <option value="impact">Sırala: K/Z büyüklüğü</option>
+                <option value="pnl-desc">K/Z: kâr → zarar</option>
+                <option value="pnl-asc">K/Z: zarar → kâr</option>
+                <option value="name">Ad (A-Z)</option>
+                <option value="symbol">Sembol</option>
+              </select>
+            )}
             <button
               aria-pressed={hedgeOnly}
               title="Yalnız hedge botları göster (HEDGE_PROTECTIVE + HEDGE_DUAL)"
@@ -376,14 +506,17 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
             title="Filo boş"
             hint="Yeni Bot sihirbazından ilk stratejinizi kurun — DCA, Grid, Infinity veya Hedge."
           />
-        ) : hedgeOnly && shown.length === 0 ? (
+        ) : shown.length === 0 ? (
           <EmptyState
             icon={Bot}
-            title="Hedge botu yok"
-            hint="Hedge filtresini kapatın ya da sihirbazdan HEDGE_PROTECTIVE / HEDGE_DUAL botu kurun."
+            title="Eşleşen bot yok"
+            hint="Arama, durum filtresi veya Hedge çipini gevşetin."
           />
-        ) : view === "cards" ? (
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+        ) : (
+          <>
+            <GlobalPolicyStrip bots={bots} />
+            {view === "cards" ? (
+            <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
             {shown.map((b, i) => (
               <motion.div
                 key={b.id}
@@ -398,21 +531,25 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
                     <div className="mt-1 flex flex-wrap items-center gap-1.5">
                       <BotIdentityBadges bot={b} />
                       <RiskWarningBadge bot={b} />
-                      {riskChipsOf(b).map((c) => (
-                        <RiskPolicyChip key={c.label} label={c.label} warn={c.warn} />
-                      ))}
                     </div>
                   </div>
-                  <StatusPill status={b.status} />
-                  {/* Faz 21 (N-8): kernel halt filoda GÖRÜNÜR — sessiz duran
-                      bot artık kırmızı rozetle işaretlenir. */}
-                  {b.kernelHalted && (
-                    <span
-                      className="rounded border border-rose-500/60 bg-rose-500/10 px-2 py-0.5 text-[10px] font-bold tracking-wider text-rose-400"
-                      title={b.kernelHaltedReason || "Kernel kalıcı halt — RESET_KERNEL ile açılır"}
-                    >
-                      KERNEL HALT
-                    </span>
+                  {/* Faz 25 (UIX-26): KERNEL HALT birincil durumdur — RUNNING
+                      (yeşil) ile birlikte göstermek çelişkiydi. HALT varken
+                      durum rozeti HALT olur, RUNNING alt notta kalır. */}
+                  {b.kernelHalted ? (
+                    <div className="flex shrink-0 flex-col items-end gap-0.5">
+                      <span
+                        className="rounded border border-rose-500/60 bg-rose-500/10 px-2 py-0.5 text-[10px] font-bold tracking-wider text-rose-400"
+                        title={b.kernelHaltedReason || "Kernel kalıcı halt — RESET_KERNEL ile açılır"}
+                      >
+                        KERNEL HALT
+                      </span>
+                      <span className="text-[9px] font-semibold tracking-wide text-slate-500" title="Yürütücü durdu; sıfırlanana kadar emir üretilmez">
+                        yeniden başlatma bekliyor
+                      </span>
+                    </div>
+                  ) : (
+                    <StatusPill status={b.status} />
                   )}
                 </div>
 
@@ -444,7 +581,7 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
                     </div>
                   </div>
                   <div>
-                    <span className="text-slate-500">KÂR/ZARAR · PROFIT</span>
+                    <span className="text-slate-500">KÂR/ZARAR</span>
                     <div
                       className={cn(
                         "font-semibold",
@@ -456,7 +593,33 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
                   </div>
                 </div>
 
+                {/* Faz 25 (UIX-43) / Faz 27: kaldıraçlı botta marj erimesi
+                    vurgusu — izole marjda M07 likidasyonu ~%100 IM erimesi;
+                    %50 eşiği aşan kartta kırmızı uyarı (arda1 vakası dersi). */}
+                <MarginErodeBadge bot={b} />
+
                 <div className="mt-3 flex flex-wrap gap-1.5 border-t border-border pt-3">
+                  {/* Faz 27 (O-2): KERNEL HALT kurtarması yalnız Studio'da
+                      değildi — filo kartında tek tık; sticky-halt bekleyen bot
+                      için operasyon yükünü düşürür. */}
+                  {b.kernelHalted && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="min-h-9 flex-1 border-rose-500/60 text-rose-300 hover:bg-rose-500/10"
+                      disabled={busyId === b.id}
+                      title={b.kernelHaltedReason || "Kernel kalıcı halt — sıfırlanınca bot sonraki kapalı bardan warmup ile devam eder"}
+                      onClick={() =>
+                        void withBusy(b.id, async () => {
+                          await apiBotAction(b.id, "RESET_KERNEL");
+                          toast({ title: `${b.name} kernel sıfırlandı`, description: "Bir sonraki kapalı bardan warmup ile devam eder." });
+                        })
+                      }
+                    >
+                      <Play className="h-3.5 w-3.5" aria-hidden />
+                      KERNEL&apos;İ SIFIRLA
+                    </Button>
+                  )}
                   <Button size="sm" className="min-h-9 flex-1 bg-emerald-500/90 text-[#04150e] hover:bg-emerald-500" onClick={() => onInspect(b.id)}>
                     <Eye className="h-3.5 w-3.5" aria-hidden />
                     İncele
@@ -525,28 +688,25 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
                       Dondur
                     </Button>
                   ) : null}
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="min-h-9 border-border-strong text-slate-300 hover:bg-secondary"
-                    disabled={busyId === b.id}
-                    onClick={() => void closeAll(b)}
-                  >
-                    <XCircle className="h-3.5 w-3.5" aria-hidden />
-                    Kapat
-                  </Button>
+                  <CloseAllDialog
+                    bot={b}
+                    onClose={executeCloseAll}
+                    disabled={busyId === b.id || closeAllDialogId !== null && closeAllDialogId !== b.id}
+                    triggerClassName="min-h-9 border-border-strong text-slate-300 hover:bg-secondary"
+                  />
                   <DeleteBotDialog
                     bot={b}
                     onRemove={remove}
                     disabled={busyId === b.id}
+                    withLabel
                     triggerClassName="min-h-9 border-rose-500/30 text-rose-400 hover:bg-rose-500/10"
                   />
                 </div>
               </motion.div>
             ))}
           </div>
-        ) : (
-          <div className="thin-scroll max-h-[32rem] overflow-y-auto rounded-lg border border-border">
+            ) : (
+              <div className="thin-scroll max-h-[32rem] overflow-y-auto rounded-lg border border-border">
             <Table>
               <TableHeader className="sticky top-0 z-10 bg-surface">
                 <TableRow className="hover:bg-transparent border-border">
@@ -575,18 +735,22 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
                       <BotIdentityBadges bot={b} />
                     </TableCell>
                     <TableCell className="py-2">
-                      <StatusPill status={b.status} />
+                      {/* UIX-26: HALT birincil — RUNNING'e yeşil rozetle eşitlenmez */}
+                      {b.kernelHalted ? (
+                        <span
+                          className="inline-flex rounded border border-rose-500/60 bg-rose-500/10 px-2 py-0.5 text-[10px] font-bold tracking-wider text-rose-400"
+                          title={b.kernelHaltedReason || "Kernel kalıcı halt — RESET_KERNEL ile açılır"}
+                        >
+                          KERNEL HALT
+                        </span>
+                      ) : (
+                        <StatusPill status={b.status} />
+                      )}
                       <EntryTriggerNote bot={b} compact />
                     </TableCell>
                     <TableCell className="py-2">
                       {(b.warnings?.length ?? 0) > 0 ? (
                         <RiskWarningBadge bot={b} />
-                      ) : riskChipsOf(b).length > 0 ? (
-                        <div className="flex flex-wrap gap-1">
-                          {riskChipsOf(b).map((c) => (
-                            <RiskPolicyChip key={c.label} label={c.label} warn={c.warn} />
-                          ))}
-                        </div>
                       ) : (
                         <span className="text-[10px] text-slate-400">—</span>
                       )}
@@ -610,15 +774,12 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
                         <Button size="sm" variant="outline" className="min-h-8 border-border-strong px-2 text-slate-300 hover:bg-secondary" onClick={() => onInspect(b.id)}>
                           <Eye className="h-3.5 w-3.5" aria-hidden />
                         </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          className="min-h-8 border-border-strong px-2 text-slate-300 hover:bg-secondary"
-                          disabled={busyId === b.id}
-                          onClick={() => void closeAll(b)}
-                        >
-                          <XCircle className="h-3.5 w-3.5" aria-hidden />
-                        </Button>
+                        <CloseAllDialog
+                          bot={b}
+                          onClose={executeCloseAll}
+                          disabled={busyId === b.id || closeAllDialogId !== null && closeAllDialogId !== b.id}
+                          triggerClassName="min-h-8 border-border-strong px-2 text-slate-300 hover:bg-secondary"
+                        />
                         <DeleteBotDialog
                           bot={b}
                           onRemove={remove}
@@ -631,7 +792,9 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
                 ))}
               </TableBody>
             </Table>
-          </div>
+              </div>
+            )}
+          </>
         )}
       </Panel>
 

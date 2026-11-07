@@ -1251,6 +1251,36 @@ pub async fn dispatch_action(
             // aynı kapanış muafiyetleri (GATE6 yok, reduce_only, positionIdx
             // bacak yönü) TP için de geçerlidir.
             let is_close = role == "GRID_CLOSE" || role == "TP";
+            // Faz 27 (İ-1): portföy-düzeyi max-total-notional kapısı — yalnız
+            // Add emirleri (BASE/SAFETY/hedge açılış). Kapanış emirleri muaf:
+            // kapanış notional'i DÜŞÜRÜR, çıkış yolu hep açık kalmalı.
+            if !is_close {
+                let cap = crate::fleet::portfolio_cap_pct_from_env(
+                    std::env::var("DCA_PORTFOLIO_MAX_NOTIONAL_PCT").ok().as_deref(),
+                );
+                if cap > 0 {
+                    // Kilit-siz cache okuması — runtimes kilidi bu noktada
+                    // ZATEN çağırıcıda; tekrar istemek deadlock üretir.
+                    let Some((nav, gross)) = crate::fleet::portfolio_cache_read(app, 30_000) else {
+                        return Ok(()); // taze değil: kapı bu turu atlar (fail-open)
+                    };
+                    let candidate = price.mul(&qty).unwrap_or_else(|_| Fraction::zero());
+                    if crate::fleet::portfolio_cap_exceeded(&gross, &candidate, &nav, cap) {
+                        let msg = format!(
+                            "PORTFOLIO CAP: {} emri yerlestirilmedi — acik brut notional + aday {} NAV'in %{} sinirini asar (su anki brut/NAV agirligi asildi). Emir yok; seviye sonraki barda yeniden degerlendirilir. Esigi yukseltmek icin DCA_PORTFOLIO_MAX_NOTIONAL_PCT.",
+                            role,
+                            candidate,
+                            cap
+                        );
+                        crate::state::persist_event(app, &rt.bot_id, "WARN", "", &msg).await;
+                        let _ = sse.send(SseEvent {
+                            event: "LOG".into(),
+                            data: json!({"botId": rt.bot_id, "level": "WARN", "message": msg, "ts": ts}).to_string(),
+                        });
+                        return Ok(());
+                    }
+                }
+            }
             match rt.mode.as_str() {
                 "PAPER" => {
                     // Faz 13B: hedge-prefix'li emirler hedge bacak stepper'ına.
@@ -1324,6 +1354,45 @@ pub async fn dispatch_action(
         }
         Action::PlaceMarket { id, side, qty, role, quote_notional } => {
             let kind = if matches!(role, "TP" | "SL" | "MANUAL" | "TRAIL") { OrderKind::Reduce } else { OrderKind::Add };
+            // Faz 27 (İ-1): portföy kapısı — PlaceMarket Add emirleri (BASE,
+            // hedge açılış). Reduce rolleri (TP/SL/MANUAL/TRAIL) muaf.
+            // Aday notional: quote_notional (QUOTE_NOTIONAL boyutlama) yoksa
+            // mark × qty ile yaklaşık son kapanıştan ölçülür.
+            if kind == OrderKind::Add {
+                let cap = crate::fleet::portfolio_cap_pct_from_env(
+                    std::env::var("DCA_PORTFOLIO_MAX_NOTIONAL_PCT").ok().as_deref(),
+                );
+                if cap > 0 {
+                    // Kilit-siz cache okuması (PlaceLimit kolu ile aynı desen).
+                    let Some((nav, gross)) = crate::fleet::portfolio_cache_read(app, 30_000) else {
+                        return Ok(()); // taze değil: kapı bu turu atlar (fail-open)
+                    };
+                    let candidate = match &quote_notional {
+                        Some(q) => q.clone(),
+                        None => rt
+                            .stepper
+                            .last_close
+                            .as_deref()
+                            .and_then(|s| Fraction::from_any_str(s).ok())
+                            .and_then(|mark| mark.mul(&qty).ok())
+                            .unwrap_or_else(Fraction::zero),
+                    };
+                    if crate::fleet::portfolio_cap_exceeded(&gross, &candidate, &nav, cap) {
+                        let msg = format!(
+                            "PORTFOLIO CAP: {} emri yerlestirilmedi — acik brut notional + aday {} NAV'in %{} sinirini asar. Emir yok; seviye sonraki barda yeniden degerlendirilir. Esigi yukseltmek icin DCA_PORTFOLIO_MAX_NOTIONAL_PCT.",
+                            role,
+                            candidate,
+                            cap
+                        );
+                        crate::state::persist_event(app, &rt.bot_id, "WARN", "", &msg).await;
+                        let _ = sse.send(SseEvent {
+                            event: "LOG".into(),
+                            data: json!({"botId": rt.bot_id, "level": "WARN", "message": msg, "ts": ts}).to_string(),
+                        });
+                        return Ok(());
+                    }
+                }
+            }
             match rt.mode.as_str() {
                 "PAPER" => {
                     // Faz 13B: hedge-prefix'li emirler hedge bacak stepper'ına.
@@ -1679,6 +1748,9 @@ async fn poll_inner(
             }
         }
         *app.venue_live_load.lock().await = loads;
+        // Faz 27 (İ-1): portföy kapısı anlık görüntüsü — aynı kilit altında
+        // hesaplanır, dispatch'teki kapı ayrı std kilitten okur (deadlock yok).
+        crate::fleet::refresh_portfolio_cache(app, &rts);
     }
 
     // ---------------- H-1 FAZ 1: kısa kilit — bağlam kopyası ----------------
