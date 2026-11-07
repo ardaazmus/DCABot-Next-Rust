@@ -827,12 +827,10 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
         </TabsContent>
 
         {/* ---------- Backtest ---------- */}
-        <TabsContent value="backtest" className="mt-4 space-y-3">          {isHedge && (
-            <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-300">
-              Motor backtest'i Hedge ailesini desteklemiyor (<code className="font-mono">DcaEngine requires DCA_LONG/DCA_SHORT/FUTURES_DCA</code> → 422).
-              Hedge stratejisini PAPER modda küçük sermayeyle canlı test edin; backtest sonucu üretilemez.
-            </div>
-          )}
+        <TabsContent value="backtest" className="mt-4 space-y-3">
+          {/* Faz 28: eski "hedge backtest 422" uyarisi kaldirildi — motor
+              hedge ailesini de gercek barlarla kosturuyor (canli dogrulandi:
+              HEDGE_DUAL/HEDGE_PROTECTIVE 200 + fills). */}
           {/* Task 18 S5: konfigürasyon kaynağı motor örneği/sihirbaz hint'i değilse
              dürüstçe söyle — sessiz varsayılanlarla koşan backtest yanıltıcı olur. */}
           {!(bot.config ?? configHint) && (

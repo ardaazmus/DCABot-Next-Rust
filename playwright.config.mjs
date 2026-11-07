@@ -5,7 +5,9 @@ import { defineConfig } from "@playwright/test";
 export default defineConfig({
   testDir: "./tests",
   testMatch: "playwright-smoke.mjs",
-  timeout: 45_000,
+  // Dev sunucusu ilk istekte sayfayi yeniden derler (sandbox cpus:1 → ~60sn);
+  // timeout bunu kapsamali.
+  timeout: 150_000,
   retries: 0,
   workers: 1,
   use: {

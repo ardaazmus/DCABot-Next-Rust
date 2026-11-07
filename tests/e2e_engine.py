@@ -21,6 +21,11 @@ Verified contract (from crates/dca_server/src/main.rs):
   POST /api/vault/keys {venue,label,api_key,api_secret} -> 422 on invalid key
   GET  /api/stream                  (SSE)
 """
+# Faz 28 (B) durum notu — test piramidi segmentasyonu:
+#   HIZLI (CI/commit oncesi): tests/engine_contract.mjs (auth/gate/lifecycle/proxy, ~5 sn)
+#   ORTA: tests/bot-matrix.mjs (backtest matrisi 8 kind + pine + signal) · tests/playwright-smoke.mjs (5 ekran UI)
+#   BU DOSYA: GECELIK DERIN sut (T1-T21; 600+ sn) — hizli sozlesme yollarini
+#   engine_contract.mjs devraldi; burasi tam kapsamli gece dogrulamasi olarak kalir.
 import json
 import os
 import pathlib

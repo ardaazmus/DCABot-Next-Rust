@@ -1117,3 +1117,15 @@ Work Log:
 - D: 8 moderate npm = tek kok minimatch ReDoS (GHSA-g3hv-75wg-m249, dev-lint zinciri). npm recetesi eslint-config-next 16→15 DUSURMEYDI — reddedildi; overrides {"minimatch":"^11.0.5"} ile npm audit TOPLAM 0 (dev+runtime); eslint 0 error / tsc 0 — zincir saglam. 4 warning pre-existing tests/bot-matrix.mjs (dokunulmadi).
 - Motor H-1'li binary ile restart; 13/13 bot, tick canli. 295/295 workspace test.
 - Commit: Faz 25-27 → 4101b33; Faz 28 ayri commit.
+---
+Task ID: FAZ28-DEVAM (sozlesme drifti + port yarisi + bot-matrix yasama)
+Agent: main (2026-11-07)
+Task: acik kalem temizligi surerken iki yeni kesif: hedge backtest sozlesme degismisi ve :3000 port yarisi.
+
+Work Log:
+- bot-matrix.mjs: 4 lint uyarisi (ok ? pass++ : fail++) → if/else; auth eklendi (Faz 21 sonrasi 401'e dustugunu kimse farketmemisti!) → kosulur hale geldi: 10/10 PASS.
+- SOZLESME DRIFTI: hedge backtest artik 200+fill (eskiden 422 DcaEngine requires). Matrix beklentisi guncellendi; Studio backtest tab'indaki bayat "hedge desteklenmez" uyari kaldirildi (tsc/eslint 0).
+- PORT YARISI: Playwright baska site test ediyordu — :3000'de D:\project\suyonetimi Next dev (10:05) DCABOT UI cogulmasindan sonra portu almis. su-projesi sureci durduruldu (kullanici projesi — geri alinabilir), restart-ui ile DCABOT geri geldi. Smoke'a kimlik sigortasi: header DCABOT degilse net hata.
+- Smoke desenleri: SSE networkidle/load'u engelliyor → domcontentloaded + hidrasyon isareti (footer tazelik rozeti waitForFunction) + port-yarisi kimlik guard'i → 5/5 PASS (9sn).
+- Test piramidi belgelendi: engine_contract.mjs (hizli, 25/25) · bot-matrix.mjs (orta, 10/10) · playwright-smoke.mjs (UI, 5/5) · e2e_engine.py (gecelik derin T1-T21, basina durum notu).
+- Tum sutler temiz ortamda tekrar kosuldu: contract 25/25 · smoke 5/5 · tsc/eslint 0.

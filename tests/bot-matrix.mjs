@@ -6,13 +6,28 @@
 // desteklemez — sozlesme 422'dir, matriks bunu kilitler.
 const BASE = process.env.BASE_URL || "http://127.0.0.1:3002";
 
+// Faz 28: motor auth duvari (Faz 21) sonrasi anahtar zorunlu — .local-runtime
+// keys dosyasindan okunur; script disina asla yazilmaz.
+import { readFileSync } from "node:fs";
+const KEY = (readFileSync(new URL("../.local-runtime/local-keys.env", import.meta.url), "utf8"))
+  .split(String.fromCharCode(10))
+  .find((l) => l.startsWith("DCA_API_KEY="))
+  ?.trim()
+  .split("=")
+  .slice(1)
+  .join("=");
+if (!KEY) {
+  console.error("HATA: DCA_API_KEY bulunamadi — once npm run local:start");
+  process.exit(2);
+}
+
 async function req(method, path, body, timeoutMs = 300000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const r = await fetch(`${BASE}${path}`, {
       method,
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${KEY}` },
       body: body ? JSON.stringify(body) : undefined,
       signal: ctrl.signal,
     });
@@ -66,20 +81,21 @@ for (const [kind, over] of MATRIX) {
   const m = j.metrics || {};
   const traded = Number(m.deals) >= 1 || Number(j.fills) >= 1;
   const ok = s === 200 && traded;
-  ok ? pass++ : fail++;
+  if (ok) { pass += 1; } else { fail += 1; }
   console.log(`[${ok ? "PASS" : "FAIL"}] ${kind}: status=${s} deals=${m.deals} fills=${j.fills} return=${m.total_return_pct} mdd=${m.max_drawdown_pct} win=${m.win_rate_pct} fees=${m.total_fees} funding=${m.total_funding ?? "-"}`);
 }
 
-// Hedge ailesi: motor backtest'i desteklemez — sozlesme 422'dir.
+// Hedge ailesi: Faz 28 dogrulamasi — motor artik hedge backtest'i DE
+// destekliyor (200 + fill; eski sozlesme 422'ydi, kaldirildi).
 for (const kind of ["HEDGE_DUAL", "HEDGE_PROTECTIVE"]) {
   const cfg = fullConfig(kind, {});
   const [s, j] = await req("POST", "/api/backtest", {
-    kind, symbol: "BTCUSDT", interval: "1h", bars: 50,
+    kind, symbol: "BTCUSDT", interval: "1h", bars: 60,
     start_cash: "10000", config: cfg,
   });
-  const ok = s === 422 && /DcaEngine requires/.test(String(j.error || ""));
-  ok ? pass++ : fail++;
-  console.log(`[${ok ? "PASS" : "FAIL"}] ${kind}: status=${s} (beklenen: 422 DcaEngine requires…)`);
+  const ok = s === 200 && (Number(j.fills) >= 1 || Number(j.metrics?.deals) >= 1);
+  if (ok) { pass += 1; } else { fail += 1; }
+  console.log(`[${ok ? "PASS" : "FAIL"}] ${kind}: status=${s} fills=${j.fills} deals=${j.metrics?.deals}`);
 }
 
 // Pine: yeni Trend Surus sablonu gercek barlarda kosuyor mu?
@@ -99,7 +115,7 @@ strategy.exit("Trail", stop=close - stopMult * atr)
   const [s, j] = await req("POST", "/api/pine/backtest",
     { code: TREND, symbol: "BTCUSDT", interval: "1h", bars: 200 });
   const ok = s === 200 && j.ok === true && Number(j.entries) >= 1;
-  ok ? pass++ : fail++;
+  if (ok) { pass += 1; } else { fail += 1; }
   console.log(`[${ok ? "PASS" : "FAIL"}] PINE TrendSurus: status=${s} entries=${j.entries} deals=${j.metrics?.deals}`);
 }
 
@@ -113,7 +129,7 @@ strategy.exit("Trail", stop=close - stopMult * atr)
     start_cash: "10000", config: cfg,
   });
   const ok = s === 200 && Number(j.metrics?.deals) >= 1;
-  ok ? pass++ : fail++;
+  if (ok) { pass += 1; } else { fail += 1; }
   console.log(`[${ok ? "PASS" : "FAIL"}] SIGNAL RSI-Dip: status=${s} deals=${j.metrics?.deals}`);
 }
 

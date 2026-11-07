@@ -10,10 +10,35 @@ import { test, expect } from "@playwright/test";
 
 const BASE = "http://127.0.0.1:3000";
 
+/** React hidrasyonu için kısa bekleme — SSE kalıcı bağlantısı
+ * networkidle'ı engellediğinden load + sabit gecikme kullanılır. */
+async function gotoApp(page, path = "/") {
+  // SSE kalıcı bağlantısı "load"/networkidle'ı engelleyebilir; DOMContentLoaded
+  // + hidrasyon işareti (client-side tazelik rozeti) beklenir.
+  await page.goto(BASE + path, { waitUntil: "domcontentloaded", timeout: 120_000 });
+  // Kimlik sigortası: :3000'i başka bir uygulama kapmışsa (port yarışı)
+  // testler yanlış siteye karşı koşmasın — net hata ver.
+  await page.waitForFunction(
+    () => document.querySelector("header")?.textContent?.includes("DCABOT") ?? false,
+    { timeout: 30_000 },
+  ).catch(() => {
+    throw new Error(
+      `:3000 üzerinde DCABOT yok (başka uygulama dinliyor olabilir) — npm run local:start ile yeniden başlatın`,
+    );
+  });
+  await page
+    .waitForFunction(
+      () => /VERİ|VERI/.test(document.querySelector("footer")?.textContent ?? ""),
+      { timeout: 60_000 },
+    )
+    .catch(() => {}); // rozet yoksa test beklentileri yine de çalışır
+  await page.waitForTimeout(500);
+}
+
 test.describe.configure({ mode: "serial" });
 
 test("kokpit: KPI kartları + bot listesi + footer durumu", async ({ page }) => {
-  await page.goto(BASE, { waitUntil: "networkidle" });
+  await gotoApp(page);
   await expect(page.getByText("TOPLAM ÖZKAYNAK", { exact: false })).toBeVisible({ timeout: 20000 });
   await expect(page.getByText(/bot filosu/i).first()).toBeVisible();
   await expect(page.getByText("Borsa Duyuruları")).toBeVisible();
@@ -21,7 +46,7 @@ test("kokpit: KPI kartları + bot listesi + footer durumu", async ({ page }) => 
 });
 
 test("filo: arama/filtre/sıralama kontrolleri + politika şeridi + HALT kurtarma", async ({ page }) => {
-  await page.goto(BASE, { waitUntil: "networkidle" });
+  await gotoApp(page);
   await page.getByRole("button", { name: "Bot Filosu" }).click();
   await expect(page.getByText(/Bot Filosu \(/)).toBeVisible({ timeout: 20000 });
   await expect(page.getByPlaceholder("Ara: bot / sembol")).toBeVisible();
@@ -34,7 +59,7 @@ test("filo: arama/filtre/sıralama kontrolleri + politika şeridi + HALT kurtarm
 });
 
 test("studio: K/Z birinci kademe + Deal Durumu faz-bazlı", async ({ page }) => {
-  await page.goto(BASE, { waitUntil: "networkidle" });
+  await gotoApp(page);
   await page.getByRole("button", { name: "Bot Filosu" }).click();
   await page.getByRole("button", { name: "İncele" }).first().click();
   await expect(page.getByText("K/Z (GERÇEKLEŞEN)")).toBeVisible({ timeout: 20000 });
@@ -45,7 +70,7 @@ test("studio: K/Z birinci kademe + Deal Durumu faz-bazlı", async ({ page }) => 
 });
 
 test("hesaplayıcı: insan altbaşlık + ladder fiyat biçimi", async ({ page }) => {
-  await page.goto(BASE, { waitUntil: "networkidle" });
+  await gotoApp(page);
   await page.getByRole("button", { name: "Hesaplayıcı" }).click();
   await expect(page.getByText(/Sandbox hesaplayıcı/)).toBeVisible({ timeout: 20000 });
   await expect(page.getByText(/motorla birebir aynı hesap çekirdeği/)).toBeVisible();
@@ -55,7 +80,7 @@ test("hesaplayıcı: insan altbaşlık + ladder fiyat biçimi", async ({ page })
 });
 
 test("ayarlar: YZ sağlayıcı tek panel + kasa", async ({ page }) => {
-  await page.goto(BASE, { waitUntil: "networkidle" });
+  await gotoApp(page);
   await page.getByRole("button", { name: "Ayarlar" }).click();
   await expect(page.getByText("YZ Sağlayıcısı (Özetler & Teşhis)")).toBeVisible({ timeout: 20000 });
   await expect(page.getByText("API Key Vault (AES-256-GCM)")).toBeVisible();

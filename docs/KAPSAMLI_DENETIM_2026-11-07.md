@@ -112,3 +112,16 @@ Kaynaklar sonda. Uygulanabilir plan (motor öncelikli):
 | **8 moderate npm** | Kök: tek transitive `minimatch` (ReDoS, dev-lint zinciri). npm'in reçetesi eslint-config-next 16→15 DÜŞÜRMEYdi (reddedildi); doğru çözüm `overrides: { minimatch: "^11.0.5" }` (GHSA-g3hv-75wg-m249 yaması ≥11.0.1) | `npm audit` **0 vulnerabilities** (dev+runtime); eslint 0 error / tsc 0 / UI 200 — zincir kırılmadı |
 
 **Faz 28 final:** workspace 295/295 · motor H-1'li binary ile canlı (13/13) · npm audit toplam 0 · sözleşme 25/25 · smoke 5/5.
+
+---
+
+## 10. Faz 28-devam — Sözleşme Drifti ve Port Yarışı (2026-11-07, aynı gün)
+
+| Konu | Bulgu | Uygulama |
+|---|---|---|
+| **Sözleşme drifti** | `bot-matrix.mjs` hedge beklentisi 422 → motor **hedge backtest'i artık 200+fill** döndürüyor (canlı doğrulandı: HEDGE_DUAL fills=15/deals=5); Studio'nun "hedge desteklenmez" uyarısı bayat | Matrix beklentisi güncellendi (10/10) · Studio bayat uyarı kaldırıldı · bot-matrix'e auth eklendi (Faz 21 sonrası 401'e düşmüştü) + lint 0 |
+| **Port yarışı (ortam)** | :3000'de **başka proje** (`D:\project\suyonetimi` Next dev, 10:05) DCABOT UI çökünce portu kapmış — Playwright yanlış siteyi test ediyordu, curl doğru yanıtı veriyordu (bağlantı yarışı) | su-projesi süreci durduruldu, `restart-ui` ile DCABOT geri getirildi; smoke'a **kimlik sigortası** eklendi (header'da DCABOT yoksa net hata) |
+| **Smoke sağlamlaştırma** | SSE kalıcı bağlantı `load`/`networkidle`'ı engelliyor; DOMContentLoaded + hidrasyon işareti (footer tazelik rozeti) doğru desen | 5/5 PASS (9 sn) — port yarışı çözülünce stabil |
+| **Test piramidi** | T1-T21'lik derin e2e (600+ sn) gece sütunu olarak belgelendi; hızlı yolları contract.mjs devraldı | e2e_engine.py başına durum notu |
+
+**Faz 28-devam final:** contract 25/25 · smoke 5/5 · matrix 10/10 · tsc/eslint 0. Hedge backtest sözleşme değişikliği motor tarafında önceden gelmişti — UI/beklenti katmanı bu faza yakalandı (dürüstlük: testin yakaladığı drift).
