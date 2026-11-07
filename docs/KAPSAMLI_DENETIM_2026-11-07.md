@@ -99,3 +99,16 @@ Kaynaklar sonda. Uygulanabilir plan (motor öncelikli):
 **Final doğrulama:** `cargo test --workspace` **295/295** (287+8) · `tsc --noEmit` 0 · `eslint` 0 · motor canlı (13/13, default cap %85) · audit test botlarının tamamı silindi (filo temiz).
 
 **Bilinen açık kalem (dürüstlük):** e2e_engine.py bölümlendirme + Playwright smoke (§5.5-6) bu fazda yapılmadı — ayrı oturum gerektirir; plan §5'te duruyor. Kalan 8 moderate npm bulgusu breaking-change istiyor — planlı bakımda.
+
+---
+
+## 9. Faz 28 — Açık Kalemlerin Kapatılması (2026-11-07)
+
+| Açık kalem | Uygulama | Kanıt |
+|---|---|---|
+| **H-1 (Rust)** sub-tick anchor | `m02.rs build_dca_plan`: `anchor < tick_size` → `Err DomainViolation` (sessiz boş plan kapatıldı); p4b property testi artık Err bekler | `cargo test -p dca_math` 56/56; binary string doğrulandı; workspace 295/295 |
+| **e2e bölümlendirme** | `tests/engine_contract.mjs` — hızlı sözleşme süiti (node fetch, sabit loopback, SSRF allowlist): A auth ×7 · B fail-closed ×5 · C yaşam döngüsü ×7 · D webhook ×1 · E proxy/CSRF ×5. `node tests/engine_contract.mjs` ile koşar (motor+UI ayakta) | **25/25 PASS** |
+| **Playwright smoke** | `playwright.config.mjs` + `tests/playwright-smoke.mjs`: 5 ekran altın-yol (Kokpit KPI+footer, filo kontrolleri+HALT kurtarma, Studio K/Z + invariant-yasak, hesaplayıcı ondalık-yasak, Ayarlar YZ+kasa). Salt-okunur — yıkıcı aksiyon yok | **5/5 PASS** (27 sn). Ders: `domcontentloaded` sonrası click React hidrasyonundan önce yutuluyor → `networkidle` şart |
+| **8 moderate npm** | Kök: tek transitive `minimatch` (ReDoS, dev-lint zinciri). npm'in reçetesi eslint-config-next 16→15 DÜŞÜRMEYdi (reddedildi); doğru çözüm `overrides: { minimatch: "^11.0.5" }` (GHSA-g3hv-75wg-m249 yaması ≥11.0.1) | `npm audit` **0 vulnerabilities** (dev+runtime); eslint 0 error / tsc 0 / UI 200 — zincir kırılmadı |
+
+**Faz 28 final:** workspace 295/295 · motor H-1'li binary ile canlı (13/13) · npm audit toplam 0 · sözleşme 25/25 · smoke 5/5.

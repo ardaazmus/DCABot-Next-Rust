@@ -1105,3 +1105,15 @@ Work Log:
 - Temizlik: 7 audit test botu silindi; filo 13/13. Debug eprintln'ler kaldırıldı.
 - Doğrulama: cargo test 295/295 · tsc 0 · eslint 0 · UI 200 · görsel turlar.
 - Açık kalem: e2e bölümlendirme + Playwright smoke (ayrı oturum); 8 moderate npm (breaking).
+---
+Task ID: FAZ28-ACIK-KALEMLER (denetim raporu acik kalemlerinin kapatilmasi)
+Agent: main (2026-11-07)
+Task: Faz 27 raporundaki acik kalemler — H-1 Rust hardening, e2e hizli sut + Playwright smoke, 8 moderate npm.
+
+Work Log:
+- H-1: m02.rs build_dca_plan — anchor < tick_size → Err DomainViolation (sessiz bos plan kapatildi); p4b testi Err bekler. dca_math 56/56; binary dogrulandi (ASCII desen — onceki Turkce desenli byte-aramam encoding bozulmus, motor saglamdi).
+- B: tests/engine_contract.mjs — node fetch sozlesme sutu (auth 7, fail-closed 5, yasam dongusu 7, webhook 1, proxy/CSRF 5) = 25/25 PASS. Ilk kosmada 400-char kirpma JSON.parse patlatti → tam govne gecildi.
+- C: @playwright/test + chromium kuruldu; playwright.config.mjs + tests/playwright-smoke.mjs (5 ekran, salt-okunur). Ilk kosmada kokpit testi click yuttu — domcontentloaded sonrasi React hidrasyonu beklenmedigi icin; networkidle ile 5/5 PASS (27sn).
+- D: 8 moderate npm = tek kok minimatch ReDoS (GHSA-g3hv-75wg-m249, dev-lint zinciri). npm recetesi eslint-config-next 16→15 DUSURMEYDI — reddedildi; overrides {"minimatch":"^11.0.5"} ile npm audit TOPLAM 0 (dev+runtime); eslint 0 error / tsc 0 — zincir saglam. 4 warning pre-existing tests/bot-matrix.mjs (dokunulmadi).
+- Motor H-1'li binary ile restart; 13/13 bot, tick canli. 295/295 workspace test.
+- Commit: Faz 25-27 → 4101b33; Faz 28 ayri commit.

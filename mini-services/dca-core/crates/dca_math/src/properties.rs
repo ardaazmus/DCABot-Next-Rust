@@ -217,13 +217,10 @@ mod property_tests {
         }
     }
 
-    /// P4b (H-1 hardening notu): sub-tick anchor'da build_dca_plan Err yerine
-    /// SESSİZ BOŞ plan döndürebilir (gözlemlendi). Panik yoktur; arayan
-    /// (dca.rs rebuild_ladder_from_anchor) boş planı kabul eder ve ladder
-    /// boş kalır — base zaten size-guard'a takılır. Yine de bu davranış
-    /// gelecek fazda Err'e bağlanmalı (fail-closed tutarlılığı).
+    /// P4b (Faz 28 H-1): sub-tick anchor ARTIK Err — sessiz boş plan yok.
+    /// (Faz 27'de gözlemlenen H-1 açığı kapatıldı: fail-closed tutarlılığı.)
     #[test]
-    fn p4b_subtick_anchor_returns_empty_or_err_no_panic() {
+    fn p4b_subtick_anchor_is_honest_err() {
         let r = build_dca_plan(
             &f("0.00000001"),
             &f("100"),
@@ -237,9 +234,11 @@ mod property_tests {
             &f(STEP),
             SizingMode::QuoteNotional,
         );
-        if let Ok(plan) = r {
-            assert!(plan.is_empty(), "sub-tick anchor: boş olmayan plan beklenmedik — incele");
-        }
+        let err = r.expect_err("sub-tick anchor Err dönmeli (H-1 kapalı)");
+        assert!(
+            err.to_string().contains("tick"),
+            "hata anchor/tick ilişkisini açıklamalı: {err}"
+        );
     }
 
     /// P5: Fraction string turu kimliği — uç değerlerde değer korunumu.
