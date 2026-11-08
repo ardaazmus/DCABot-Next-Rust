@@ -102,6 +102,12 @@ export async function apiBacktestCert(
   return engineFetch("/api/backtest/cert", { ...engineJson("POST", req), signal });
 }
 
+/** Faz 24 (UI/UX Pro Max §3.1.1): portföy equity curve — motor
+    equity_points birleşimi. */
+export async function apiEquity(days = 30, signal?: AbortSignal): Promise<{ days: number; points: { ts: number; equity: number }[]; total: number }> {
+  return engineFetch(`/api/equity?days=${days}`, { ...{ signal }, ...{} } as RequestInit);
+}
+
 export async function apiParity(body: { bot_id: string; bars?: number; interval?: string }): Promise<ParityResult> {
   return engineFetch("/api/parity", engineJson("POST", body));
 }

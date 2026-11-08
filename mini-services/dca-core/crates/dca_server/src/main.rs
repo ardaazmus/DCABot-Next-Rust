@@ -185,12 +185,15 @@ async fn main() {
     // P0-8: TradingView webhook'u auth middleware DIŞINDA — TradingView alert'i
     // Bearer başlığı ekleyemez. Uç kendi savunma katmanlarıyla korunur:
     // sabit-zamanlı per-bot secret + ±60sn replay penceresi + DUPLICATE dedup
-    // + pair eşleşmesi (hepsi canlı doğrulanmış).
-    let webhook_routes = Router::new().route("/api/webhooks/tradingview", post(tradingview_webhook));
+    // + pair eşleşmesi + gövde limiti (16KB, SEC-FIND-06).
+    let webhook_routes = Router::new()
+        .route("/api/webhooks/tradingview", post(tradingview_webhook))
+        .layer(axum::extract::DefaultBodyLimit::max(16 * 1024));
 
     // Tüm yönetim routes'ları kimlik doğrulama altına alınır.
     let api_routes = Router::new()
         .route("/api/summary", get(summary))
+        .route("/api/equity", get(equity_curve))
         .route("/api/bots", get(list_bots).post(create_bot))
         .route("/api/bots/:id", get(get_bot).patch(patch_bot).delete(delete_bot))
         .route("/api/bots/:id/actions", post(bot_actions))
@@ -263,20 +266,37 @@ async fn main() {
         // M-15: yönetim uçlarında gövde limiti — 1MB isim gibi aşırı yük reddedilir.
         .layer(axum::extract::DefaultBodyLimit::max(131_072));
 
-    // SSE akışı: EventSource (tarayıcı) özel başlık gönderemez, bu yüzden
-    // /api/stream auth middleware'i HARİÇ tutulur. SSE kendi içinde
-    // last-event-id ile reconnect durumunu takip eder; gerçek kimlik
-    // doğrulaması Next.js middleware (DCA_API_KEY Bearer) ile sağlanır.
+    // SEC-FIND-03: SSE akışı kimlik doğrulaması — Bearer başlığı veya ?token=<DCA_API_KEY>.
+    let sse_api_key = api_key.clone();
     let sse_routes = Router::new().route(
         "/api/stream",
-        get(move |headers: axum::http::HeaderMap| {
+        get(move |headers: axum::http::HeaderMap, query: axum::extract::Query<std::collections::HashMap<String, String>>| {
             let st = sse_state.clone();
             let rx = sse_rx.resubscribe();
-            let last_event_id = headers
-                .get("last-event-id")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<i64>().ok());
-            sse_handler(st, rx, last_event_id)
+            let key = sse_api_key.clone();
+            async move {
+                let auth_header = headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|h| h.strip_prefix("Bearer "));
+                let auth_query = query.get("token").map(|s| s.as_str());
+
+                let provided = auth_header.or(auth_query).unwrap_or("");
+                let is_authed = !key.is_empty()
+                    && !provided.is_empty()
+                    && provided.len() == key.len()
+                    && provided.bytes().zip(key.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0;
+
+                if !is_authed {
+                    return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+                }
+
+                let last_event_id = headers
+                    .get("last-event-id")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<i64>().ok());
+                sse_handler(st, rx, last_event_id).await.into_response()
+            }
         }),
     );
 
@@ -843,6 +863,62 @@ async fn health(State(app): State<Arc<AppState>>) -> Json<Value> {
             "note": "lastTickAgeS > 60 ve aktif bot varsa supervisor hattı takılmış olabilir",
         },
     }))
+}
+
+/// Faz 24 (UI/UX Pro Max raporu §3.1.1): portföy equity curve — tüm botların
+/// equity_points kayıtlarını güne göre birleştirip toplam döndürür.
+/// `?days=N` (varsayılan 30, üst sınır 90) → son N gün; nokta sayısı
+/// örneklenerek (~720) grafik dostu seri döner.
+async fn equity_curve(
+    State(app): State<Arc<AppState>>,
+    q: axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let days: i64 = q
+        .get("days")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(30)
+        .clamp(1, 90);
+    let since_ms = crate::state::now_ms() - days * 86_400_000;
+    let conn = app.db.conn.lock().map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response()
+    })?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT ts, SUM(CAST(equity AS REAL)) FROM equity_points WHERE ts >= ?1 GROUP BY ts ORDER BY ts ASC",
+        )
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
+        })?;
+    let rows = stmt
+        .query_map([since_ms], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
+        })?;
+    let mut raw: Vec<(i64, f64)> = rows.flatten().collect();
+    drop(stmt);
+    drop(conn);
+    let total = raw.len();
+    if total > 720 {
+        let step = total as f64 / 720.0;
+        raw = (0..720).map(|i| raw[((i as f64) * step) as usize]).collect();
+    }
+    let points: Vec<serde_json::Value> = raw
+        .iter()
+        .map(|(t, v)| serde_json::json!({"ts": t, "equity": v}))
+        .collect();
+    Ok(Json(serde_json::json!({"days": days, "points": points, "total": total})))
 }
 
 async fn summary(State(app): State<Arc<AppState>>) -> Json<Value> {
@@ -1857,7 +1933,7 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
                 if let Some(rt2) = rts2.get_mut(&id) {
                     rt2.live_open_orders.push(crate::state::LiveTrackedOrder {
                         id: order_id.clone(),
-                        side: dca_math::Side::Buy,
+                        side: req_o.side,
                         kind: dca_kernel::OrderKind::Add,
                         price: mark_v.clone(),
                         qty: qty.clone(),
@@ -2283,7 +2359,7 @@ async fn save_pine_script(
 }
 
 async fn list_pine_scripts(State(app): State<Arc<AppState>>) -> Json<Value> {
-    let conn = app.db.conn.lock().unwrap();
+    let conn = app.db.conn.lock().unwrap_or_else(|p| p.into_inner());
     let mut stmt = match conn
         .prepare("SELECT id, name, code, inputs, notes, created_at, updated_at FROM pine_scripts ORDER BY updated_at DESC")
     {
@@ -2352,7 +2428,7 @@ async fn patch_pine_script(
 }
 
 async fn delete_pine_script(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Json<Value> {
-    let conn = app.db.conn.lock().unwrap();
+    let conn = app.db.conn.lock().unwrap_or_else(|p| p.into_inner());
     if let Err(e) = conn.execute("DELETE FROM pine_scripts WHERE id=?1", [&id]) {
         tracing::warn!("pine_script delete failed: {e}");
     }
@@ -2596,7 +2672,7 @@ fn frac_match_pct(a: &Fraction, b: &Fraction) -> f64 {
 async fn parity(State(app): State<Arc<AppState>>, Json(req): Json<ParityReq>) -> Result<Json<Value>, axum::response::Response> {
     let bars_req = req.bars.min(1000).max(1);
     let (kind_s, symbol, start_cash, cfg_json, interval_row): (String, String, String, String, Option<String>) = {
-        let conn = app.db.conn.lock().unwrap();
+        let conn = app.db.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.query_row(
             "SELECT kind, symbol, start_cash, config, interval FROM bots WHERE id=?1",
             [&req.bot_id],
@@ -2621,7 +2697,7 @@ async fn parity(State(app): State<Arc<AppState>>, Json(req): Json<ParityReq>) ->
     let window_start = kl.first().map(|k| k.t).unwrap_or(0);
     // Paper tarafı: penceredeki fill'ler (kalıcı fills tablosu).
     let (n_paper, fee_paper) = {
-        let conn = app.db.conn.lock().unwrap();
+        let conn = app.db.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = conn
             .prepare("SELECT fee FROM fills WHERE bot_id=?1 AND ts>=?2")
             .map_err(|e| err422(e.to_string()))?;
@@ -2669,7 +2745,7 @@ async fn parity(State(app): State<Arc<AppState>>, Json(req): Json<ParityReq>) ->
         "KALDI"
     };
     {
-        let conn = app.db.conn.lock().unwrap();
+        let conn = app.db.conn.lock().unwrap_or_else(|p| p.into_inner());
         let _ = conn.execute(
             "INSERT INTO parity_checks(bot_id, verdict, count_match, fee_match, bt_fills, paper_fills, win_rate_bt, bars, created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             rusqlite::params![
@@ -3585,17 +3661,24 @@ async fn tradingview_webhook(
     // (60 sn / 60 istek). Secret doğrulamasından ÖNCE kapatılır: flood
     // denemeleri DB/runtime kilidine hiç dokunmaz.
     {
-        let ip = headers
+        let ip: String = headers
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.split(',').next())
             .map(str::trim)
-            .map(str::to_string)
+            .map(|s| s.chars().take(45).collect())
             .unwrap_or_else(|| "unknown".into());
         let now = crate::state::now_ms();
         const WINDOW_MS: i64 = 60_000;
         const WINDOW_MAX: u32 = 60;
         let mut rate = app.webhook_rate.lock().await;
+        // SEC-FIND-05: Süresi dolmuş pencereleri temizle (bellek sızıntısı önleme)
+        if rate.len() > 100 {
+            rate.retain(|_, (t, _)| now - *t < WINDOW_MS);
+        }
+        if rate.len() > 2000 {
+            rate.clear();
+        }
         let entry = rate.entry(ip).or_insert((now, 0u32));
         if now - entry.0 > WINDOW_MS {
             *entry = (now, 0);
@@ -3863,10 +3946,16 @@ fn mask(s: &str) -> String {
 }
 
 async fn list_keys(State(app): State<Arc<AppState>>) -> Json<Value> {
-    let conn = app.db.conn.lock().unwrap();
-    let mut stmt = conn
+    let conn = app.db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let mut stmt = match conn
         .prepare("SELECT id, venue, label, permissions, created_at, api_key_enc, api_pass_enc FROM vault_keys ORDER BY created_at DESC")
-        .unwrap();
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("vault_keys prepare failed: {e}");
+            return Json(json!({"keys": []}));
+        }
+    };
     let rows: Vec<Value> = stmt
         .query_map([], |r| {
             let perms_raw: String = r.get(3)?;
@@ -3924,7 +4013,7 @@ async fn list_keys(State(app): State<Arc<AppState>>) -> Json<Value> {
 /// emir gönderilmeye devam edilebilir.
 async fn remove_key(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Json<Value> {
     let venue: Option<String> = {
-        let conn = app.db.conn.lock().unwrap();
+        let conn = app.db.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.query_row("SELECT venue FROM vault_keys WHERE id=?1", [&id], |r| r.get::<_, String>(0)).ok()
     };
     if let Some(venue) = venue {
@@ -3958,7 +4047,7 @@ async fn remove_key(State(app): State<Arc<AppState>>, Path(id): Path<String>) ->
             ).await;
         }
     }
-    let conn = app.db.conn.lock().unwrap();
+    let conn = app.db.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute("DELETE FROM vault_keys WHERE id=?1", [&id]);
     Json(json!({"ok": true}))
 }
@@ -3982,7 +4071,7 @@ async fn sse_handler(
         // Satırlar önce owned Vec'e toplanır (guard en kısa ömürde).
         let mut rows_raw: Vec<(i64, String, String, String, String, i64)> = Vec::new();
         {
-            let conn = app.db.conn.lock().unwrap();
+            let conn = app.db.conn.lock().unwrap_or_else(|p| p.into_inner());
             if let Ok(mut stmt) = conn
                 .prepare("SELECT id, bot_id, level, gate, message, ts FROM events WHERE id > ?1 ORDER BY id ASC LIMIT 200")
             {

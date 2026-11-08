@@ -8,7 +8,7 @@ $coreBinary = Join-Path $coreDirectory 'target/debug/dca_server.exe'
 $processFile = Join-Path $runtimeDirectory 'processes.json'
 
 # C-2 / M-7: motor (SEC-01/SEC-02) DCA_API_KEY + DCA_VAULT_KEY zorunlu tutar;
-# UI (C-1) NEXT_PUBLIC_ENGINE_API_KEY bekler. Anahtarlar İLK çalıştırmada
+# UI sunucu proxy'si (P0-9) ENGINE_API_KEY / DCA_API_KEY kullanır. Anahtarlar İLK çalıştırmada
 # rastgele üretilir ve .local-runtime/local-keys.env içinde kalıcıdır —
 # sonraki başlatmalar aynı anahtarla açılır (vault şifresi değişmez).
 # Sabit/bilinen dev anahtar dönemi kapandı. local-keys.env yalnız yerel
@@ -22,8 +22,7 @@ if (-not (Test-Path -LiteralPath $keysFile)) {
     # BOM ise ilk satirin regex eslesmesini bozar. Anahtarlar ASCII'dir.
     [System.IO.File]::WriteAllLines($keysFile, @(
         "DCA_API_KEY=$api",
-        "DCA_VAULT_KEY=$vault",
-        "NEXT_PUBLIC_ENGINE_API_KEY=$api"
+        "DCA_VAULT_KEY=$vault"
     ))
     Write-Output "Generated local auth keys: $keysFile"
 }
@@ -36,9 +35,10 @@ Get-Content -LiteralPath $keysFile | ForEach-Object {
         Set-Item -Path ('env:' + $Matches[1]) -Value $Matches[2]
     }
 }
-if (-not $env:DCA_API_KEY -or -not $env:DCA_VAULT_KEY -or -not $env:NEXT_PUBLIC_ENGINE_API_KEY) {
+if (-not $env:DCA_API_KEY -or -not $env:DCA_VAULT_KEY) {
     throw "local-keys.env okunamadi veya eksik alan var: $keysFile"
 }
+$env:ENGINE_API_KEY = $env:DCA_API_KEY
 
 foreach ($port in @(3000, 3002)) {
     $listener = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue

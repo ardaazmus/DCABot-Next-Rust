@@ -219,7 +219,7 @@ pub async fn generate_memory(
     })?;
     let ctx_s = ctx.to_string();
     let cfg = body.map(|b| b.0);
-    let rc = crate::ai::resolve_call(cfg.as_ref());
+    let rc = crate::ai::resolve_call(cfg.as_ref()).map_err(|e| crate::err422(format!("AI yapılandırması: {e}")))?;
     tracing::info!("[memory] bot={id} provider={} model={}", rc.provider.id, rc.model);
     let (system, user) = memory_prompt(&ctx);
     // LLM çağrısı: her hata ABSTAIN (sahte özet yok); bağlam yine de kaydedilir.

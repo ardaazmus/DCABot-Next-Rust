@@ -4,12 +4,9 @@ import { useCallback, useEffect, useState } from "react";
 import {
   BadgeCheck,
   Ban,
-  BookOpen,
   CheckCircle2,
-  Coins,
   Copy,
   Cpu,
-  Download,
   Eye,
   EyeOff,
   KeyRound,
@@ -19,7 +16,6 @@ import {
   ShieldCheck,
   Sparkles,
   Trash2,
-  Webhook,
   Wrench,
   XCircle,
 } from "lucide-react";
@@ -45,27 +41,23 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { EmptyState, Panel, Spinner, VenueChip } from "@/components/terminal/bits";
-import { apiAddVaultKey, apiAiProviders, apiBlacklist, apiBlacklistAdd, apiBlacklistRemove, apiDeleteVaultKey, apiMaintenance, apiMaintenanceSet, apiSelfCheck, apiVaultKeys, useAiConfig, useBnb, useEngineHealth } from "@/hooks/use-engine";
+import {
+  apiAddVaultKey,
+  apiAiProviders,
+  apiBlacklist,
+  apiBlacklistAdd,
+  apiBlacklistRemove,
+  apiDeleteVaultKey,
+  apiMaintenance,
+  apiMaintenanceSet,
+  apiSelfCheck,
+  apiVaultKeys,
+  useAiConfig,
+  useEngineHealth,
+} from "@/hooks/use-engine";
 import { toast } from "@/hooks/use-toast";
 import { fmtTs } from "@/lib/format";
-import { cn } from "@/lib/utils";
-import type { AiProvider, BlacklistRow, BnbStatus, FaqEntry, GlossaryEntry, MaintenanceStatus, SelfCheckResult, VaultKey } from "@/lib/engine-types";
-import glossaryJson from "@/data/glossary.json";
-import faqJson from "@/data/faq.json";
-
-const GLOSSARY = glossaryJson as GlossaryEntry[];
-const FAQ = faqJson as FaqEntry[];
-
-const GATES_INFO: [string, string][] = [
-  ["G1", "OHLC Monotonluk — H>L, O/C aralık içinde; bozuk veri varsa bot HALT'e geçer (fail-closed)."],
-  ["G2", "Fee Guard / Fee-Breaker — grid spread'i maker ücretini karşılamıyorsa yapı reddedilir."],
-  ["G3", "Slippage gerçekçiliği — fill fiyatı emir fiyatından kötüleşemez, sapma modeli denetlenir."],
-  ["G4", "No-lookahead — backtest yalnızca bar kapanışına kadar bilgi kullanabilir."],
-  ["G5", "Realism tagging — her fill MARKETABLE (taker) / RESTING (maker) / GAP-BETTER olarak etiketlenir."],
-  ["G6", "Capital guard — bakiye yetersizse emir SKIP/WAIT; negatif nakit oluşamaz."],
-  ["G7", "Seans takvimi (M21) — borsa kapalıyken emir üretimi durur; takvim verisi yoksa fail-closed."],
-  ["G8", "Opening salvo / gap konsolidasyonu — bar açılış boşlukları tek fill'e konsolide edilir."],
-];
+import type { AiProvider, BlacklistRow, MaintenanceStatus, SelfCheckResult, VaultKey } from "@/lib/engine-types";
 
 export function SettingsView() {
   const { health } = useEngineHealth(15000);
@@ -653,218 +645,7 @@ export function SettingsView() {
             </div>
           )}
         </Panel>
-        <Panel title="BNB Komisyon Bekçisi" icon={<Coins className="h-4 w-4 text-slate-500" aria-hidden />}>
-          <BnbCard />
-        </Panel>
-        <Panel title="Proje Paketi" icon={<Cpu className="h-4 w-4 text-slate-500" aria-hidden />}>
-          <p className="text-[11px] leading-relaxed text-slate-400">
-            Tüm proje tek ZIP&apos;te: Rust çekirdek (6 crate), Next.js terminal UI, Bybit araştırma dokümanı,
-            roadmap spec&apos;i, E2E test süiti ve konfigürasyonlar. Build çıktıları (target/, node_modules/) hariçtir.
-          </p>
-          <a
-            href="/dcabot-v3.0.zip"
-            download="dcabot-v3.0.zip"
-            className="mt-3 inline-flex min-h-11 w-full items-center justify-center gap-2 rounded-md bg-emerald-500/90 px-6 text-sm font-semibold text-[#04150e] transition-colors hover:bg-emerald-500 sm:w-auto"
-          >
-            <Download className="h-4 w-4" aria-hidden />
-            dcabot-v3.0.zip indir (~0.5 MB)
-          </a>
-        </Panel>
-
-        <Panel title="Risk Felsefesi — İki Sınıf" icon={<ShieldAlert className="h-4 w-4 text-slate-500" aria-hidden />}>
-          <div className="grid gap-3 sm:grid-cols-2">
-            <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
-              <div className="text-xs font-bold text-amber-400">1 · Uyarı &amp; Geçersiz Kılınabilir Korumalar</div>
-              <p className="mt-1.5 text-[11px] leading-relaxed text-slate-400">
-                M20 SL-Merdiven, Grid Komisyon Kırıcı (g_min), Seans Koruması, Açılış Salvo Tamponu, Gap Konsolidasyonu,
-                Makro Kara Pencere, Rejim Filtresi, Çoklu Güvenlik Emri, Günlük DD Kesici, Dolum Modeli.
-              </p>
-              <p className="mt-1.5 text-[11px] leading-relaxed text-amber-300/90">
-                Patron kullanıcıdır: motor emri engellemez; ne işe yaradığını ve üstlenilen riski yazar. Kullanıcı
-                &quot;riski anladım&quot; onayı ile (Acknowledge &amp; Proceed) geçersiz kılabilir.
-              </p>
-            </div>
-            <div className="rounded-lg border border-rose-500/30 bg-rose-500/5 p-3">
-              <div className="text-xs font-bold text-rose-400">2 · Fiziksel &amp; Güvenlik Değişmezleri</div>
-              <p className="mt-1.5 text-[11px] leading-relaxed text-slate-400">
-                Zero-Withdrawal Hard Gate (çekim izni olan API anahtarı HTTP 422 ile reddedilir) ve Gate 6 — Olmayan
-                Parayı Harcamama (bakiye yetersizse emir SKIP/WAIT).
-              </p>
-              <p className="mt-1.5 text-[11px] leading-relaxed text-rose-300/90">
-                Borsa fizik kuralları ve cüzdan güvenliği gereği asla esnetilemez; hiçbir kullanıcı onayı bu ikisini
-                aşamaz.
-              </p>
-            </div>
-          </div>
-        </Panel>
-
-        <Panel title="Sözlük & SSS — Hata Kodları ve Yardım" icon={<BookOpen className="h-4 w-4 text-slate-500" aria-hidden />}>
-          <GlossaryBrowser />
-        </Panel>
-        <Panel title="TradingView Webhook Kurulumu" icon={<Webhook className="h-4 w-4 text-slate-500" aria-hidden />}>
-          <p className="text-[11px] leading-relaxed text-slate-400">
-            TradingView alarmını (webhook sekmesi) aşağıdaki uca yönlendirin — sinyal, botun
-            Studio → Ayarlar sekmesindeki gizli anahtarıyla eşleşirse kuyruğa girer, deal bir sonraki
-            bar değerlendirmesinde açılır. Bot başına gizli anahtar Studio&apos;da gösterilir; burada
-            secret yazılmaz, gösterilmez.
-          </p>
-          <div className="num mt-2.5 rounded-lg border border-border-strong bg-surface p-2.5 font-mono text-[11px] text-cyan-300">
-            POST /api/webhooks/tradingview
-          </div>
-          <pre className="num mt-2 overflow-x-auto rounded-lg border border-border bg-surface p-2.5 font-mono text-[10px] leading-relaxed text-slate-300">
-{`{
-  "secret": "tvw_<bot-gizli-anahtarı>",
-  "botId": "<bot-id>",
-  "action": "START_DEAL",
-  "pair": "BTCUSDT",
-  "timestamp": 1776672000000
-}`}
-          </pre>
-          <ul className="mt-2.5 space-y-1.5 text-[11px] leading-relaxed text-slate-400">
-            <li><span className="font-semibold text-slate-200">Secret:</span> <code className="font-mono text-[10px] text-amber-300">tvw_</code> önekli, bot başına üretilir (Studio → bot → Ayarlar sekmesi).</li>
-            <li><span className="font-semibold text-slate-200">Replay koruması:</span> timestamp sn veya ms kabul edilir; ±60 sn dışı EXPIRED_ALERT ile reddedilir.</li>
-            <li><span className="font-semibold text-slate-200">Pair kapısı:</span> <code className="font-mono text-[10px]">pair</code> bot sembolüyle uyuşmazsa PAIR_MISMATCH + WARN olayı.</li>
-            <li><span className="font-semibold text-slate-200">Fail-closed:</span> açık deal varken sinyal DEAL_ALREADY_ACTIVE ile yoksayılır (çifte deal asla açılmaz); bot RUNNING değilse, KILL devredeyse veya LIVE hatta FREEZE devredeyse sinyal işlenmez.</li>
-          </ul>
-        </Panel>
-        <Panel title="8 Fail-Closed Gate" icon={<ShieldCheck className="h-4 w-4 text-slate-500" aria-hidden />}>
-          <ul className="space-y-2">
-            {GATES_INFO.map(([g, desc]) => (
-              <li key={g} className="flex items-start gap-2 text-xs">
-                <span className="num mt-0.5 shrink-0 rounded border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-bold text-emerald-400">
-                  {g}
-                </span>
-                <span className="leading-relaxed text-slate-400">{desc}</span>
-              </li>
-            ))}
-          </ul>
-          <div className="mt-3 rounded-lg border border-cyan-500/25 bg-cyan-500/5 p-3 text-[11px] leading-relaxed text-slate-400">
-            <span className="font-semibold text-cyan-400">Fail-closed ilkesi:</span> bir gate doğrulayamazsa emir ÜRETİLMEZ.
-            Tüm finansal hesaplamalar 4096-bit rasyonel aritmetikte yürür; float yalnızca ekran gösteriminde kullanılır.
-            Gate 7/8a/8b ve M20/g_min artık <span className="text-amber-400">RiskPolicy</span> ile bot başına
-            ZORUNLU veya UYARI+İZİN modunda çalışır (sihirbaz Bölüm 6&apos;dan seçilir).
-          </div>
-        </Panel>
       </div>
-    </div>
-  );
-}
-
-/* P4-4: sözlük + SSS tarayıcı (v3 help/glossary karşılığı — salt-okunur). */
-function GlossaryBrowser() {
-  const [q, setQ] = useState("");
-  const [tab, setTab] = useState<"glossary" | "faq">("glossary");
-  const [openId, setOpenId] = useState<string | null>(null);
-  const needle = q.trim().toLowerCase();
-  const glossHits = GLOSSARY.filter((g) =>
-    !needle ||
-    g.code.toLowerCase().includes(needle) ||
-    g.title.toLowerCase().includes(needle) ||
-    g.plainCause.toLowerCase().includes(needle) ||
-    g.exchange.toLowerCase().includes(needle),
-  );
-  const faqHits = FAQ.filter((f) =>
-    !needle ||
-    f.question.toLowerCase().includes(needle) ||
-    f.answer.toLowerCase().includes(needle) ||
-    f.category.toLowerCase().includes(needle) ||
-    f.keywords.some((k) => k.toLowerCase().includes(needle)),
-  );
-  return (
-    <div>
-      <div className="flex gap-1.5">
-        {([{ v: "glossary", l: `SÖZLÜK (${glossHits.length})` }, { v: "faq", l: `SSS (${faqHits.length})` }] as const).map((o) => (
-          <button
-            key={o.v}
-            onClick={() => { setTab(o.v); setOpenId(null); }}
-            aria-pressed={tab === o.v}
-            className={cn(
-              "min-h-10 flex-1 rounded-lg border px-2 py-2 text-[11px] font-bold",
-              tab === o.v ? "border-cyan-500/60 bg-cyan-500/10 text-cyan-300" : "border-border text-slate-500 hover:border-border-strong",
-            )}
-          >
-            {o.l}
-          </button>
-        ))}
-      </div>
-      <Input
-        value={q}
-        onChange={(e) => setQ(e.target.value)}
-        placeholder={tab === "glossary" ? "kod / başlık ara — örn. -2010" : "soru ara — örn. sapma adımı"}
-        aria-label="Sözlükte ara"
-        className="mt-2 min-h-11 border-border-strong bg-surface text-slate-100"
-      />
-      {tab === "glossary" ? (
-        <ul className="mt-2 max-h-72 space-y-1.5 overflow-y-auto">
-          {glossHits.map((g) => {
-            const open = openId === g.code;
-            return (
-              <li key={g.code} className="rounded-lg border border-border bg-surface">
-                <button onClick={() => setOpenId(open ? null : g.code)} aria-expanded={open} className="flex w-full items-center gap-2 px-2.5 py-2 text-left">
-                  <span className="num shrink-0 rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 font-mono text-[10px] font-bold text-amber-300">{g.code}</span>
-                  <span className="min-w-0 flex-1 truncate text-[11px] font-semibold text-slate-200">{g.title}</span>
-                  <span className="shrink-0 text-[9px] font-bold tracking-wider text-slate-400">{g.exchange} · {g.severity}</span>
-                </button>
-                {open && (
-                  <div className="space-y-1.5 px-2.5 pb-2.5 text-[11px] leading-relaxed">
-                    <p className="text-slate-300"><span className="font-bold text-slate-400">Neden: </span>{g.plainCause}</p>
-                    <p className="text-slate-400"><span className="font-bold text-slate-500">Bot eylemi: </span>{g.botAction}</p>
-                    {g.operatorSteps && g.operatorSteps.length > 0 && (
-                      <ol className="list-decimal space-y-0.5 pl-4 text-slate-500">
-                        {g.operatorSteps.map((s, i) => <li key={i}>{s}</li>)}
-                      </ol>
-                    )}
-                  </div>
-                )}
-              </li>
-            );
-          })}
-          {glossHits.length === 0 && <li className="text-[11px] text-slate-400">Eşleşme yok.</li>}
-        </ul>
-      ) : (
-        <ul className="mt-2 max-h-72 space-y-1.5 overflow-y-auto">
-          {faqHits.map((f) => {
-            const open = openId === f.id;
-            return (
-              <li key={f.id} className="rounded-lg border border-border bg-surface">
-                <button onClick={() => setOpenId(open ? null : f.id)} aria-expanded={open} className="flex w-full items-center gap-2 px-2.5 py-2 text-left">
-                  <span className="min-w-0 flex-1 truncate text-[11px] font-semibold text-slate-200">{f.question}</span>
-                  <span className="shrink-0 text-[9px] font-bold tracking-wider text-slate-400">{f.category}</span>
-                </button>
-                {open && <p className="px-2.5 pb-2.5 text-[11px] leading-relaxed text-slate-400">{f.answer}</p>}
-              </li>
-            );
-          })}
-          {faqHits.length === 0 && <li className="text-[11px] text-slate-400">Eşleşme yok.</li>}
-        </ul>
-      )}
-      <p className="mt-2 text-[10px] leading-tight text-slate-400">YZ Yardımcı&apos;nın RAG bağlamı bu iki listeden beslenir; burası salt-okunur yardımdır.</p>
-    </div>
-  );
-}
-
-/* Faz 1.6: BNB komisyon bekçisi kartı (v3 bnb-sentinel karşılığı, GET only). */
-function BnbCard() {
-  const { status } = useBnb(60000);
-  const b: BnbStatus | null = status;
-  const alert = b?.alert === true;
-  const abstain = b?.source === "ABSTAIN";
-  return (
-    <div>
-      <p className="text-[11px] leading-relaxed text-slate-400">
-        Binance spot cüzdandaki serbest BNB — komisyon indirimi için eşik{" "}
-        <span className="num font-bold text-slate-200">0.05</span> BNB. Altındayken komisyon base
-        asset&apos;ten kesilir (toz birikimi). Salt-okunur; süpürme düğmesi yok.
-      </p>
-      <div className="mt-2.5 flex flex-wrap items-center gap-2">
-        <span
-          className={`rounded border px-2 py-1 text-xs font-bold ${!b ? "border-slate-600/50 bg-slate-600/10 text-slate-400" : alert ? "border-amber-500/40 bg-amber-500/10 text-amber-400" : abstain ? "border-slate-600/50 bg-slate-600/10 text-slate-400" : "border-emerald-500/40 bg-emerald-500/10 text-emerald-400"}`}
-        >
-          {!b ? "… okunuyor" : alert ? `⚠ DÜŞÜK — ${b.freeBnb ?? "?"} BNB` : abstain ? "… ANAHTARSIZ (ABSTAIN)" : `✓ YETERLİ — ${b.freeBnb ?? "?"} BNB`}
-        </span>
-        {b?.cached && <span className="text-[10px] text-slate-400">önbellek (45 sn)</span>}
-      </div>
-      {b?.reason && <p className="mt-1.5 text-[11px] text-slate-400">{b.reason}</p>}
     </div>
   );
 }

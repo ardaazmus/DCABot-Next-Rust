@@ -299,7 +299,63 @@ pub(crate) struct ResolvedCall {
     pub(crate) base_url: String,
 }
 
-pub(crate) fn resolve_call(cfg: Option<&AiCallConfig>) -> ResolvedCall {
+/// SEC-FIND-04: SSRF koruması — harici ve yerel AI URL doğrulaması.
+pub fn validate_ai_base_url(url: &str, provider_id: &str) -> Result<String, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("geçersiz base_url: {e}"))?;
+    let scheme = parsed.scheme();
+    let host = parsed.host_str().ok_or_else(|| "URL ana makine içermiyor".to_string())?;
+
+    if provider_id == "ollama" {
+        if scheme != "http" && scheme != "https" {
+            return Err("Ollama yalnızca http veya https protokolü destekler".into());
+        }
+        let is_loopback = host == "localhost" || host == "127.0.0.1" || host == "::1";
+        if !is_loopback {
+            return Err("Ollama güvenliği: yalnızca yerel makine (localhost / 127.0.0.1) adreslerine izin verilir".into());
+        }
+        return Ok(url.trim_end_matches('/').to_string());
+    }
+
+    if scheme != "https" {
+        return Err("güvenlik kuralı: harici AI sağlayıcıları yalnızca HTTPS protokolü kullanmalıdır".into());
+    }
+
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        let is_private_or_restricted = match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_broadcast()
+                    || v4.is_documentation()
+                    || v4.octets()[0] == 0
+                    || (v4.octets()[0] == 169 && v4.octets()[1] == 254)
+                    || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
+                    || (v4.octets()[0] == 198 && (v4.octets()[1] & 0xFE) == 18)
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00
+            }
+        };
+        if is_private_or_restricted {
+            return Err("güvenlik kuralı: dahili veya metadata IP adreslerine istek yapılamaz (SSRF koruması)".into());
+        }
+    }
+
+    if host == "localhost"
+        || host.ends_with(".internal")
+        || host.ends_with(".local")
+        || host.ends_with(".lan")
+        || host == "metadata.google.internal"
+        || host == "instance-data"
+    {
+        return Err("güvenlik kuralı: dahili ana makine adlarına istek yapılamaz (SSRF koruması)".into());
+    }
+
+    Ok(url.trim_end_matches('/').to_string())
+}
+
+pub(crate) fn resolve_call(cfg: Option<&AiCallConfig>) -> Result<ResolvedCall, String> {
     let provider = resolve_provider(cfg.and_then(|c| c.provider.as_deref()));
     let model = cfg
         .and_then(|c| c.model.clone())
@@ -307,12 +363,12 @@ pub(crate) fn resolve_call(cfg: Option<&AiCallConfig>) -> ResolvedCall {
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| provider.models.first().unwrap_or(&"").to_string());
     let api_key = cfg.and_then(|c| c.api_key.clone()).unwrap_or_default();
-    let base_url = cfg
-        .and_then(|c| c.base_url.clone())
-        .map(|u| u.trim().trim_end_matches('/').to_string())
-        .filter(|u| !u.is_empty())
-        .unwrap_or_else(|| provider.default_base_url.unwrap_or("").to_string());
-    ResolvedCall { provider, model, api_key, base_url }
+    let base_url = if let Some(raw_u) = cfg.and_then(|c| c.base_url.as_deref()).map(str::trim).filter(|u| !u.is_empty()) {
+        validate_ai_base_url(raw_u, provider.id)?
+    } else {
+        provider.default_base_url.unwrap_or("").to_string()
+    };
+    Ok(ResolvedCall { provider, model, api_key, base_url })
 }
 
 pub(crate) async fn call_provider(app: &AppState, rc: &ResolvedCall, system: &str, user: &str, history: &[(String, String)]) -> Result<String, String> {
@@ -495,14 +551,28 @@ fn bot_symbol(app: &Arc<AppState>, bot_id: &str) -> Option<String> {
 
 /// body: { mode: 'diagnose'|'chat', bot_id?, waterfall?, message?, history?,
 /// symbol?, config? } — config yalnız bu istekte yaşar.
-pub async fn ai_diagnose(State(app): State<Arc<AppState>>, Json(body): Json<DiagnoseBody>) -> impl IntoResponse {
+pub async fn ai_diagnose(State(app): State<Arc<AppState>>, Json(body): Json<DiagnoseBody>) -> axum::response::Response {
     let t0 = now_ms();
-    let rc = resolve_call(body.config.as_ref());
+    let rc = match resolve_call(body.config.as_ref()) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "verdict": "ERROR",
+                    "note": format!("Geçersiz AI yapılandırması: {e}"),
+                    "elapsedMs": now_ms() - t0,
+                })),
+            )
+                .into_response();
+        }
+    };
     let cfg_desc = body.config.as_ref().map(|c| c.redacted(rc.provider.id, &rc.model)).unwrap_or_else(|| format!("provider={} model={} apiKey=yok", rc.provider.id, rc.model));
     tracing::info!("[ai] diagnose isteği {}", cfg_desc);
     let mode = body.mode.as_deref().unwrap_or("diagnose");
     if mode == "chat" {
-        return ai_chat_inner(&app, &rc, body, t0).await;
+        return ai_chat_inner(&app, &rc, body, t0).await.into_response();
     }
     // ── diagnose ──
     let waterfall: Vec<Value> = match body.waterfall {
@@ -517,7 +587,8 @@ pub async fn ai_diagnose(State(app): State<Arc<AppState>>, Json(body): Json<Diag
             "ok": false, "verdict": "ABSTAIN", "provider": rc.provider.id, "model": rc.model,
             "note": "Analiz edilecek iz şelalesi boş — bot_id yanlış olabilir veya olaylar henüz yazılmadı.",
             "elapsedMs": now_ms() - t0,
-        }));
+        }))
+        .into_response();
     }
     let wtext = serde_json::to_string(&waterfall).unwrap_or_default();
     let codes = extract_codes(&wtext);
@@ -545,17 +616,20 @@ pub async fn ai_diagnose(State(app): State<Arc<AppState>>, Json(body): Json<Diag
             "model": format!("{} · {}", rc.provider.label, rc.model),
             "bullets": parse_bullets(&raw), "elapsedMs": now_ms() - t0,
             "sources": {"glossaryCodes": codes, "newsOk": news_ok},
-        })),
+        }))
+        .into_response(),
         Ok(raw) => Json(json!({
             "ok": false, "verdict": "ABSTAIN", "provider": rc.provider.id, "model": rc.model,
             "note": format!("model yanıtı çok kısa ({} karakter) — sahte analiz üretilmedi", raw.len()),
             "elapsedMs": now_ms() - t0,
-        })),
+        }))
+        .into_response(),
         Err(e) => Json(json!({
             "ok": false, "verdict": "ERROR", "provider": rc.provider.id, "model": rc.model,
             "note": format!("model çağrısı başarısız: {}", e.chars().take(160).collect::<String>()),
             "elapsedMs": now_ms() - t0,
-        })),
+        }))
+        .into_response(),
     }
 }
 
@@ -667,7 +741,10 @@ pub async fn news_ai(State(app): State<Arc<AppState>>, Json(body): Json<NewsAiBo
     if title.trim().is_empty() {
         return (StatusCode::OK, Json(json!({"ok": false, "summaryTr": Value::Null, "reason": "Başlık boş", "cached": false})));
     }
-    let rc = resolve_call(body.config.as_ref());
+    let rc = match resolve_call(body.config.as_ref()) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"ok": false, "summaryTr": Value::Null, "reason": format!("Geçersiz AI yapılandırması: {e}"), "cached": false}))),
+    };
     let user = format!("Başlık: {title}\nBunu tek cümlelik Türkçe sade özete dönüştür (en fazla 140 karakter).");
     match call_provider(&app, &rc, NEWS_TR_SYSTEM, &user, &[]).await {
         Ok(raw) => {
@@ -763,5 +840,46 @@ mod ai_tests {
         let s = c.redacted("openai", "gpt-4o");
         assert!(!s.contains("sk-gizli-anahtar-123"), "redakte özet anahtarı taşımamalı");
         assert!(s.contains("openai"));
+    }
+
+    #[test]
+    fn validate_ai_base_url_blocks_ssrf_and_permits_safe() {
+        // Block cloud metadata
+        assert!(validate_ai_base_url("http://169.254.169.254/latest/meta-data", "openai").is_err());
+        assert!(validate_ai_base_url("https://169.254.169.254/latest/meta-data", "openai").is_err());
+
+        // Block internal / loopback for cloud providers
+        assert!(validate_ai_base_url("http://127.0.0.1:8080", "openai").is_err());
+        assert!(validate_ai_base_url("https://127.0.0.1:8080", "openai").is_err());
+        assert!(validate_ai_base_url("http://localhost:8080", "openai").is_err());
+        assert!(validate_ai_base_url("https://192.168.1.1/admin", "openai").is_err());
+        assert!(validate_ai_base_url("https://10.0.0.1/api", "openai").is_err());
+        assert!(validate_ai_base_url("https://metadata.google.internal", "openai").is_err());
+
+        // Block non-https for cloud providers
+        assert!(validate_ai_base_url("http://api.openai.com/v1", "openai").is_err());
+        assert!(validate_ai_base_url("ftp://api.openai.com/v1", "openai").is_err());
+
+        // Safe cloud provider URL
+        assert_eq!(
+            validate_ai_base_url("https://api.openai.com/v1", "openai").unwrap(),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            validate_ai_base_url("https://api.deepseek.com", "deepseek").unwrap(),
+            "https://api.deepseek.com"
+        );
+
+        // Ollama: allows local loopback, blocks remote
+        assert_eq!(
+            validate_ai_base_url("http://localhost:11434", "ollama").unwrap(),
+            "http://localhost:11434"
+        );
+        assert_eq!(
+            validate_ai_base_url("http://127.0.0.1:11434", "ollama").unwrap(),
+            "http://127.0.0.1:11434"
+        );
+        assert!(validate_ai_base_url("http://external-evil.com:11434", "ollama").is_err());
+        assert!(validate_ai_base_url("http://192.168.1.50:11434", "ollama").is_err());
     }
 }

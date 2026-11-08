@@ -291,6 +291,9 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
   const { bots, loading, refetch } = useBots();
   const [view, setView] = useState<"cards" | "table">("cards");
   const [busyId, setBusyId] = useState<string | null>(null);
+  // Faz 24 (UI/UX Pro Max raporu §3.2.1): toplu seçim — checkbox ile çoklu
+  // bot başlat/duraklat. Seçim kart/tablo ortak id kümesi olarak tutulur.
+  const [selected, setSelected] = useState<Set<string>>(new Set());
   const [closeAllDialogId, setCloseAllDialogId] = useState<string | null>(null);
   const [hedgeOnly, setHedgeOnly] = useState(false);
   /* Faz 25 (UIX-25): filo arama + durum filtresi + kart sıralaması.
@@ -395,6 +398,44 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
       toast({ title: `${b.name}`, description: `Durum → ${target}` });
     });
 
+  /* Faz 24 (UI/UX Pro Max raporu §3.2.3): PANIC — açık pozisyonu marketten
+     kapat (CLOSE_ALL) ve botu durdur (STOP). İki aşamalı onaylı. */
+  const panicClose = (b: BotRow) => {
+    if (!window.confirm(`PANIC: ${b.name} — açık pozisyon marketten kapatılacak ve bot durdurulacak. Emin misiniz?`)) return;
+    void (async () => {
+      try {
+        await apiBotAction(b.id, "CLOSE_ALL");
+        await apiPatchBot(b.id, { status: "STOPPED" });
+        toast({ title: `${b.name} PANIC`, description: "Market çıkışı gönderildi, bot STOPPED." });
+        refetch();
+      } catch (e) {
+        toast({ title: "PANIC başarısız", description: String(e) });
+      }
+    })();
+  };
+
+  /* Faz 24 (UI/UX Pro Max raporu §3.2.1): toplu eylem — seçili botlara
+     tek tek apiBotAction uygular (motor serial işler), bitince refetch. */
+  const bulkAction = (action: string, label: string) => {
+    const ids = Array.from(selected);
+    if (ids.length === 0) return;
+    if (!window.confirm(`${label}: ${ids.length} bot uygulanacak. Emin misiniz?`)) return;
+    void (async () => {
+      let ok = 0;
+      for (const bid of ids) {
+        try {
+          await apiBotAction(bid, action);
+          ok += 1;
+        } catch {
+          /* tek bot hatası toplu akışı bozmaz — olay kaydı motor tarafında */
+        }
+      }
+      setSelected(new Set());
+      refetch();
+      toast({ title: label, description: `${ok}/${ids.length} bot uygulandı.` });
+    })();
+  };
+
   /* P2-2 Freeze: RUNNING → FROZEN (yeni emir yok, açıklar korunur), geri dönüş RUNNING. */
   const toggleFreeze = (b: BotRow) =>
     withBusy(b.id, async () => {
@@ -496,6 +537,24 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
           </div>
         }
       >
+        {/* Faz 24: toplu eylem araç çubuğu — yalnız seçim varken görünür */}
+        {selected.size > 0 && (
+          <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-emerald-500/40 bg-emerald-500/5 p-2.5">
+            <span className="text-xs font-bold text-emerald-300">{selected.size} bot seçili</span>
+            <Button size="sm" variant="outline" className="min-h-9 border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10" onClick={() => bulkAction("START", "Toplu Başlat")}>
+              <Play className="h-3.5 w-3.5" aria-hidden /> Başlat
+            </Button>
+            <Button size="sm" variant="outline" className="min-h-9 border-amber-500/40 text-amber-300 hover:bg-amber-500/10" onClick={() => bulkAction("PAUSE", "Toplu Duraklat")}>
+              <Pause className="h-3.5 w-3.5" aria-hidden /> Duraklat
+            </Button>
+            <Button size="sm" variant="outline" className="min-h-9 border-rose-500/40 text-rose-300 hover:bg-rose-500/10" onClick={() => bulkAction("CLOSE_ALL", "Toplu Kapat")}>
+              Kapat
+            </Button>
+            <Button size="sm" variant="ghost" className="min-h-9 text-slate-400" onClick={() => setSelected(new Set())}>
+              Seçimi temizle
+            </Button>
+          </div>
+        )}
         {loading && bots.length === 0 ? (
           <div className="flex items-center justify-center py-10">
             <Spinner className="h-6 w-6" />
@@ -620,6 +679,22 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
                       KERNEL&apos;İ SIFIRLA
                     </Button>
                   )}
+                  {/* Faz 24: toplu seçim checkbox'ı */}
+                  <label className="flex min-h-9 items-center gap-1.5 rounded-md border border-border px-2.5" aria-label={`${b.name} toplu seçim`}>
+                    <input
+                      type="checkbox"
+                      checked={selected.has(b.id)}
+                      onChange={(e) =>
+                        setSelected((s) => {
+                          const next = new Set(s);
+                          if (e.target.checked) next.add(b.id);
+                          else next.delete(b.id);
+                          return next;
+                        })
+                      }
+                      className="h-3.5 w-3.5 accent-emerald-500"
+                    />
+                  </label>
                   <Button size="sm" className="min-h-9 flex-1 bg-emerald-500/90 text-[#04150e] hover:bg-emerald-500" onClick={() => onInspect(b.id)}>
                     <Eye className="h-3.5 w-3.5" aria-hidden />
                     İncele
@@ -688,6 +763,20 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
                       Dondur
                     </Button>
                   ) : null}
+                  {/* Faz 24 (UI/UX Pro Max raporu §3.2.3): PANIC — tek tıkla
+                      market çıkışı + bot durdurma (onaylı). */}
+                  {b.status === "RUNNING" && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="min-h-9 border-rose-500/60 bg-rose-500/10 font-bold text-rose-300 hover:bg-rose-500/20"
+                      disabled={busyId === b.id}
+                      title="Pozisyonu marketten kapat ve botu durdur"
+                      onClick={() => void panicClose(b)}
+                    >
+                      PANIC
+                    </Button>
+                  )}
                   <CloseAllDialog
                     bot={b}
                     onClose={executeCloseAll}

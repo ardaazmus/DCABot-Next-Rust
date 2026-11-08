@@ -209,6 +209,16 @@ pub struct LiveTrackedOrder {
 impl BotRuntime {
     pub fn snapshot_json(&self) -> serde_json::Value {
         let snap = self.engine_kind.snapshot();
+        // Faz 24 (UI/UX Pro Max §3.1.2): net gerçekleşen (kernel tanımı:
+        // gross − kapanış fees − funding) UI'ya stats içinden taşınır —
+        // strategy EngineSnapshot'ında bu alan yoktur.
+        let mut snap = match serde_json::to_value(&snap) {
+            Ok(v) => v,
+            Err(_) => serde_json::json!({}),
+        };
+        if let Some(obj) = snap.as_object_mut() {
+            obj.insert("realized_net".into(), serde_json::json!(self.stepper.realized_net.to_string()));
+        }
         let warnings = dca_strategy::compute_warnings(&self.cfg, &self.stepper.instrument);
         // Faz 13B: equity'ler makro öncesi hesaplanır (json! blok kısıtı).
         let mark_now = self.stepper.last_close.as_deref().and_then(|x| dca_math::fraction::Fraction::from_any_str(x).ok());

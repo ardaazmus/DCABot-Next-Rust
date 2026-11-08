@@ -55,6 +55,8 @@ export interface BotStats {
   trailing_peak: string | null;
   safety_triggered: number;
   realized_gross: string;
+  /** Faz 24 (UI/UX Pro Max §3.1.2): net gerçekleşen (gross − kapanış fees − funding). */
+  realized_net?: string;
   cumulative_funding: string;
   deals_closed: number;
   wins: number;

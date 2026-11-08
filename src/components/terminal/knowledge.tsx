@@ -16,7 +16,7 @@
  */
 
 import { useMemo, useState } from "react";
-import { BookOpen, ChevronDown, FileText, Map, Search, ShieldCheck, Sparkles } from "lucide-react";
+import { BookOpen, ChevronDown, FileText, Map, Search, ShieldAlert, ShieldCheck, Sparkles, Webhook } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
@@ -121,6 +121,17 @@ const STATE_STYLE: Record<HonestyState, string> = {
   NONE: "border-slate-600/50 bg-slate-600/10 text-slate-500",
 };
 
+const GATES_INFO: [string, string][] = [
+  ["G1", "OHLC Monotonluk — H>L, O/C aralık içinde; bozuk veri varsa bot HALT'e geçer (fail-closed)."],
+  ["G2", "Fee Guard / Fee-Breaker — grid spread'i maker ücretini karşılamıyorsa yapı reddedilir."],
+  ["G3", "Slippage gerçekçiliği — fill fiyatı emir fiyatından kötüleşemez, sapma modeli denetlenir."],
+  ["G4", "No-lookahead — backtest yalnızca bar kapanışına kadar bilgi kullanabilir."],
+  ["G5", "Realism tagging — her fill MARKETABLE (taker) / RESTING (maker) / GAP-BETTER olarak etiketlenir."],
+  ["G6", "Capital guard — bakiye yetersizse emir SKIP/WAIT; negatif nakit oluşamaz."],
+  ["G7", "Seans takvimi (M21) — borsa kapalıyken emir üretimi durur; takvim verisi yoksa fail-closed."],
+  ["G8", "Opening salvo / gap konsolidasyonu — bar açılış boşlukları tek fill'e konsolide edilir."],
+];
+
 function ContractTab() {
   return (
     <div className="space-y-6">
@@ -179,6 +190,82 @@ function ContractTab() {
         </ul>
         <p className="mt-1.5 text-[11px] text-slate-400">Taşınmayacaklar (Telegram, toz süpürme, mainnet emir UI, login, v6Shield telemetri) plana dahil değildir.</p>
       </section>
+      <section aria-label="8 Fail-Closed Gate">
+        <h2 className="flex items-center gap-1.5 text-sm font-bold text-slate-100">
+          <ShieldCheck className="h-4 w-4 text-emerald-400" aria-hidden />
+          8 Fail-Closed Gate
+        </h2>
+        <p className="mt-1 text-[11px] text-slate-400">
+          Fail-closed ilkesi: bir gate doğrulayamazsa emir ÜRETİLMEZ. Tüm finansal hesaplamalar 4096-bit rasyonel aritmetikte yürür; float yalnızca ekran gösteriminde kullanılır.
+        </p>
+        <ul className="mt-2.5 space-y-1.5">
+          {GATES_INFO.map(([g, desc]) => (
+            <li key={g} className="flex items-start gap-2.5 rounded-lg border border-border bg-surface p-2.5 text-xs">
+              <span className="shrink-0 rounded border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 font-mono text-[10px] font-bold text-emerald-400">
+                {g}
+              </span>
+              <span className="leading-relaxed text-slate-300">{desc}</span>
+            </li>
+          ))}
+        </ul>
+      </section>
+
+      <section aria-label="Risk Felsefesi — İki Sınıf">
+        <h2 className="flex items-center gap-1.5 text-sm font-bold text-slate-100">
+          <ShieldAlert className="h-4 w-4 text-amber-400" aria-hidden />
+          Risk Felsefesi — İki Sınıf
+        </h2>
+        <div className="mt-2.5 grid gap-3 sm:grid-cols-2">
+          <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+            <div className="text-xs font-bold text-amber-400">1 · Uyarı &amp; Geçersiz Kılınabilir Korumalar</div>
+            <p className="mt-1.5 text-[11px] leading-relaxed text-slate-400">
+              M20 SL-Merdiven, Grid Komisyon Kırıcı (g_min), Seans Koruması, Açılış Salvo Tamponu, Gap Konsolidasyonu,
+              Makro Kara Pencere, Rejim Filtresi, Çoklu Güvenlik Emri, Günlük DD Kesici, Dolum Modeli.
+            </p>
+            <p className="mt-1.5 text-[11px] leading-relaxed text-amber-300/90">
+              Patron kullanıcıdır: motor emri engellemez; ne işe yaradığını ve üstlenilen riski yazar. Kullanıcı &quot;riski anladım&quot; onayı ile geçersiz kılabilir.
+            </p>
+          </div>
+          <div className="rounded-lg border border-rose-500/30 bg-rose-500/5 p-3">
+            <div className="text-xs font-bold text-rose-400">2 · Fiziksel &amp; Güvenlik Değişmezleri</div>
+            <p className="mt-1.5 text-[11px] leading-relaxed text-slate-400">
+              Zero-Withdrawal Hard Gate (çekim izni olan API anahtarı HTTP 422 ile reddedilir) ve Gate 6 — Olmayan Parayı Harcamama (bakiye yetersizse emir SKIP/WAIT).
+            </p>
+            <p className="mt-1.5 text-[11px] leading-relaxed text-rose-300/90">
+              Borsa fizik kuralları ve cüzdan güvenliği gereği asla esnetilemez; hiçbir kullanıcı onayı bu ikisini aşamaz.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section aria-label="TradingView Webhook Sözleşmesi">
+        <h2 className="flex items-center gap-1.5 text-sm font-bold text-slate-100">
+          <Webhook className="h-4 w-4 text-cyan-400" aria-hidden />
+          TradingView Webhook Sözleşmesi
+        </h2>
+        <p className="mt-1 text-[11px] leading-relaxed text-slate-400">
+          TradingView alarmını (webhook sekmesi) aşağıdaki uca yönlendirin — sinyal, botun Studio → Ayarlar sekmesindeki gizli anahtarıyla eşleşirse kuyruğa girer.
+        </p>
+        <div className="mt-2.5 rounded-lg border border-border-strong bg-surface p-2.5 font-mono text-[11px] text-cyan-300">
+          POST /api/webhooks/tradingview
+        </div>
+        <pre className="mt-2 overflow-x-auto rounded-lg border border-border bg-surface p-2.5 font-mono text-[10px] leading-relaxed text-slate-300">
+{`{
+  "secret": "tvw_<bot-gizli-anahtarı>",
+  "botId": "<bot-id>",
+  "action": "START_DEAL",
+  "pair": "BTCUSDT",
+  "timestamp": 1776672000000
+}`}
+        </pre>
+        <ul className="mt-2.5 space-y-1.5 text-[11px] leading-relaxed text-slate-400">
+          <li><span className="font-semibold text-slate-200">Secret:</span> <code className="font-mono text-[10px] text-amber-300">tvw_</code> önekli, bot başına üretilir.</li>
+          <li><span className="font-semibold text-slate-200">Replay koruması:</span> timestamp sn veya ms kabul edilir; ±60 sn dışı EXPIRED_ALERT ile reddedilir.</li>
+          <li><span className="font-semibold text-slate-200">Pair kapısı:</span> <code className="font-mono text-[10px]">pair</code> bot sembolüyle uyuşmazsa PAIR_MISMATCH uyarısı.</li>
+          <li><span className="font-semibold text-slate-200">Fail-closed:</span> açık deal varken çifte deal asla açılmaz; bot RUNNING değilse veya FREEZE devredeyse sinyal işlenmez.</li>
+        </ul>
+      </section>
+
       <section aria-label="Belgeler">
         <h2 className="flex items-center gap-1.5 text-sm font-bold text-slate-100">
           <BookOpen className="h-4 w-4 text-slate-400" aria-hidden />

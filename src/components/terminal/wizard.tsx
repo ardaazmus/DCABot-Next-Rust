@@ -1338,6 +1338,43 @@ export function Wizard({ onCreated }: WizardProps) {
 
         {/* ---------------- SECTION 3: parameters + start condition ---------------- */}
         <WizardSection n={3} title="Parametreler & Başlangıç Koşulu" valid={sec3Valid} hidden={!kind}>
+          {/* Faz 24 (UI/UX Pro Max raporu §3.4.1): hazır strateji şablonları —
+              tek tıkla sektörel başlangıç değerleri; kullanıcı onlarca
+              parametreyi sıfırdan doldurma bariyeri olmadan başlar. */}
+          {!isGridKind && kind && (
+            <div className="grid gap-2 sm:grid-cols-3">
+              {([
+                {
+                  key: "konservatif", label: "KONSERVATİF", desc: "Geniş tampon, düşük TP",
+                  dev: 2.5, safety: 8, tp: 1.5, step: 1.5, vol: 1.3,
+                },
+                {
+                  key: "dengeli", label: "DENGELİ (önerilen)", desc: "Standart dalgalanma",
+                  dev: 1.8, safety: 5, tp: 2.0, step: 1.3, vol: 1.4,
+                },
+                {
+                  key: "agresif", label: "AGRESİF / SCALP", desc: "Sık kademe, hızlı TP",
+                  dev: 0.8, safety: 3, tp: 1.0, step: 1.2, vol: 1.6,
+                },
+              ] as const).map((p) => (
+                <button
+                  key={p.key}
+                  onClick={() => {
+                    setDeviationPct(p.dev);
+                    setMaxSafety(p.safety);
+                    setTargetProfitPct(p.tp);
+                    setStepScale(String(p.step));
+                    setVolumeScale(String(p.vol));
+                    toast({ title: `${p.label} şablonu uygulandı`, description: "Parametreleri dilediğin gibi ince ayar yapabilirsin." });
+                  }}
+                  className="min-h-11 rounded-lg border border-border-strong bg-surface p-2.5 text-left transition-colors hover:border-emerald-500/50 hover:bg-emerald-500/5"
+                >
+                  <span className="block text-xs font-bold text-emerald-300">{p.label}</span>
+                  <span className="mt-0.5 block text-[10px] text-slate-400">{p.desc} — sapma %{p.dev}, {p.safety} kademe, TP %{p.tp}</span>
+                </button>
+              ))}
+            </div>
+          )}
           <div className="grid gap-4 lg:grid-cols-2">
             {!isGridKind ? (
               <Panel title="DCA Parametreleri" icon={<Bot className="h-4 w-4 text-slate-500" aria-hidden />}>
@@ -1368,6 +1405,25 @@ export function Wizard({ onCreated }: WizardProps) {
                     <NumField label="Step Scale" value={stepScale} onChange={setStepScale} />
                     <NumField label="Volume Scale" value={volumeScale} onChange={setVolumeScale} />
                   </div>
+                  {/* Faz 24 (UI/UX Pro Max raporu §3.4.2): fiyat düşüş kapsama
+                      göstergesi — merdivenin son seviyesinin kümülatif sapması
+                      + gereken toplam nakit; calc yanıtı geldikçe canlı. */}
+                  {calcDca && calcDca.levels.length > 0 && (
+                    <div className="rounded-lg border border-cyan-500/30 bg-cyan-500/5 p-2.5">
+                      <p className="text-[11px] leading-snug text-cyan-200/90">
+                        <span className="font-semibold">Fiyat kapsama:</span> bu yapı, fiyatın{" "}
+                        <span className="num font-bold">
+                          %{
+                            (
+                              (fracToNum(calcDca.levels[calcDca.levels.length - 1].cumDeviation ?? null) ?? 0) * 100
+                            ).toFixed(1)
+                          }
+                        </span>{" "}
+                        düşüşüne kadar alım yapmaya devam eder; gereken toplam nakit{" "}
+                        <span className="num font-bold">{fmtUsd(fracToNum(calcDca.totalNotional) ?? 0)}</span>.
+                      </p>
+                    </div>
+                  )}
                 </div>
               </Panel>
             ) : (

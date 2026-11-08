@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import {
+  Coins,
   Activity,
   ArrowLeft,
   Bot,
@@ -28,6 +29,7 @@ import {
   Workflow,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
@@ -61,6 +63,7 @@ const StudioBacktestRunner = dynamic(
   () => import("@/components/terminal/backtest-panel").then((m) => m.StudioBacktestRunner),
   { ssr: false, loading: () => <div className="p-6 text-xs text-slate-500">Backtest modülü yükleniyor…</div> },
 );
+import { EngineError } from "@/hooks/use-engine";
 import { apiAiProviders, apiBotAction, apiBotGrid, apiBotMemoryGenerate, apiBotMemoryList, apiBotTick, apiCalcDca, apiDryRun, apiMarkets, apiParity, apiPatchBot, apiReconcile, getBotMeta, useBotDetail, useBotEvents, useFills } from "@/hooks/use-engine";
 import { ForensicsTraces } from "@/components/terminal/forensics";
 import { fmtFrac, fmtNum, fmtTimeShort, fmtTs, fmtUsd, fmtUsdSigned, fracToNum, truncateMid } from "@/lib/format";
@@ -122,6 +125,11 @@ function sessionLabel(v: UserRiskPolicy["session_type"]): string {
 export function Studio({ botId, onBack }: { botId: string; onBack: () => void }) {
   const { bot, loading } = useBotDetail(botId);
   const { fills, loading: fillsLoading } = useFills(botId, { live: true });
+  // Faz 24 (UI/UX Pro Max raporu §3.3.3): Deal Kurtarma — son kademeden sonra
+  // likidasyondan kurtarmak/ortalamayı çekmek için manuel ek teminat.
+  const [addFundsOpen, setAddFundsOpen] = useState(false);
+  const [addFundsAmount, setAddFundsAmount] = useState("");
+  const [addFundsBusy, setAddFundsBusy] = useState(false);
   const { events, loading: eventsLoading } = useBotEvents(botId);
   // Wizard-created bots stash their config in sessionStorage; read lazily per mount.
   const [configHint] = useState<BotConfig | null>(() => {
@@ -351,6 +359,7 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
 
   const s = bot.stats;
   const isGrid = bot.kind.includes("GRID");
+  const isGridKind = isGrid;
   const isHedge = bot.kind.includes("HEDGE");
 
   /* Task 16: Risk Motoru — policy echo (legacy bots → engine defaults) + advisory warnings. */
@@ -378,8 +387,26 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
     push(s.tp_price, "#10b981", "TP", true);
     push(s.sl_price, "#f43f5e", "SL", true);
     push(s.next_safety_price, "#f59e0b", `S${s.next_safety_level ?? ""}`, true);
+    // Faz 24 (UI/UX Pro Max raporu §3.3.1): TAM merdiven — bekleyen tüm
+    // güvenlik seviyeleri (S1..Sn) grafikte; tüccar kaç kademe kaldığını
+    // fiyatla görsel eşleştirir. next_safety ile gelene kadar olanlar dolmuş
+    // kabul edilir (yerleştirme imleci sözleşmesi).
+    if (bot.ladder) {
+      for (const lv of bot.ladder) {
+        const pn = fracToNum(lv.price);
+        if (!pn || pn <= 0) continue;
+        const filled = s.next_safety_level != null && lv.level < s.next_safety_level;
+        lines.push({
+          price: pn,
+          color: filled ? "#475569" : "#f59e0b",
+          title: `SO${lv.level + 1}`,
+          dashed: true,
+        });
+        if (lines.length >= 14) break;
+      }
+    }
     push(bot.liqPrice, "#f43f5e", "LIQ", true);
-    return lines.slice(0, 8);
+    return lines.slice(0, 16);
   })();
 
   return (
@@ -428,6 +455,30 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
 
         {/* ---------- Genel ---------- */}
         <TabsContent value="genel" className="mt-4 space-y-4">
+          {/* Faz 24 (UI/UX Pro Max raporu §3.1.2): Deal performans şeridi —
+              kapanan deal sayısı, kazanma oranı ve net gerçekleşen kâr; tüccarın
+              ilk baktığı üç sayı artık Genel sekmesinin en üstünde. */}
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <div className="rounded-lg border border-border bg-surface p-3">
+              <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">KAPANAN DEAL</div>
+              <div className="num mt-1 text-xl font-bold text-slate-100">{s.deals_closed}</div>
+            </div>
+            <div className="rounded-lg border border-border bg-surface p-3">
+              <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">KAZANMA ORANI</div>
+              <div className={cn("num mt-1 text-xl font-bold", s.wins + s.losses > 0 ? (s.wins / (s.wins + s.losses) >= 0.5 ? "text-emerald-400" : "text-rose-400") : "text-slate-400")}>
+                {s.wins + s.losses > 0 ? `${Math.round((s.wins / (s.wins + s.losses)) * 100)}%` : "—"}
+              </div>
+              <div className="mt-0.5 text-[10px] text-slate-500">{s.wins}W / {s.losses}L</div>
+            </div>
+            <div className="rounded-lg border border-border bg-surface p-3">
+              <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">NET GERÇEKLENEN</div>
+              <div className="num mt-1 text-xl font-bold text-slate-100">{s.realized_net ? fmtUsdSigned(s.realized_net, 4) : "—"}</div>
+            </div>
+            <div className="rounded-lg border border-border bg-surface p-3">
+              <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">BRÜT GERÇEKLENEN</div>
+              <div className="num mt-1 text-xl font-bold text-slate-100">{fmtUsdSigned(s.realized_gross, 4)}</div>
+            </div>
+          </div>
           {/* Faz 21 (N-8): kernel sticky-halt artık GÖRÜNÜR — kırmızı şerit +
               açma düğmesi. Eski davranışta bot "görünmez şekilde duruyor",
               faz rozeti Open kalıyor, hiçbir emir gitmiyordu. */}
@@ -638,6 +689,58 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
                         } Merdiven ve sonraki güvenlik seviyesi deal açılınca burada görünür.`}
             </p>
           </Panel>
+          {/* Faz 24 (UI/UX Pro Max raporu §3.3.3): Deal Kurtarma / Manuel
+              Kademe (Add Funds) — son kademe sonrası likidasyon riskine
+              karşı manuel ek teminat; motor ADD_FUNDS aksiyonu pozisyon
+              yönüne göre emri açar ve TP'yi yeniden hesaplar. Yalnız OPEN
+              fazlı DCA botlarında gösterilir. */}
+          {!isGridKind && s.phase === "Open" && (
+            <Dialog open={addFundsOpen} onOpenChange={setAddFundsOpen}>
+              <Button
+                variant="outline"
+                className="min-h-10 w-full border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/10"
+                onClick={() => {
+                  setAddFundsAmount("");
+                  setAddFundsOpen(true);
+                }}
+              >
+                Deal Kurtarma — Manuel Kademe Ekle (Add Funds)
+              </Button>
+              <DialogContent className="sm:max-w-md">
+                <DialogHeader>
+                  <DialogTitle>Manuel Kademe Ekle</DialogTitle>
+                  <DialogDescription>
+                    Açık pozisyona ek teminat ekler: tutar, pozisyon yönüne göre piyasa emriyle işlenir ve TP yeni ortalama maliyete göre yeniden hesaplanır. Kaldıraçlı botlarda marjin etkisini göz önünde bulundurun.
+                  </DialogDescription>
+                </DialogHeader>
+                <Input
+                  inputMode="decimal"
+                  value={addFundsAmount}
+                  onChange={(e) => setAddFundsAmount(e.target.value.replace(/,/g, "."))}
+                  placeholder="Tutar (quote, örn. 150)"
+                  aria-label="Eklenecek tutar (quote)"
+                  className="num min-h-11 border-border-strong bg-surface text-slate-100"
+                />
+                <Button
+                  className="min-h-11 w-full bg-cyan-500/90 font-bold text-[#02171b] hover:bg-cyan-500"
+                  disabled={addFundsBusy || !(Number(addFundsAmount) > 0)}
+                  onClick={() => {
+                    setAddFundsBusy(true);
+                    void apiBotAction(bot.id, "ADD_FUNDS", addFundsAmount)
+                      .then(() => {
+                        toast({ title: "Add Funds gönderildi", description: `${fmtUsd(addFundsAmount)} — pozisyona işleniyor, TP yeniden hesaplanacak.` });
+                        setAddFundsOpen(false);
+                      })
+                      .catch((e) => toast({ title: "Add Funds başarısız", description: e instanceof EngineError ? (e.body as { error?: string })?.error || e.message : String(e) }))
+                      .finally(() => setAddFundsBusy(false));
+                  }}
+                >
+                  {addFundsBusy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Coins className="h-4 w-4" aria-hidden />}
+                  Ek Teminat Gönder
+                </Button>
+              </DialogContent>
+            </Dialog>
+          )}
         </TabsContent>
 
         {/* ---------- Hedge (Task 21) ---------- */}

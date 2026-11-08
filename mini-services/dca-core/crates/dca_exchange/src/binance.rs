@@ -204,16 +204,73 @@ impl VenueAdapter for BinanceAdapter {
         Ok(Vec::new()) // spot venue: no funding
     }
 
-    async fn key_permissions(&self, _creds: &VenueCreds) -> Result<KeyPermissions, String> {
-        // Binance: withdrawal permission cannot be introspected via public API;
-        // policy: keys MUST be trade-only; we flag as unknown-but-gated.
+    async fn key_permissions(&self, creds: &VenueCreds) -> Result<KeyPermissions, String> {
+        // 1. Try /sapi/v1/account/apiRestrictions first (official endpoint for checking withdrawal and trade permissions)
+        let q = self.signed_query("recvWindow=5000", &creds.secret);
+        let sapi_url = format!("{}/sapi/v1/account/apiRestrictions?{}", self.base_url, q);
+        let sapi_res = self
+            .http
+            .get(&sapi_url)
+            .header("X-MBX-APIKEY", &creds.key)
+            .send()
+            .await;
+
+        if let Ok(resp) = sapi_res {
+            if resp.status().is_success() {
+                if let Ok(v) = resp.json::<Value>().await {
+                    let can_withdraw = v.get("enableWithdrawals").and_then(|x| x.as_bool()).unwrap_or(false);
+                    let spot_trade = v.get("enableSpotAndMarginTrading").and_then(|x| x.as_bool()).unwrap_or(true);
+                    let contract_trade = v.get("enableFutures").and_then(|x| x.as_bool()).unwrap_or(false);
+                    let read_only = v.get("enableReading").and_then(|x| x.as_bool()).map(|r| r && !spot_trade && !contract_trade).unwrap_or(false);
+                    let ip_restrict = v.get("ipRestrict").and_then(|x| x.as_bool()).unwrap_or(false);
+                    let ips = if ip_restrict { vec!["IP_RESTRICTED".into()] } else { vec![] };
+                    return Ok(KeyPermissions {
+                        read_only,
+                        can_withdraw,
+                        spot_trade,
+                        contract_trade,
+                        ips,
+                        note: format!("binance /sapi/v1/account/apiRestrictions: can_withdraw={can_withdraw}, spot={spot_trade}, futures={contract_trade}"),
+                    });
+                }
+            }
+        }
+
+        // 2. Fallback to /api/v3/account (standard spot account endpoint, works on mainnet & testnet/demo)
+        let q = self.signed_query("recvWindow=5000", &creds.secret);
+        let acc_url = format!("{}/api/v3/account?{}", self.base_url, q);
+        let resp = self
+            .http
+            .get(&acc_url)
+            .header("X-MBX-APIKEY", &creds.key)
+            .send()
+            .await
+            .map_err(|e| format!("binance network error: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_body = resp.text().await.unwrap_or_default();
+            return Err(format!("binance account check failed ({status}): {err_body}"));
+        }
+
+        let v: Value = resp.json().await.map_err(|e| format!("binance response parse error: {e}"))?;
+        let can_withdraw = v.get("canWithdraw").and_then(|x| x.as_bool()).unwrap_or(false);
+        let can_trade = v.get("canTrade").and_then(|x| x.as_bool()).unwrap_or(false);
+        let perms: Vec<String> = v
+            .get("permissions")
+            .and_then(|x| x.as_array())
+            .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let spot_trade = can_trade && (perms.is_empty() || perms.iter().any(|p| p == "SPOT" || p == "TRD_GRP_002"));
+        let contract_trade = perms.iter().any(|p| p == "FUTURES" || p == "LEVERAGED");
+
         Ok(KeyPermissions {
-            read_only: false,
-            can_withdraw: false,
-            spot_trade: true,
-            contract_trade: false,
+            read_only: !can_trade,
+            can_withdraw,
+            spot_trade,
+            contract_trade,
             ips: vec![],
-            note: "binance: withdrawal gate enforced by policy (key must be trade-only)".into(),
+            note: format!("binance /api/v3/account: canWithdraw={can_withdraw}, canTrade={can_trade}, perms={perms:?}"),
         })
     }
 

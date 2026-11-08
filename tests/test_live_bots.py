@@ -5,12 +5,23 @@ Test bot creation, lifecycle, and market feeds for:
 2. BINANCE (Spot capability, Demo Trading account with active Vault key)
 """
 import json
+import os
+import re
 import urllib.request
 import urllib.error
 import time
 
 BASE_URL = "http://127.0.0.1:3002"
 _LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+API_KEY = os.environ.get("DCA_API_KEY", "")
+if not API_KEY and os.path.exists(".local-runtime/local-keys.env"):
+    with open(".local-runtime/local-keys.env", "r", encoding="utf-8") as f:
+        for line in f:
+            m = re.match(r"^DCA_API_KEY=(.*)$", line.strip())
+            if m:
+                API_KEY = m.group(1).strip()
+                break
 
 
 def _assert_local_api(url: str, path: str) -> str:
@@ -29,6 +40,8 @@ def api_call(path, method="GET", payload=None):
     url = _assert_local_api(f"{BASE_URL}{path}", path)
     data = json.dumps(payload).encode("utf-8") if payload else None
     headers = {"Content-Type": "application/json"} if payload else {}
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:

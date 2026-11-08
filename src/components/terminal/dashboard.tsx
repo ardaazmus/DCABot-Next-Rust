@@ -5,6 +5,7 @@ import { motion } from "framer-motion";
 import {
   ArrowRight,
   Bot,
+  ChartCandlestick,
   Coins,
   Gauge,
   Power,
@@ -27,7 +28,7 @@ import {
   StatusPill,
   VenueChip,
 } from "@/components/terminal/bits";
-import { apiKlines, apiNews, useBots, useEventStream, useFills, useHalt, useMaintenance, useSummary } from "@/hooks/use-engine";
+import { apiEquity, apiKlines, apiNews, useBots, useEventStream, useFills, useHalt, useMaintenance, useSummary } from "@/hooks/use-engine";
 import {
   fmtFrac,
   fmtNum,
@@ -38,6 +39,61 @@ import {
   kindLabel,
 } from "@/lib/format";
 import { cn } from "@/lib/utils";
+
+/** Faz 24 (UI/UX Pro Max raporu §3.1.1): portföy equity curve — 30 günlük
+ *  kümülatif özkaynak eğrisi (motor equity_points birleşimi, örneklenmiş).
+ *  Bağımlılıksız inline SVG area chart. */
+function EquityCurveCard({ points }: { points: { ts: number; equity: number }[] | null }) {
+  const W = 560;
+  const H = 140;
+  const path = useMemo(() => {
+    if (!points || points.length < 2) return null;
+    const vals = points.map((p) => p.equity).filter(Number.isFinite);
+    if (vals.length < 2) return null;
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    const span = max - min || 1;
+    const step = W / (points.length - 1);
+    const coords = points.map((p, i) => {
+      const x = i * step;
+      const y = H - 8 - ((p.equity - min) / span) * (H - 24);
+      return `${i === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
+    });
+    const area = `${coords.join(" ")} L${W},${H} L0,${H} Z`;
+    const first = vals[0];
+    const last = vals[vals.length - 1];
+    const up = last >= first;
+    return { line: coords.join(" "), area, up, first, last };
+  }, [points]);
+  const stroke = path?.up ? "#34d399" : "#fb7185";
+  return (
+    <Panel title="Portföy Özkaynak Eğrisi (30g)" icon={<ChartCandlestick className="h-4 w-4 text-slate-500" aria-hidden />}>
+      {!path ? (
+        <div className="flex h-[140px] items-center justify-center text-xs text-slate-500">
+          {points && points.length < 2 ? "Grafik için en az 2 günlük veri gerekli — botlar çalıştıkça dolar." : "Yükleniyor…"}
+        </div>
+      ) : (
+        <div>
+          <div className="mb-1 flex items-baseline gap-2">
+            <span className={cn("num text-lg font-bold", path.up ? "text-emerald-400" : "text-rose-400")}>
+              {path.last.toLocaleString("tr-TR", { maximumFractionDigits: 2 })}
+            </span>
+            <span className="num text-[11px] text-slate-500">
+              30g değişim: {(((path.last - path.first) / (Math.abs(path.first) || 1)) * 100).toFixed(2)}%
+            </span>
+          </div>
+          <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} preserveAspectRatio="none" aria-hidden="true">
+            <path d={path.area} fill={stroke} opacity="0.08" />
+            <path d={path.line} fill="none" stroke={stroke} strokeWidth="2" />
+          </svg>
+          <p className="mt-1 text-[10px] text-slate-500">Tüm botların birleşik özkaynağı (motor equity kayıtları, UTC zaman damgalı).</p>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+
 
 const DONUT_COLORS = ["#10B981", "#06B6D4", "#F59E0B", "#F43F5E", "#94A3B8", "#0EA5E9", "#D946EF"];
 
@@ -236,6 +292,27 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
   const { bots } = useBots();
   const { events, connected } = useEventStream();
   const { kill, freeze } = useHalt();
+  // Faz 24 (UI/UX Pro Max raporu §3.1.1): portföy equity curve verisi —
+  // 30 günlük motor equity_points birleşimi; her 5 dk tazelenir.
+  const [equity, setEquity] = useState<{ ts: number; equity: number }[] | null>(null);
+  useEffect(() => {
+    let alive = true;
+    const tick = () => {
+      apiEquity(30)
+        .then((r) => {
+          if (alive) setEquity(r.points ?? []);
+        })
+        .catch(() => {
+          if (alive) setEquity(null);
+        });
+    };
+    tick();
+    const t = setInterval(tick, 300_000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, []);
   /* Faz 25 (UIX-19): SSE akışı ham mühendislik günlüğüydü — dakikada bir
      tekrarlayan EQUITY tick'leri işleme-önemli olayları (FILL/RISK/TP...) ekrandan
      itiyordu. Varsayılan filtre "İşlem-önemli"; EQUITY/LOG INFO opt-in.
@@ -464,6 +541,7 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
 
       {/* Middle: allocation + fleet */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+        <EquityCurveCard points={equity} />
         <Panel title="Tahsis Dağılımı" icon={<Coins className="h-4 w-4 text-slate-500" aria-hidden />}>
           {/* Faz 25 (UIX-32): tek varlıkta donut bilgi taşımaz — ölü alanı
               işletme özetiyle değiştir; çok varlıkta donut kalır. */}
