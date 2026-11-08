@@ -31,3 +31,4 @@ uuid = { workspace = true }
 lettre = { workspace = true }
 futures-util = { workspace = true }
 reqwest = { workspace = true }
+zeroize = { workspace = true }

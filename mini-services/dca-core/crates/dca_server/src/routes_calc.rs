@@ -27,6 +27,7 @@ use crate::routes_common::err422;
 
 // ---------------- Calculators ----------------
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
 pub(crate) struct DcaCalcReq {
     anchor: String,
@@ -150,6 +151,7 @@ pub(crate) async fn calc_dca(Json(req): Json<DcaCalcReq>) -> Result<axum::respon
     Ok(axum::Json(body).into_response())
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
 pub(crate) struct GridCalcReq {
     lower: String,

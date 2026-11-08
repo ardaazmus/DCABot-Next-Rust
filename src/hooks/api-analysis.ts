@@ -108,6 +108,105 @@ export async function apiEquity(days = 30, signal?: AbortSignal): Promise<{ days
   return engineFetch(`/api/equity?days=${days}`, { ...{ signal }, ...{} } as RequestInit);
 }
 
+export interface ClosedDeal {
+  id: string;
+  botId: string;
+  botName: string;
+  symbol: string;
+  venue: string;
+  kind: string;
+  closedTs: number;
+  date: string;
+  time: string;
+  grossPnl: number;
+  fees: number;
+  funding: number;
+  netPnl: number;
+  wins: number;
+  losses: number;
+  result: "WIN" | "LOSS";
+  reason: "TP" | "SL" | "LIQUIDATION" | "MANUAL";
+}
+
+export interface DealsSummary {
+  totalNetPnl: number;
+  totalGrossPnl: number;
+  totalFees: number;
+  totalFunding: number;
+  wins: number;
+  losses: number;
+  winRate: number;
+  profitFactor?: number;
+  avgDealProfit?: number;
+}
+
+export interface DealsResponse {
+  deals: ClosedDeal[];
+  total: number;
+  summary: DealsSummary;
+}
+
+export interface DailyPnlBar {
+  date: string;
+  dayTs: number;
+  netPnl: number;
+  grossPnl: number;
+  fees: number;
+  funding: number;
+  count: number;
+  wins: number;
+  losses: number;
+  winRate: number;
+}
+
+export interface DailyPnlResponse {
+  days: DailyPnlBar[];
+  summary: {
+    totalNetPnl: number;
+    totalDeals: number;
+    profitableDays: number;
+    unprofitableDays: number;
+    neutralDays: number;
+    bestDay: { date: string; netPnl: number; count: number } | null;
+    worstDay: { date: string; netPnl: number; count: number } | null;
+    profitFactor?: number;
+  };
+}
+
+export async function apiDeals(
+  params?: {
+    days?: number;
+    date?: string;
+    bot_id?: string;
+    symbol?: string;
+    q?: string;
+    limit?: number;
+  },
+  signal?: AbortSignal,
+): Promise<DealsResponse> {
+  const q = new URLSearchParams();
+  if (params?.days != null) q.set("days", String(params.days));
+  if (params?.date) q.set("date", params.date);
+  if (params?.bot_id) q.set("bot_id", params.bot_id);
+  if (params?.symbol) q.set("symbol", params.symbol);
+  if (params?.q) q.set("q", params.q);
+  if (params?.limit != null) q.set("limit", String(params.limit));
+  const qs = q.toString();
+  return engineFetch(`/api/deals${qs ? `?${qs}` : ""}`, { signal });
+}
+
+export async function apiDailyPnl(
+  days = 30,
+  params?: { bot_id?: string; symbol?: string },
+  signal?: AbortSignal,
+): Promise<DailyPnlResponse> {
+  const q = new URLSearchParams();
+  q.set("days", String(days));
+  if (params?.bot_id) q.set("bot_id", params.bot_id);
+  if (params?.symbol) q.set("symbol", params.symbol);
+  return engineFetch(`/api/daily-pnl?${q.toString()}`, { signal });
+}
+
 export async function apiParity(body: { bot_id: string; bars?: number; interval?: string }): Promise<ParityResult> {
   return engineFetch("/api/parity", engineJson("POST", body));
 }

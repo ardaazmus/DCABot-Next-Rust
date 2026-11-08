@@ -51,6 +51,7 @@ import { apiBotAction, apiDeleteBot, apiPatchBot, useBots, useFleetTape } from "
 import { fmtFrac, fmtTimeShort, fmtTs, fmtUsd, fmtUsdSigned, fracToNum, kindLabel } from "@/lib/format";
 import { toast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
+import { DealProgressBar } from "@/components/terminal/deal-progress-bar";
 import type { Bot as BotRow } from "@/lib/engine-types";
 
 /* Task 16 — compact risk-policy chips for fleet cards/table (max 2). */
@@ -301,12 +302,55 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
      sektör standardı (Bitsgap/3Commas) ve en büyük kayıp listede gömülü kalmasın. */
   const [query, setQuery] = useState("");
   const [statusF, setStatusF] = useState<"ALL" | "RUNNING" | "PAUSED" | "FROZEN" | "STOPPED">("ALL");
+  type SmartFilter = "ALL" | "OPEN_DEAL" | "BAG_HOLDING" | "RISK_MARGIN" | "HALT_WARN" | "STOPPED";
+  const [smartF, setSmartF] = useState<SmartFilter>("ALL");
   const [cardSort, setCardSort] = useState<"impact" | "pnl-asc" | "pnl-desc" | "name" | "symbol">("impact");
   const hedgeCount = bots.filter((b) => HEDGE_KINDS.has(b.kind)).length;
+  const openDealsCount = useMemo(() => bots.filter((b) => b.stats.phase === "Open").length, [bots]);
+  const bagHoldingCount = useMemo(() => {
+    return bots.filter(
+      (b) =>
+        b.stats.phase === "Open" &&
+        b.config?.max_safety_orders != null &&
+        b.stats.safety_triggered >= b.config.max_safety_orders,
+    ).length;
+  }, [bots]);
+  const riskMarginCount = useMemo(() => {
+    return bots.filter((b) => {
+      const im = fracToNum(b.imUsed) ?? 0;
+      const unreal = fracToNum(b.unrealizedNow) ?? 0;
+      return im > 0 && unreal < 0 && (-unreal / im) * 100 >= 50;
+    }).length;
+  }, [bots]);
+  const haltWarnCount = useMemo(() => bots.filter((b) => b.kernelHalted || (b.warnings?.length ?? 0) > 0).length, [bots]);
+  const stoppedCount = useMemo(() => bots.filter((b) => b.status === "STOPPED").length, [bots]);
+  const runningBots = useMemo(() => bots.filter((b) => b.status === "RUNNING"), [bots]);
+  const pausedBots = useMemo(() => bots.filter((b) => b.status === "PAUSED"), [bots]);
+
   const shown = useMemo(() => {
     const q = query.trim().toLocaleLowerCase("tr");
     let list = bots;
     if (hedgeOnly) list = list.filter((b) => HEDGE_KINDS.has(b.kind));
+    if (smartF === "OPEN_DEAL") list = list.filter((b) => b.stats.phase === "Open");
+    else if (smartF === "BAG_HOLDING") {
+      list = list.filter(
+        (b) =>
+          b.stats.phase === "Open" &&
+          b.config?.max_safety_orders != null &&
+          b.stats.safety_triggered >= b.config.max_safety_orders,
+      );
+    }
+    else if (smartF === "RISK_MARGIN") {
+      list = list.filter((b) => {
+        const im = fracToNum(b.imUsed) ?? 0;
+        const unreal = fracToNum(b.unrealizedNow) ?? 0;
+        return im > 0 && unreal < 0 && (-unreal / im) * 100 >= 50;
+      });
+    } else if (smartF === "HALT_WARN") {
+      list = list.filter((b) => b.kernelHalted || (b.warnings?.length ?? 0) > 0);
+    } else if (smartF === "STOPPED") {
+      list = list.filter((b) => b.status === "STOPPED");
+    }
     if (statusF !== "ALL") list = list.filter((b) => b.status === statusF);
     if (q) list = list.filter((b) => b.name.toLocaleLowerCase("tr").includes(q) || b.symbol.toLocaleLowerCase("tr").includes(q));
     if (view === "cards") {
@@ -327,7 +371,7 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
       });
     }
     return list;
-  }, [bots, hedgeOnly, statusF, query, view, cardSort]);
+  }, [bots, hedgeOnly, smartF, statusF, query, view, cardSort]);
   /* P7 — tablo sıralaması (aria-sort). Kart görünümü etkilenmez. */
   const [sortKey, setSortKey] = useState<"name" | "status" | "pnl" | null>(null);
   const [sortDir, setSortDir] = useState<1 | -1>(1);
@@ -462,6 +506,38 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
       toast({ title: `${b.name}`, description: "Bot silindi." });
     });
 
+  const handleBulkPauseAll = async () => {
+    if (runningBots.length === 0) return;
+    if (!window.confirm(`Çalışan ${runningBots.length} botun tümü duraklatılacak. Emin misiniz?`)) return;
+    let ok = 0;
+    for (const b of runningBots) {
+      try {
+        await apiPatchBot(b.id, { status: "PAUSED" });
+        ok++;
+      } catch {
+        /* devam et */
+      }
+    }
+    refetch();
+    toast({ title: "Toplu Duraklatma", description: `${ok}/${runningBots.length} bot duraklatıldı.` });
+  };
+
+  const handleBulkResumeAll = async () => {
+    if (pausedBots.length === 0) return;
+    if (!window.confirm(`Duraklatılmış ${pausedBots.length} botun tümü başlatılacak. Emin misiniz?`)) return;
+    let ok = 0;
+    for (const b of pausedBots) {
+      try {
+        await apiPatchBot(b.id, { status: "RUNNING" });
+        ok++;
+      } catch {
+        /* devam et */
+      }
+    }
+    refetch();
+    toast({ title: "Toplu Başlatma", description: `${ok}/${pausedBots.length} bot başlatıldı.` });
+  };
+
   return (
     <div className="space-y-4">
       <Panel
@@ -539,22 +615,149 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
       >
         {/* Faz 24: toplu eylem araç çubuğu — yalnız seçim varken görünür */}
         {selected.size > 0 && (
-          <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-emerald-500/40 bg-emerald-500/5 p-2.5">
-            <span className="text-xs font-bold text-emerald-300">{selected.size} bot seçili</span>
-            <Button size="sm" variant="outline" className="min-h-9 border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10" onClick={() => bulkAction("START", "Toplu Başlat")}>
-              <Play className="h-3.5 w-3.5" aria-hidden /> Başlat
-            </Button>
-            <Button size="sm" variant="outline" className="min-h-9 border-amber-500/40 text-amber-300 hover:bg-amber-500/10" onClick={() => bulkAction("PAUSE", "Toplu Duraklat")}>
-              <Pause className="h-3.5 w-3.5" aria-hidden /> Duraklat
-            </Button>
-            <Button size="sm" variant="outline" className="min-h-9 border-rose-500/40 text-rose-300 hover:bg-rose-500/10" onClick={() => bulkAction("CLOSE_ALL", "Toplu Kapat")}>
-              Kapat
-            </Button>
-            <Button size="sm" variant="ghost" className="min-h-9 text-slate-400" onClick={() => setSelected(new Set())}>
-              Seçimi temizle
-            </Button>
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-emerald-500/40 bg-emerald-500/10 p-3 shadow-md">
+            <div className="flex items-center gap-2">
+              <span className="flex h-6 w-6 items-center justify-center rounded-full bg-emerald-500/20 text-xs font-bold text-emerald-300">
+                {selected.size}
+              </span>
+              <span className="text-xs font-bold text-emerald-200">bot seçili</span>
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <Button size="sm" variant="outline" className="min-h-8 border-emerald-500/50 text-xs text-emerald-300 hover:bg-emerald-500/20" onClick={() => bulkAction("START", "Toplu Başlat")}>
+                <Play className="mr-1 h-3.5 w-3.5" aria-hidden /> Başlat
+              </Button>
+              <Button size="sm" variant="outline" className="min-h-8 border-amber-500/50 text-xs text-amber-300 hover:bg-amber-500/20" onClick={() => bulkAction("PAUSE", "Toplu Duraklat")}>
+                <Pause className="mr-1 h-3.5 w-3.5" aria-hidden /> Duraklat
+              </Button>
+              <Button size="sm" variant="outline" className="min-h-8 border-cyan-500/50 text-xs text-cyan-300 hover:bg-cyan-500/20" onClick={() => bulkAction("FREEZE", "Toplu Dondur")}>
+                <Snowflake className="mr-1 h-3.5 w-3.5" aria-hidden /> Dondur
+              </Button>
+              <Button size="sm" variant="outline" className="min-h-8 border-rose-500/50 text-xs text-rose-300 hover:bg-rose-500/20" onClick={() => bulkAction("CLOSE_ALL", "Toplu Kapat")}>
+                <XCircle className="mr-1 h-3.5 w-3.5" aria-hidden /> Kapat
+              </Button>
+              <Button size="sm" variant="ghost" className="min-h-8 text-xs text-slate-400 hover:text-slate-200" onClick={() => setSelected(new Set())}>
+                Seçimi temizle
+              </Button>
+            </div>
           </div>
         )}
+        {/* Faz 25: Akıllı durum filtre çipleri & Hızlı Toplu Yönetim */}
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2 text-xs">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => setSmartF("ALL")}
+              className={cn(
+                "rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition-colors",
+                smartF === "ALL" ? "border-slate-400 bg-secondary text-slate-100" : "border-border text-slate-400 hover:text-slate-200"
+              )}
+            >
+              Tümü ({bots.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setSmartF("OPEN_DEAL")}
+              className={cn(
+                "rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition-colors",
+                smartF === "OPEN_DEAL"
+                  ? "border-cyan-500/60 bg-cyan-500/15 text-cyan-300"
+                  : "border-border text-slate-400 hover:text-slate-200",
+              )}
+            >
+              ⚡ Açık Deal ({openDealsCount})
+            </button>
+            <button
+              type="button"
+              onClick={() => setSmartF("BAG_HOLDING")}
+              className={cn(
+                "rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition-colors",
+                smartF === "BAG_HOLDING"
+                  ? "border-amber-500/60 bg-amber-500/15 text-amber-300"
+                  : bagHoldingCount > 0
+                    ? "border-amber-500/30 text-amber-400/90 hover:bg-amber-500/5"
+                    : "border-border text-slate-400 hover:text-slate-200",
+              )}
+            >
+              ⚠️ Kademe Tükendi ({bagHoldingCount})
+            </button>
+            <button
+              type="button"
+              onClick={() => setSmartF("RISK_MARGIN")}
+              className={cn(
+                "rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition-colors",
+                smartF === "RISK_MARGIN"
+                  ? "border-rose-500/60 bg-rose-500/15 text-rose-300"
+                  : riskMarginCount > 0
+                    ? "border-rose-500/30 text-rose-400/90 hover:bg-rose-500/5"
+                    : "border-border text-slate-400 hover:text-slate-200"
+              )}
+            >
+              ⚠️ Likidasyon Riski ({riskMarginCount})
+            </button>
+            <button
+              type="button"
+              onClick={() => setSmartF("HALT_WARN")}
+              className={cn(
+                "rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition-colors",
+                smartF === "HALT_WARN"
+                  ? "border-amber-500/60 bg-amber-500/15 text-amber-300"
+                  : haltWarnCount > 0
+                    ? "border-amber-500/30 text-amber-400/90 hover:bg-amber-500/5"
+                    : "border-border text-slate-400 hover:text-slate-200"
+              )}
+            >
+              🛑 Halt / Uyarı ({haltWarnCount})
+            </button>
+            <button
+              type="button"
+              onClick={() => setSmartF("STOPPED")}
+              className={cn(
+                "rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition-colors",
+                smartF === "STOPPED" ? "border-slate-400 bg-secondary text-slate-100" : "border-border text-slate-400 hover:text-slate-200"
+              )}
+            >
+              Duran ({stoppedCount})
+            </button>
+          </div>
+
+          {/* 3Commas benchmark: Hızlı Toplu Yönetim Düğmeleri */}
+          <div className="flex flex-wrap items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => {
+                if (selected.size === shown.length && shown.length > 0) {
+                  setSelected(new Set());
+                } else {
+                  setSelected(new Set(shown.map((b) => b.id)));
+                }
+              }}
+              className="rounded-lg border border-border bg-surface px-2.5 py-1 text-[11px] font-semibold text-slate-300 transition-colors hover:bg-secondary hover:text-white"
+            >
+              {selected.size === shown.length && shown.length > 0 ? "Seçimi Kaldır" : `Tümünü Seç (${shown.length})`}
+            </button>
+            {runningBots.length > 0 && (
+              <button
+                type="button"
+                onClick={handleBulkPauseAll}
+                className="inline-flex items-center gap-1 rounded-lg border border-amber-500/40 bg-amber-500/10 px-2.5 py-1 text-[11px] font-semibold text-amber-300 transition-colors hover:bg-amber-500/20"
+                title="Çalışan tüm botları duraklat"
+              >
+                <Pause className="h-3 w-3" /> Tümünü Duraklat ({runningBots.length})
+              </button>
+            )}
+            {pausedBots.length > 0 && (
+              <button
+                type="button"
+                onClick={handleBulkResumeAll}
+                className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-semibold text-emerald-300 transition-colors hover:bg-emerald-500/20"
+                title="Duraklatılmış tüm botları başlat"
+              >
+                <Play className="h-3 w-3" /> Tümünü Başlat ({pausedBots.length})
+              </button>
+            )}
+          </div>
+        </div>
+
         {loading && bots.length === 0 ? (
           <div className="flex items-center justify-center py-10">
             <Spinner className="h-6 w-6" />
@@ -582,14 +785,43 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ duration: 0.22, delay: i * 0.04 }}
-                className="flex flex-col rounded-xl border border-border bg-surface p-4 transition-colors hover:border-border-strong"
+                className={cn(
+                  "relative flex flex-col rounded-xl border bg-surface p-4 transition-colors hover:border-border-strong",
+                  selected.has(b.id) ? "border-emerald-500/60 ring-1 ring-emerald-500/30" : "border-border",
+                )}
               >
                 <div className="flex items-start justify-between gap-2">
-                  <div className="min-w-0">
-                    <div className="truncate text-sm font-semibold text-slate-100">{b.name}</div>
-                    <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                      <BotIdentityBadges bot={b} />
-                      <RiskWarningBadge bot={b} />
+                  <div className="flex items-start gap-2.5 min-w-0">
+                    <input
+                      type="checkbox"
+                      aria-label={`${b.name} seç`}
+                      checked={selected.has(b.id)}
+                      onChange={(e) =>
+                        setSelected((s) => {
+                          const next = new Set(s);
+                          if (e.target.checked) next.add(b.id);
+                          else next.delete(b.id);
+                          return next;
+                        })
+                      }
+                      className="mt-0.5 h-4 w-4 rounded border-border-strong bg-secondary text-emerald-500 focus:ring-emerald-500/40"
+                    />
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-semibold text-slate-100">{b.name}</div>
+                      <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                        <BotIdentityBadges bot={b} />
+                        <RiskWarningBadge bot={b} />
+                        {b.stats.phase === "Open" &&
+                          b.config?.max_safety_orders != null &&
+                          b.stats.safety_triggered >= b.config.max_safety_orders && (
+                            <span
+                              className="inline-flex items-center gap-1 rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-bold text-amber-300 ring-1 ring-amber-500/40"
+                              title="Tüm güvenlik emirleri doldu (Kademe tükendi). Fiyat dönene veya Add Funds eklenene kadar beklemede."
+                            >
+                              ⚠️ KADEME TÜKENDİ
+                            </span>
+                          )}
+                      </div>
                     </div>
                   </div>
                   {/* Faz 25 (UIX-26): KERNEL HALT birincil durumdur — RUNNING
@@ -650,6 +882,28 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
                       {fmtUsdSigned(b.stats.realized_gross)}
                     </div>
                   </div>
+                </div>
+
+                {/* 3Commas tarzı görsel SO Stepper & TP mesafe ilerleme çubuğu */}
+                <div className="mt-2.5">
+                  <DealProgressBar
+                    phase={b.stats.phase}
+                    safetyTriggered={b.stats.safety_triggered}
+                    maxSafetyOrders={b.config?.max_safety_orders}
+                    avgPrice={b.stats.avg_price}
+                    tpPrice={b.stats.tp_price}
+                    slPrice={b.stats.sl_price}
+                    currentPrice={b.markPrice}
+                    unrealizedPnl={b.unrealizedNow}
+                    liqPrice={b.liqPrice}
+                    marginMode={b.marginMode}
+                    nextSafetyPrice={b.stats.next_safety_price}
+                    nextSafetyLevel={b.stats.next_safety_level}
+                    positionQty={b.stats.position_qty}
+                    isShort={b.kind === "DCA_SHORT"}
+                    symbol={b.symbol}
+                    compact={true}
+                  />
                 </div>
 
                 {/* Faz 25 (UIX-43) / Faz 27: kaldıraçlı botta marj erimesi

@@ -73,6 +73,7 @@ pub struct BotRuntime {
     /// Son fetch DENEMESİ (başarısızlıkta retry throttle'ı).
     pub funding_history_tried_at: i64,
     /// Faz 23: boş-geçmiş uyarısı yalnız bir kez (spam koruması).
+    #[allow(dead_code)]
     pub funding_empty_warned: bool,
     /// Faz 23 (derin inceleme): sweep dönen-pencere imleci — poll başına en
     /// fazla SWEEP_MAX_ORDERS emir taranır; runtimes kilidi ağ çağrılarıyla
@@ -137,6 +138,7 @@ pub fn parse_halt_message(msg: &str) -> Option<(String, Option<String>, Option<S
 /// kill tüm modlarda TV ENTRY dahil yürütmeyi durdurur (v3: paper tick sürer
 /// ama TV ENTRY reddedilir); freeze yalnız LIVE hattı durdurur.
 /// PAPER poll döngüsü her iki şalterde de sürer.
+#[allow(dead_code)]
 pub fn live_halted(mode: &str, kill: bool, freeze: bool) -> bool {
     mode == "LIVE" && (kill || freeze)
 }
@@ -159,6 +161,7 @@ pub enum LiveIntent {
 }
 
 impl LiveIntent {
+    #[allow(dead_code)]
     pub fn id(&self) -> &str {
         match self {
             LiveIntent::Place { id, .. } => id,
@@ -284,6 +287,7 @@ impl BotRuntime {
             "equityNow": equity_now,
             "hedgeEquityNow": hedge_equity_now,
             "unrealizedNow": unrealized_now,
+            "markPrice": self.stepper.last_close.clone(),
         })
     }
 }
@@ -532,6 +536,7 @@ pub fn new_tick_trace(bot_id: &str) -> String {
     format!("tr-{}-{}", if short.is_empty() { "bot" } else { &short }, now_ms())
 }
 
+#[allow(dead_code)]
 pub async fn persist_bot_stats(app: &AppState, bot_id: &str, stats_json: &str) {
     if let Ok(conn) = app.db.conn.lock() {
         if let Err(e) = conn.execute("UPDATE bots SET stats=?1 WHERE id=?2", rusqlite::params![stats_json, bot_id]) {

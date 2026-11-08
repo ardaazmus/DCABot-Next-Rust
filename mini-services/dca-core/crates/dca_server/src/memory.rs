@@ -81,7 +81,7 @@ async fn collect_context(app: &AppState, bot_id: &str) -> Result<Value, String> 
             let s = r.engine_kind.snapshot();
             let is_short = matches!(r.cfg.kind, dca_strategy::StrategyKind::DcaShort);
             let mark = r.stepper.last_close.as_deref().and_then(|m| m.parse::<f64>().ok()).filter(|m| *m > 0.0);
-            let qty = s.position_qty.split('/').next().and_then(|q| q.trim().parse::<f64>().ok()).unwrap_or(0.0);
+            let _qty = s.position_qty.split('/').next().and_then(|q| q.trim().parse::<f64>().ok()).unwrap_or(0.0);
             let avg = s.avg_price.as_deref().and_then(|a| a.parse::<f64>().ok()).filter(|a| *a > 0.0);
             let upct = match (mark, avg) {
                 (Some(m), Some(a)) => Some(((m - a) / a) * if is_short { -100.0 } else { 100.0 }),

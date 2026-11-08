@@ -6,6 +6,8 @@ import {
   ArrowRight,
   Bot,
   ChartCandlestick,
+  ChevronDown,
+  ChevronUp,
   Coins,
   Gauge,
   Power,
@@ -17,6 +19,9 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { NewsPulse } from "@/components/terminal/news-pulse";
+import { DailyPnlChart } from "@/components/terminal/daily-pnl-chart";
+import { ClosedDealsLedger } from "@/components/terminal/closed-deals";
+import { DealProgressBar } from "@/components/terminal/deal-progress-bar";
 import { Donut, ExposureBar, type DonutSlice } from "@/components/terminal/charts";
 import {
   EmptyState,
@@ -76,7 +81,7 @@ function EquityCurveCard({ points }: { points: { ts: number; equity: number }[] 
         <div>
           <div className="mb-1 flex items-baseline gap-2">
             <span className={cn("num text-lg font-bold", path.up ? "text-emerald-400" : "text-rose-400")}>
-              {path.last.toLocaleString("tr-TR", { maximumFractionDigits: 2 })}
+              ${path.last.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
             </span>
             <span className="num text-[11px] text-slate-500">
               30g değişim: {(((path.last - path.first) / (Math.abs(path.first) || 1)) * 100).toFixed(2)}%
@@ -292,6 +297,8 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
   const { bots } = useBots();
   const { events, connected } = useEventStream();
   const { kill, freeze } = useHalt();
+  const [selectedDate, setSelectedDate] = useState<string | null>(null);
+  const [showMarketNews, setShowMarketNews] = useState(false);
   // Faz 24 (UI/UX Pro Max raporu §3.1.1): portföy equity curve verisi —
   // 30 günlük motor equity_points birleşimi; her 5 dk tazelenir.
   const [equity, setEquity] = useState<{ ts: number; equity: number }[] | null>(null);
@@ -403,6 +410,18 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
     return Math.min(100, (sh / eq) * 100);
   }, [summary]);
 
+  const totalExposure = useMemo(() => {
+    if (!summary) return 0;
+    return (fracToNum(summary.longExposure) ?? 0) + (fracToNum(summary.shortExposure) ?? 0);
+  }, [summary]);
+  const totalEq = useMemo(() => (summary ? fracToNum(summary.totalEquity) ?? 0 : 0), [summary]);
+  const utilPct = totalEq > 0 ? Math.min(100, (totalExposure / totalEq) * 100) : 0;
+  const freeBufferPct = Math.max(0, 100 - utilPct);
+
+  const [botFilter, setBotFilter] = useState<"all" | "open">("all");
+  const openBots = useMemo(() => bots.filter((b) => b.stats.phase === "Open"), [bots]);
+  const displayedBots = botFilter === "open" ? openBots : bots;
+
   const donutSlices: DonutSlice[] = useMemo(
     () =>
       (summary?.allocation ?? []).map((a, i) => ({
@@ -415,6 +434,15 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
 
   const killActive = kill?.engaged === true;
   const freezeActive = freeze?.frozen === true;
+
+  const totalEconomicPnL = useMemo(() => {
+    if (!summary) return 0;
+    const realized = fracToNum(summary.totalRealizedGross) ?? 0;
+    const fees = fracToNum(summary.totalFees) ?? 0;
+    const unrealized = fracToNum(summary.totalUnrealizedPnl) ?? 0;
+    return realized - fees + unrealized;
+  }, [summary]);
+
   return (
     <div className="space-y-4">
       {/* Faz 0.2/0.3 — global şalter bandı (SSE + 10sn poll; restart-safe) */}
@@ -491,22 +519,41 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
         </div>
 
         <div className="rounded-xl border border-border bg-[#151a24] p-4">
-          <div className="flex items-center gap-2 text-[11px] uppercase tracking-wider text-slate-400">
-            <TrendingUp className="h-3.5 w-3.5" aria-hidden />
-            Toplam Kâr/Zarar
+          <div className="flex items-center justify-between text-[11px] uppercase tracking-wider text-slate-400">
+            <div className="flex items-center gap-2">
+              <TrendingUp className="h-3.5 w-3.5" aria-hidden />
+              Toplam Ekonomik K/Z
+            </div>
+            <span
+              className={cn(
+                "rounded px-1.5 py-0.5 text-[9px] font-bold",
+                totalEconomicPnL >= 0 ? "bg-emerald-500/20 text-emerald-300" : "bg-rose-500/20 text-rose-300",
+              )}
+              title="Gerçekleşen net kâr + anlık açık pozisyonların toplamı (dürüst cüzdan etkisi)"
+            >
+              {totalEconomicPnL >= 0 ? "NET KÂRDA" : "DRAWDOWNDA"}
+            </span>
           </div>
           <div
             className={cn(
               "num mt-2 text-3xl font-bold tracking-tight",
-              (fracToNum(summary?.totalRealizedGross) ?? 0) >= 0 ? "text-emerald-400" : "text-rose-400",
+              totalEconomicPnL >= 0 ? "text-emerald-400" : "text-rose-400",
             )}
+            title="Toplam Ekonomik K/Z: Gerçekleşen (Net) + Açık Pozisyonlar (Unrealized)"
           >
-            {fmtUsdSigned(summary?.totalRealizedGross)}
+            {fmtUsdSigned(totalEconomicPnL)}
           </div>
           <div className="mt-1 text-xs text-slate-500">
-            Gerçekleşen (gross) · Gerçekleşmemiş{" "}
-            <span className="num text-slate-400">{fmtUsdSigned(summary?.totalUnrealizedPnl ?? "0")}</span>
-            {" "}· Komisyon <span className="num text-slate-400">{fmtUsd(summary?.totalFees, 4)}</span>
+            Gerçekleşen: <span className="num font-semibold text-slate-300">{fmtUsdSigned(summary?.totalRealizedGross)}</span> · Açık:{" "}
+            <span
+              className={cn(
+                "num font-semibold",
+                (fracToNum(summary?.totalUnrealizedPnl) ?? 0) >= 0 ? "text-emerald-400" : "text-rose-400",
+              )}
+            >
+              {fmtUsdSigned(summary?.totalUnrealizedPnl ?? "0")}
+            </span>{" "}
+            · Komisyon <span className="num text-slate-400">{fmtUsd(summary?.totalFees, 2)}</span>
           </div>
         </div>
 
@@ -530,14 +577,24 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
               <span className="text-slate-500"> · %{Math.round(shortPct)}</span>
             </span>
           </div>
+          <div className="num mt-2.5 flex items-center justify-between border-t border-border/50 pt-2 text-[10px] text-slate-400">
+            <span>Sermaye Kullanımı: <span className="font-semibold text-slate-200">%{Math.round(utilPct)}</span></span>
+            <span>Güvenlik Tamponu: <span className="font-semibold text-emerald-400">%{Math.round(freeBufferPct)}</span></span>
+          </div>
         </div>
       </div>
 
-      {/* Piyasa Nabzı — açılışta haber + sentiment (v3 başlangıç görünümü karşılığı) */}
-      <NewsPulse symbol={topSymbol ?? "BTCUSDT"} />
+      {/* Finansal Performans: Gün Bazlı Kâr/Zarar Dağılımı Bar Grafiği */}
+      <DailyPnlChart
+        selectedDate={selectedDate}
+        onSelectDate={setSelectedDate}
+      />
 
-      {/* Faz 2.8: Kaynak Durumu — haber beslemeleri + venue erişimi (v3 market-center karşılığı) */}
-      <SourceStatus symbol={topSymbol ?? "BTCUSDT"} />
+      {/* Kapanan İşlemler Defteri (Gün & Bot Filtreli) */}
+      <ClosedDealsLedger
+        selectedDate={selectedDate}
+        onClearDate={() => setSelectedDate(null)}
+      />
 
       {/* Middle: allocation + fleet */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
@@ -589,18 +646,46 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
           title="Botlarım"
           icon={<Bot className="h-4 w-4 text-slate-500" aria-hidden />}
           right={
-            <Button size="sm" variant="outline" className="min-h-9 border-border-strong text-xs text-slate-300 hover:bg-secondary" onClick={onNewBot}>
-              <ArrowRight className="h-3.5 w-3.5" aria-hidden />
-              Yeni Bot
-            </Button>
+            <div className="flex items-center gap-2">
+              <div className="flex rounded-lg border border-border p-0.5 text-[10px]">
+                <button
+                  type="button"
+                  onClick={() => setBotFilter("all")}
+                  className={cn(
+                    "rounded px-2 py-0.5 font-semibold transition-colors",
+                    botFilter === "all" ? "bg-secondary text-slate-100" : "text-slate-400 hover:text-slate-200"
+                  )}
+                >
+                  Tümü ({bots.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setBotFilter("open")}
+                  className={cn(
+                    "rounded px-2 py-0.5 font-semibold transition-colors",
+                    botFilter === "open" ? "bg-cyan-500/20 text-cyan-300" : "text-slate-400 hover:text-slate-200"
+                  )}
+                >
+                  ⚡ Açık Deal ({openBots.length})
+                </button>
+              </div>
+              <Button size="sm" variant="outline" className="min-h-9 border-border-strong text-xs text-slate-300 hover:bg-secondary" onClick={onNewBot}>
+                <ArrowRight className="h-3.5 w-3.5" aria-hidden />
+                Yeni Bot
+              </Button>
+            </div>
           }
           bodyClassName="p-3"
         >
-          {bots.length === 0 ? (
-            <EmptyState icon={Bot} title="Henüz bot yok" hint="Yeni Bot sihirbazıyla ilk DCA botunuzu başlatın." />
+          {displayedBots.length === 0 ? (
+            <EmptyState
+              icon={Bot}
+              title={botFilter === "open" ? "Açık deal yok" : "Henüz bot yok"}
+              hint={botFilter === "open" ? "Şu anda hiçbir bot açık bir deal yürütmüyor." : "Yeni Bot sihirbazıyla ilk DCA botunuzu başlatın."}
+            />
           ) : (
             <div className="thin-scroll max-h-72 space-y-2 overflow-y-auto pr-1">
-              {bots.map((b) => (
+              {displayedBots.map((b) => (
                 <button
                   key={b.id}
                   onClick={() => onInspect(b.id)}
@@ -613,6 +698,16 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
                       <KindBadge kind={b.kind} />
                       <VenueChip venue={b.venue} />
                       <ModeBadge mode={b.mode} />
+                      {b.stats.phase === "Open" &&
+                        b.config?.max_safety_orders != null &&
+                        b.stats.safety_triggered >= b.config.max_safety_orders && (
+                          <span
+                            className="inline-flex items-center gap-1 rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-bold text-amber-300 ring-1 ring-amber-500/40"
+                            title="Tüm güvenlik emirleri doldu (Kademe tükendi). Fiyat dönene veya sermaye eklenene kadar beklemede."
+                          >
+                            ⚠️ KADEME TÜKENDİ
+                          </span>
+                        )}
                     </div>
                     <div className="num mt-1 text-[11px] text-slate-400">
                       {b.symbol} · {kindLabel(b.kind)} ·{" "}
@@ -628,9 +723,31 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
                       Deal: {b.stats.deals_closed} kapatıldı (W {b.stats.wins} / L {b.stats.losses}) · Komisyon{" "}
                       {fmtUsd(b.cumulativeFees, 4)} · <BotDayActivity botId={b.id} />
                     </div>
+                    {b.stats.phase === "Open" && (
+                      <div className="mt-2 max-w-lg">
+                        <DealProgressBar
+                          phase={b.stats.phase}
+                          safetyTriggered={b.stats.safety_triggered}
+                          maxSafetyOrders={b.config?.max_safety_orders}
+                          avgPrice={b.stats.avg_price}
+                          tpPrice={b.stats.tp_price}
+                          slPrice={b.stats.sl_price}
+                          currentPrice={b.markPrice}
+                          unrealizedPnl={b.unrealizedNow}
+                          liqPrice={b.liqPrice}
+                          marginMode={b.marginMode}
+                          nextSafetyPrice={b.stats.next_safety_price}
+                          nextSafetyLevel={b.stats.next_safety_level}
+                          positionQty={b.stats.position_qty}
+                          isShort={b.kind === "DCA_SHORT"}
+                          symbol={b.symbol}
+                          compact={true}
+                        />
+                      </div>
+                    )}
                   </div>
                   <div className="hidden shrink-0 text-right sm:block">
-                    <div className="text-[10px] uppercase text-slate-400">Kâr/Zarar</div>
+                    <div className="text-[10px] uppercase text-slate-400">Net Kâr / Anlık</div>
                     <div
                       className={cn(
                         "num text-lg font-bold",
@@ -639,6 +756,17 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
                     >
                       {fmtUsdSigned(b.stats.realized_gross)}
                     </div>
+                    {b.unrealizedNow && b.unrealizedNow !== "0" && (
+                      <div
+                        className={cn(
+                          "num text-[11px] font-semibold",
+                          (fracToNum(b.unrealizedNow) ?? 0) >= 0 ? "text-emerald-400" : "text-rose-400",
+                        )}
+                        title="Açık pozisyonun anlık gerçekleşmemiş kâr/zararı"
+                      >
+                        Açık: {fmtUsdSigned(b.unrealizedNow)}
+                      </div>
+                    )}
                   </div>
                   <StatusPill status={b.status} className="hidden md:inline-flex" />
                 </button>
@@ -740,10 +868,31 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
             <div className="rounded-lg border border-rose-500/20 bg-rose-500/5 p-3 text-[11px] leading-relaxed text-slate-400">
               <span className="font-semibold text-rose-400">Koruma katmanı:</span>{" "}
               8 zorunlu kapı (yapısal ihlalde emir reddi) · 10 piyasa koruması uyarı+onay (işlem engellemez).
-              Ayrıntı: <span className="font-semibold text-slate-300">Ayarlar → 8 Fail-Closed Gate</span>.
+              Ayrıntı: <span className="font-semibold text-slate-300">Bilgi → Sözleşme (8 Fail-Closed Gate)</span>.
             </div>
           </div>
         </Panel>
+      </div>
+
+      {/* İsteğe Bağlı Piyasa İstihbaratı ve Kaynak Durumu */}
+      <div className="rounded-xl border border-border bg-[#151a24] p-3 text-xs">
+        <button
+          type="button"
+          onClick={() => setShowMarketNews((v) => !v)}
+          className="flex w-full items-center justify-between text-slate-400 hover:text-slate-200 transition-colors"
+        >
+          <span className="flex items-center gap-2 font-semibold">
+            <Rss className="h-4 w-4 text-cyan-400" />
+            Piyasa Nabzı & Kaynak Durumu (Haberler, Sentiment, Gecikme)
+          </span>
+          {showMarketNews ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+        </button>
+        {showMarketNews && (
+          <div className="mt-3 space-y-3 pt-3 border-t border-border/50">
+            <NewsPulse symbol={topSymbol ?? "BTCUSDT"} />
+            <SourceStatus symbol={topSymbol ?? "BTCUSDT"} />
+          </div>
+        )}
       </div>
     </div>
   );

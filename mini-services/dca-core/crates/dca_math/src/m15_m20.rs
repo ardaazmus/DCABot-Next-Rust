@@ -61,7 +61,6 @@ pub fn geometric_mesh(lower: &Fraction, upper: &Fraction, n: usize) -> Result<Ve
 }
 
 use num_integer::Integer as _;
-use num_traits::Zero as _;
 
 /// Exact integer n-th root (floor) via binary search on BigInt.
 pub fn integer_nth_root(v: &num_bigint::BigInt, n: u32) -> num_bigint::BigInt {

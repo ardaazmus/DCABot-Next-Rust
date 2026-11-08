@@ -61,12 +61,14 @@ export function fmtUsd(s: string | number | null | undefined, dec = 2): string {
   return "$" + nf(dec, dec).format(v);
 }
 
-/** Signed USD with explicit plus sign for positives. */
+/** Signed USD with explicit plus sign for positives and minus before dollar for negatives. */
 export function fmtUsdSigned(s: string | number | null | undefined, dec = 2): string {
   const v = fracToNum(s);
   if (v === null) return "—";
-  const sign = v > 0 ? "+" : "";
-  return sign + "$" + nf(dec, dec).format(v);
+  if (v < 0) {
+    return "-$" + nf(dec, dec).format(Math.abs(v));
+  }
+  return "+$" + nf(dec, dec).format(v);
 }
 
 /** Percentage from a fraction-of-one value ("0.02" → "2.00%"). */

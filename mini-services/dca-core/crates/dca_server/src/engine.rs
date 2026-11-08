@@ -1588,7 +1588,7 @@ pub async fn force_start_if_requested(
     let h = Fraction::from_decimal_str(&bar.h).map_err(|e| e.to_string())?;
     let l = Fraction::from_decimal_str(&bar.l).map_err(|e| e.to_string())?;
     let c = mark.clone();
-    let mut n = 0usize;
+    let n: usize;
     match &mut rt.engine_kind {
         dca_strategy::EngineTag::Dca(e) => {
             e.request_force_start();
@@ -1664,7 +1664,7 @@ pub async fn poll_and_advance(
     sse: &broadcast::Sender<SseEvent>,
 ) -> Result<usize, String> {
     // H-1: bot başına single-flight — aynı botun poll'u üst üste binmez;
-    /// meşgulse dürüst skip (0 bar; supervisor bir sonraki turda yine dener).
+    // meşgulse dürüst skip (0 bar; supervisor bir sonraki turda yine dener).
     let sf_lock: Arc<tokio::sync::Mutex<()>> = {
         let mut lock_map = app.poll_locks.lock().await;
         lock_map
@@ -1699,7 +1699,9 @@ pub async fn poll_and_advance(
 /// tutulur; ağ çağrıları kilitsiz Faz 2'de koşar.
 struct PollCtx {
     venue: String,
+    #[allow(dead_code)]
     mode: String,
+    #[allow(dead_code)]
     status: String,
     interval_str: String,
     symbol: String,
@@ -2047,7 +2049,7 @@ async fn poll_inner(
         }
     }
     // Faz 13A-POLL: borçları bitir — LIVE intent cascade'i KİLİTSİZ koşar.
-    drop(rt);
+    let _ = rt;
     drop(rts);
     run_intent_cascade(app, bot_id, sse).await?;
     Ok(processed)
@@ -2537,6 +2539,7 @@ pub async fn signal_preview(
     Ok(json!({ "met": met, "asof": asof, "leaves": leaves }))
 }
 
+#[allow(dead_code)]
 pub fn default_instrument(kind: &StrategyKind, symbol: &str) -> Instrument {
     let mut i = Instrument::default();
     i.symbol = symbol.to_string();
@@ -2549,6 +2552,7 @@ pub fn default_instrument(kind: &StrategyKind, symbol: &str) -> Instrument {
     i
 }
 
+#[allow(dead_code)]
 pub fn direction_of(cfg: &BotConfig) -> i8 {
     match cfg.kind.direction() {
         Some(Direction::Long) | None => 1,
@@ -2556,6 +2560,7 @@ pub fn direction_of(cfg: &BotConfig) -> i8 {
     }
 }
 
+#[allow(dead_code)]
 pub fn phase_str(rt: &BotRuntime) -> String {
     match &rt.engine_kind {
         dca_strategy::EngineTag::Dca(e) => format!("{:?}", e.phase),
@@ -2564,6 +2569,7 @@ pub fn phase_str(rt: &BotRuntime) -> String {
     }
 }
 
+#[allow(dead_code)]
 pub fn side_str(s: &Side) -> &'static str {
     match s {
         Side::Buy => "Buy",
@@ -2571,6 +2577,7 @@ pub fn side_str(s: &Side) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 pub fn kind_label(k: &StrategyKind) -> &'static str {
     k.label()
 }

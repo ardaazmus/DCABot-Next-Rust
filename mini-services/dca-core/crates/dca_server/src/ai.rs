@@ -111,6 +111,7 @@ struct AiBullet {
 
 // ---------------- Sözlük + SSS (RAG kaynağı) --------------------------------
 
+#[allow(dead_code)]
 #[derive(Deserialize, Clone)]
 struct GlossaryEntry {
     #[serde(default)]
@@ -129,6 +130,7 @@ struct GlossaryEntry {
     operator_steps: Vec<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Clone)]
 struct FaqEntry {
     #[serde(default)]
@@ -603,11 +605,10 @@ pub async fn ai_diagnose(State(app): State<Arc<AppState>>, Json(body): Json<Diag
     }
     let symbol = body.symbol.clone().or_else(|| body.bot_id.as_deref().and_then(|id| bot_symbol(&app, id)));
     let (news_ok, news_summary) = news_sentiment_summary(&app, symbol.as_deref()).await;
-    let mut ctx = json!({"traceWaterfall": waterfall, "errorGlossary": gloss, "newsSentiment": news_summary});
+    let ctx = json!({"traceWaterfall": waterfall, "errorGlossary": gloss, "newsSentiment": news_summary});
     let mut ctx_s = ctx.to_string();
     if ctx_s.len() > 9000 {
         ctx_s.truncate(9000);
-        ctx = json!({"traceWaterfallTruncated": ctx_s, "errorGlossary": gloss, "newsSentiment": news_summary});
     }
     let user = format!("Aşağıdaki iz şelalesini analiz et ve TAM 3 madde üret. Biçim:\n1. Ne Oldu: <zaman ve sembol + ölçülen değer>\n2. Neden: <kapı/kural + hangi eşikle kısıldı veya geçti>\n3. Tavsiye: <operasyonel gözlem — müdahale gerekip gerekmediği>\n\nBAĞLAM:\n{ctx_s}");
     match call_provider(&app, &rc, SYSTEM_PROMPT, &user, &[]).await {

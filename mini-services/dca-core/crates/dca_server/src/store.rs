@@ -5,6 +5,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use rand::RngCore;
 use rusqlite::Connection;
 use std::sync::Mutex;
+use zeroize::{Zeroize, Zeroizing};
 
 pub struct Db {
     pub conn: Mutex<Connection>,
@@ -203,7 +204,8 @@ const ENVELOPE_V2: u8 = 0x02;
 
 pub struct Vault {
     /// Master secret (env DCA_VAULT_KEY) — DB'ye ASLA yazılmaz; KDF girdisi.
-    master_secret: String,
+    /// SEC-02: Zeroizing ile bellekten silinir.
+    master_secret: Zeroizing<String>,
 }
 
 impl Vault {
@@ -214,7 +216,7 @@ impl Vault {
     pub fn new(_db: &Db) -> Result<Self, String> {
         let master_secret = std::env::var("DCA_VAULT_KEY")
             .map_err(|_| "DCA_VAULT_KEY environment variable is required — master key must be provided out-of-DB (SEC-02)")?;
-        Ok(Self { master_secret })
+        Ok(Self { master_secret: Zeroizing::new(master_secret) })
     }
 
     /// Faz 22 (P2-4): YENİ yazılar Argon2id zarfıyla —
@@ -224,8 +226,9 @@ impl Vault {
     pub fn encrypt(&self, plaintext: &str) -> Result<String, String> {
         let mut salt = [0u8; 16];
         OsRng.fill_bytes(&mut salt);
-        let key = derive_argon2id(&self.master_secret, &salt)?;
+        let mut key = derive_argon2id(&self.master_secret, &salt)?;
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+        key.zeroize();
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
@@ -239,35 +242,36 @@ impl Vault {
         Ok(hex::encode(out))
     }
 
-    /// Sürümlü çözümleme: 0x02 zarfı → Argon2id; aksi halde legacy
-    /// unsalted-SHA256 yolu (P2-4 ÖNCESİ kayıtlar — yeniden kaydedilene dek
-    /// okunur kalır; tam migrasyon ayrı iş).
+    /// Sürümlü çözümleme: 0x02 zarfı → Argon2id; başarısız olursa veya
+    /// ilk bayt 0x02 değilse legacy unsalted-SHA256 fallback (rastgele legacy nonce'un
+    /// ilk baytının 0x02'ye denk gelmesi durumunda da fail-safe çalışır).
     pub fn decrypt(&self, hexdata: &str) -> Result<String, String> {
         let data = hex::decode(hexdata).map_err(|e| e.to_string())?;
-        if data.first() == Some(&ENVELOPE_V2) {
-            if data.len() < 1 + 16 + 12 + 1 {
-                return Err("vault v2 data too short".into());
-            }
+        if data.first() == Some(&ENVELOPE_V2) && data.len() >= 1 + 16 + 12 + 16 {
             let salt = &data[1..17];
             let nonce_bytes = &data[17..29];
             let ct = &data[29..];
-            let key = derive_argon2id(&self.master_secret, salt)?;
-            let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
-            let pt = cipher
-                .decrypt(Nonce::from_slice(nonce_bytes), ct)
-                .map_err(|_| "vault v2 decrypt failed".to_string())?;
-            return String::from_utf8(pt).map_err(|e| e.to_string());
+            if let Ok(mut key) = derive_argon2id(&self.master_secret, salt) {
+                let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+                key.zeroize();
+                if let Ok(pt) = cipher.decrypt(Nonce::from_slice(nonce_bytes), ct) {
+                    if let Ok(s) = String::from_utf8(pt) {
+                        return Ok(s);
+                    }
+                }
+            }
         }
-        // LEGACY: unsalted SHA-256 (tek geçiş) — yalnız OKUMA yolu.
+        // LEGACY: unsalted SHA-256 (tek geçiş) — yalnız OKUMA / fallback yolu.
         if data.len() < 13 {
             return Err("vault data too short".into());
         }
         let (nonce_bytes, ct) = data.split_at(12);
-        let key = derive_32(&self.master_secret);
+        let mut key = derive_32(&self.master_secret);
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+        key.zeroize();
         let pt = cipher
             .decrypt(Nonce::from_slice(nonce_bytes), ct)
-            .map_err(|_| "vault legacy decrypt failed".to_string())?;
+            .map_err(|_| "vault decrypt failed".to_string())?;
         String::from_utf8(pt).map_err(|e| e.to_string())
     }
 }
@@ -289,7 +293,7 @@ mod vault_tests {
     #[test]
     fn argon2id_envelope_roundtrip_and_legacy_read() {
         std::env::set_var("DCA_VAULT_KEY_TEST", "1"); // no-op; Vault env'i new()'da okur
-        let v = Vault { master_secret: "test-master-secret".into() };
+        let v = Vault { master_secret: Zeroizing::new("test-master-secret".into()) };
         // yeni yazı: v2 zarf
         let enc = v.encrypt("secret-abc").expect("encrypt");
         let raw = hex::decode(&enc).unwrap();
@@ -307,8 +311,17 @@ mod vault_tests {
         legacy.extend(ct);
         let legacy_hex = hex::encode(legacy);
         assert_eq!(v.decrypt(&legacy_hex).unwrap(), "legacy-secret");
+        // legacy okuma 2: ilk baytı tesadüfen 0x02 (ENVELOPE_V2) olan legacy nonce
+        let mut nonce_bytes_v2_prefix = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce_bytes_v2_prefix);
+        nonce_bytes_v2_prefix[0] = ENVELOPE_V2;
+        let ct2 = cipher.encrypt(Nonce::from_slice(&nonce_bytes_v2_prefix), legacy_secret).unwrap();
+        let mut legacy2 = nonce_bytes_v2_prefix.to_vec();
+        legacy2.extend(ct2);
+        let legacy2_hex = hex::encode(legacy2);
+        assert_eq!(v.decrypt(&legacy2_hex).unwrap(), "legacy-secret");
         // farklı secret ile çözümleme başarısız (fail-closed)
-        let v2 = Vault { master_secret: "wrong".into() };
+        let v2 = Vault { master_secret: Zeroizing::new("wrong".into()) };
         assert!(v2.decrypt(&enc).is_err());
     }
 }

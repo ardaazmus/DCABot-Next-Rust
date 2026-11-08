@@ -3,7 +3,6 @@
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use dca_kernel::FillRecord;
 use dca_strategy::StrategyKind;
 use serde_json::{json, Value};
 use std::sync::Arc;

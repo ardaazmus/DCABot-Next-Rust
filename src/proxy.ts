@@ -68,6 +68,13 @@ export function proxy(req: NextRequest) {
   }
   // "/api/engine/api/health" → hedef "/api/health" (önek soyulur).
   const rest = pathname.slice("/api/engine".length) || "/";
+  // A01 / SSRF & Path Traversal Guard: Sadece meşru /api/* rotalarına izin verilir.
+  if (!rest.startsWith("/api/") && rest !== "/api") {
+    return new NextResponse("invalid engine path", { status: 400 });
+  }
+  if (rest.includes("..") || rest.includes("\0")) {
+    return new NextResponse("path traversal attempt blocked", { status: 400 });
+  }
   let target: URL;
   try {
     target = new URL(`http://${ENGINE_HOST}:${enginePort()}${rest}${search}`);

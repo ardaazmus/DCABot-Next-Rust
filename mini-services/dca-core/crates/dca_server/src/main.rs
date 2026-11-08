@@ -20,9 +20,10 @@ mod status;
 mod thin;
 mod state;
 mod store;
+mod deals;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
@@ -49,9 +50,9 @@ use uuid::Uuid;
 
 // -----------------------------------------------------------------------
 // SEC-04 Rate Limiter — basit per-IP token bucket (ağ içinde tek sunucu).
-// 100 istek / 10 sn, burst 20. Aşınca 429 Too Many Requests.
+// 400 istek / 10 sn (40 req/s), local dashboard burst'leri için genişletildi. Aşınca 429 Too Many Requests.
 // -----------------------------------------------------------------------
-const RATE_LIMIT_MAX: usize = 100;
+const RATE_LIMIT_MAX: usize = 400;
 const RATE_LIMIT_WINDOW_SECS: u64 = 10;
 const RATE_LIMIT_MAX_BUCKETS: usize = 10_000;
 
@@ -194,6 +195,8 @@ async fn main() {
     let api_routes = Router::new()
         .route("/api/summary", get(summary))
         .route("/api/equity", get(equity_curve))
+        .route("/api/deals", get(deals::list_deals))
+        .route("/api/daily-pnl", get(deals::daily_pnl))
         .route("/api/bots", get(list_bots).post(create_bot))
         .route("/api/bots/:id", get(get_bot).patch(patch_bot).delete(delete_bot))
         .route("/api/bots/:id/actions", post(bot_actions))
@@ -282,12 +285,7 @@ async fn main() {
                 let auth_query = query.get("token").map(|s| s.as_str());
 
                 let provided = auth_header.or(auth_query).unwrap_or("");
-                let is_authed = !key.is_empty()
-                    && !provided.is_empty()
-                    && provided.len() == key.len()
-                    && provided.bytes().zip(key.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0;
-
-                if !is_authed {
+                if !constant_time_eq_str(provided, &key) {
                     return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
                 }
 
@@ -797,6 +795,17 @@ async fn reconcile_restored_bots(app: &Arc<AppState>) {
 
 // ---------------- Handlers ----------------
 
+/// Constant-time comparison for secrets (immune to length and content timing attacks).
+pub fn constant_time_eq_str(provided: &str, expected: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    if provided.is_empty() || expected.is_empty() {
+        return false;
+    }
+    let h1 = Sha256::digest(provided.as_bytes());
+    let h2 = Sha256::digest(expected.as_bytes());
+    h1.iter().zip(h2.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// SEC-01: API key auth middleware — `Authorization: Bearer <DCA_API_KEY>`.
 /// Eksik/yanlış anahtar → 401. `DCA_API_KEY` env ile yapılandırılır.
 async fn auth_middleware(
@@ -813,16 +822,7 @@ async fn auth_middleware(
     }
     let provided = &auth[7..];
     // Empty api_key means auth is not configured — reject all (fail-closed).
-    if api_key.is_empty() || provided.is_empty() {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    if provided.len() != api_key.len()
-        || provided
-            .bytes()
-            .zip(api_key.bytes())
-            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-            != 0
-    {
+    if !constant_time_eq_str(provided, &api_key) {
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(next.run(req).await)
@@ -888,7 +888,7 @@ async fn equity_curve(
     })?;
     let mut stmt = conn
         .prepare(
-            "SELECT ts, SUM(CAST(equity AS REAL)) FROM equity_points WHERE ts >= ?1 GROUP BY ts ORDER BY ts ASC",
+            "SELECT ts, equity FROM equity_points WHERE ts >= ?1 ORDER BY ts ASC",
         )
         .map_err(|e| {
             (
@@ -898,7 +898,7 @@ async fn equity_curve(
                 .into_response()
         })?;
     let rows = stmt
-        .query_map([since_ms], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))
+        .query_map([since_ms], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
         .map_err(|e| {
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -906,7 +906,23 @@ async fn equity_curve(
             )
                 .into_response()
         })?;
-    let mut raw: Vec<(i64, f64)> = rows.flatten().collect();
+    let mut map: std::collections::BTreeMap<i64, f64> = std::collections::BTreeMap::new();
+    for r in rows.flatten() {
+        let (ts, eq_str) = r;
+        let val = if let Some((n, d)) = eq_str.split_once('/') {
+            let num: f64 = n.trim().parse().unwrap_or(0.0);
+            let den: f64 = d.trim().parse().unwrap_or(1.0);
+            if den.abs() > 1e-12 {
+                num / den
+            } else {
+                num
+            }
+        } else {
+            eq_str.trim().parse().unwrap_or(0.0)
+        };
+        *map.entry(ts).or_insert(0.0) += val;
+    }
+    let mut raw: Vec<(i64, f64)> = map.into_iter().collect();
     drop(stmt);
     drop(conn);
     let total = raw.len();
@@ -916,7 +932,7 @@ async fn equity_curve(
     }
     let points: Vec<serde_json::Value> = raw
         .iter()
-        .map(|(t, v)| serde_json::json!({"ts": t, "equity": v}))
+        .map(|(t, v)| serde_json::json!({"ts": t, "equity": (v * 100.0).round() / 100.0}))
         .collect();
     Ok(Json(serde_json::json!({"days": days, "points": points, "total": total})))
 }
@@ -2019,7 +2035,7 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
         "ADD_FUNDS" => {
             let amount = req.amount.clone().ok_or_else(|| err422("amount required"))?;
             let quote = Fraction::from_decimal_str(&amount).map_err(|e| err422(e))?;
-            let mark = rt
+            let _mark = rt
                 .stepper
                 .last_close
                 .as_deref()
@@ -3056,7 +3072,7 @@ async fn selfcheck(State(app): State<Arc<AppState>>, body: Option<Json<SelfCheck
     }
     let has_keys = has_any_key || active_keypair(&app, "BINANCE").is_some() || active_keypair(&app, "OKX").is_some();
     let verdict = if hard_fail || failed > 0 { "KALDI" } else if has_keys { "GECTI" } else { "YETERSIZ_ORTAM" };
-    let ran = passed + failed;
+    let _ran = passed + failed;
     let note = if hard_fail {
         "HARD-FAIL: çekim yetkisi açık anahtar var — canlı hat derhal kilitlenmeli. Withdraw yetkisini kaldırın."
     } else if failed > 0 {
@@ -3690,18 +3706,16 @@ async fn tradingview_webhook(
         }
     }
     let mut rts = app.runtimes.lock().await;
-    let Some(rt) = rts.get_mut(&req.bot_id) else {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unknown bot"}))).into_response();
-    };
-    // Constant-time secret comparison (no early-exit on content mismatch).
-    let a = req.secret.as_bytes();
-    let b = rt.webhook_secret.as_bytes();
-    let mismatch = a.len() != b.len()
-        || a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) != 0;
-    if mismatch {
-        crate::state::persist_event(&app, &req.bot_id, "WARN", "WEBHOOK", "rejected: invalid secret").await;
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "invalid secret"}))).into_response();
+    // SEC-07: Anti-enumeration & Constant-time secret comparison (unknown bot ve wrong secret aynı yanıtı verir).
+    let expected_secret = rts.get(&req.bot_id).map(|r| r.webhook_secret.clone()).unwrap_or_default();
+    let is_valid = !expected_secret.is_empty() && constant_time_eq_str(&req.secret, &expected_secret);
+    if !is_valid {
+        crate::state::persist_event(&app, &req.bot_id, "WARN", "WEBHOOK", "rejected: invalid secret or unknown bot").await;
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "UNAUTHORIZED"}))).into_response();
     }
+    let Some(rt) = rts.get_mut(&req.bot_id) else {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "UNAUTHORIZED"}))).into_response();
+    };
     // Replay protection: accept epoch seconds or milliseconds, reject stale alerts.
     let now = state::now_ms();
     let ts_ms = if req.timestamp < 1_000_000_000_000 { req.timestamp.saturating_mul(1000) } else { req.timestamp };
@@ -4110,7 +4124,7 @@ async fn sse_handler(
 }
 
 fn async_stream_wrapper(
-    mut rx: tokio::sync::broadcast::Receiver<SseEvent>,
+    rx: tokio::sync::broadcast::Receiver<SseEvent>,
     app: Arc<AppState>,
     last_event_id: Option<i64>,
 ) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {

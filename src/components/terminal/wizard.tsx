@@ -993,6 +993,123 @@ export function Wizard({ onCreated }: WizardProps) {
     },
   ];
 
+  /* ---- Pionex & 3Commas benchmark: AI / Risk Strateji Presetleri ---- */
+  const PRESET_PROFILES = [
+    {
+      key: "konservatif",
+      label: "KONSERVATİF",
+      badge: "🛡️ Düşük Risk",
+      desc: "Geniş koruma tamponu, ayı piyasası & sert düşüş trendi",
+      dropCoverage: "~%38.4",
+      dev: 2.5,
+      safety: 8,
+      tp: 1.5,
+      step: 1.5,
+      vol: 1.3,
+    },
+    {
+      key: "dengeli",
+      label: "DENGELİ",
+      badge: "⚖️ Önerilen",
+      desc: "Tipik volatilite, dengeli risk & istikrarlı kâr devri",
+      dropCoverage: "~%21.8",
+      dev: 1.8,
+      safety: 5,
+      tp: 2.0,
+      step: 1.3,
+      vol: 1.4,
+    },
+    {
+      key: "agresif",
+      label: "AGRESİF / SCALP",
+      badge: "⚡ Yüksek Hız",
+      desc: "Hızlı kâr devri, sık güvenlik emri & boğa trendi",
+      dropCoverage: "~%10.2",
+      dev: 0.8,
+      safety: 3,
+      tp: 1.0,
+      step: 1.2,
+      vol: 1.6,
+    },
+  ] as const;
+
+  const activePresetKey = useMemo(() => {
+    return (
+      [
+        { key: "konservatif", dev: 2.5, safety: 8, tp: 1.5, step: "1.5", vol: "1.3" },
+        { key: "dengeli", dev: 1.8, safety: 5, tp: 2.0, step: "1.3", vol: "1.4" },
+        { key: "agresif", dev: 0.8, safety: 3, tp: 1.0, step: "1.2", vol: "1.6" },
+      ].find(
+        (p) =>
+          p.dev === deviationPct &&
+          p.safety === maxSafety &&
+          p.tp === targetProfitPct &&
+          p.step === stepScale &&
+          p.vol === volumeScale,
+      )?.key ?? null
+    );
+  }, [deviationPct, maxSafety, targetProfitPct, stepScale, volumeScale]);
+
+  /* Canlı Maksimum Düşüş Kapsama Oranı (%) ve Gereken Sermaye (Pionex/3Commas benchmark) */
+  const dcaCoverageStats = useMemo(() => {
+    if (isGridKind || !kind) return null;
+    const sScale = Math.max(0.5, parseFloat(stepScale) || 1.0);
+    const vScale = Math.max(0.5, parseFloat(volumeScale) || 1.0);
+    const bSize = parseFloat(baseSize) || 0;
+    const sSize = parseFloat(safetySize) || 0;
+
+    let theoreticalDropPct = 0;
+    let curDev = deviationPct;
+    let totalCap = bSize;
+    let curSafety = sSize;
+
+    for (let i = 0; i < maxSafety; i++) {
+      theoreticalDropPct += curDev;
+      curDev *= sScale;
+      totalCap += curSafety;
+      curSafety *= vScale;
+    }
+
+    let actualDropPct = theoreticalDropPct;
+    if (calcDca && calcDca.levels.length > 0) {
+      const lastLevel = calcDca.levels[calcDca.levels.length - 1];
+      const parsedDev = (fracToNum(lastLevel.cumDeviation ?? null) ?? 0) * 100;
+      if (parsedDev > 0) actualDropPct = parsedDev;
+    }
+
+    const riskTier =
+      actualDropPct >= 30
+        ? {
+            label: "Geniş Koruma (Düşük Risk)",
+            color: "text-emerald-400",
+            border: "border-emerald-500/30",
+            bg: "bg-emerald-500/10",
+            badgeBg: "bg-emerald-500/20 text-emerald-300",
+          }
+        : actualDropPct >= 18
+          ? {
+              label: "Dengeli Koruma (Standart Risk)",
+              color: "text-cyan-400",
+              border: "border-cyan-500/30",
+              bg: "bg-cyan-500/10",
+              badgeBg: "bg-cyan-500/20 text-cyan-300",
+            }
+          : {
+              label: "Dar Koruma (Yüksek Hız / Scalp)",
+              color: "text-amber-400",
+              border: "border-amber-500/30",
+              bg: "bg-amber-500/10",
+              badgeBg: "bg-amber-500/20 text-amber-300",
+            };
+
+    return {
+      dropPct: actualDropPct,
+      totalCapital: calcDca ? fracToNum(calcDca.totalNotional) ?? totalCap : totalCap,
+      riskTier,
+      isExact: !!(calcDca && calcDca.levels.length > 0),
+    };
+  }, [isGridKind, kind, stepScale, volumeScale, baseSize, safetySize, deviationPct, maxSafety, calcDca]);
+
   /* ---- chart overlay: planned levels on the live TradingView chart ---- */
   const chartLines = useMemo<TvPriceLine[]>(() => {
     const lines: TvPriceLine[] = [];
@@ -1014,9 +1131,19 @@ export function Wizard({ onCreated }: WizardProps) {
         });
     }
     const avg = fracToNum(calcDca?.avgAllIn ?? null);
-    if (avg && avg > 0) lines.push({ price: avg, color: "#22d3ee", title: "AVG", dashed: false });
+    if (avg && avg > 0) {
+      lines.push({ price: avg, color: "#22d3ee", title: "BAŞABAŞ (AVG)", dashed: false });
+      if (targetProfitPct > 0) {
+        const tpMultiplier = isShort ? 1 - targetProfitPct / 100 : 1 + targetProfitPct / 100;
+        lines.push({ price: avg * tpMultiplier, color: "#10b981", title: `TP (%${targetProfitPct})`, dashed: true });
+      }
+      if (slEnabled && slPct > 0) {
+        const slMultiplier = isShort ? 1 + slPct / 100 : 1 - slPct / 100;
+        lines.push({ price: avg * slMultiplier, color: "#f43f5e", title: `SL (%${slPct})`, dashed: true });
+      }
+    }
     return lines;
-  }, [isGridKind, calcDca, calcGrid]);
+  }, [isGridKind, calcDca, calcGrid, targetProfitPct, isShort, slEnabled, slPct]);
 
   return (
     <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_400px] xl:grid-cols-[minmax(0,1fr)_440px]">
@@ -1338,41 +1465,99 @@ export function Wizard({ onCreated }: WizardProps) {
 
         {/* ---------------- SECTION 3: parameters + start condition ---------------- */}
         <WizardSection n={3} title="Parametreler & Başlangıç Koşulu" valid={sec3Valid} hidden={!kind}>
-          {/* Faz 24 (UI/UX Pro Max raporu §3.4.1): hazır strateji şablonları —
-              tek tıkla sektörel başlangıç değerleri; kullanıcı onlarca
-              parametreyi sıfırdan doldurma bariyeri olmadan başlar. */}
+          {/* Pionex & 3Commas benchmark: Hazır AI / Risk Profilleri + Canlı Düşüş Koruması */}
           {!isGridKind && kind && (
-            <div className="grid gap-2 sm:grid-cols-3">
-              {([
-                {
-                  key: "konservatif", label: "KONSERVATİF", desc: "Geniş tampon, düşük TP",
-                  dev: 2.5, safety: 8, tp: 1.5, step: 1.5, vol: 1.3,
-                },
-                {
-                  key: "dengeli", label: "DENGELİ (önerilen)", desc: "Standart dalgalanma",
-                  dev: 1.8, safety: 5, tp: 2.0, step: 1.3, vol: 1.4,
-                },
-                {
-                  key: "agresif", label: "AGRESİF / SCALP", desc: "Sık kademe, hızlı TP",
-                  dev: 0.8, safety: 3, tp: 1.0, step: 1.2, vol: 1.6,
-                },
-              ] as const).map((p) => (
-                <button
-                  key={p.key}
-                  onClick={() => {
-                    setDeviationPct(p.dev);
-                    setMaxSafety(p.safety);
-                    setTargetProfitPct(p.tp);
-                    setStepScale(String(p.step));
-                    setVolumeScale(String(p.vol));
-                    toast({ title: `${p.label} şablonu uygulandı`, description: "Parametreleri dilediğin gibi ince ayar yapabilirsin." });
-                  }}
-                  className="min-h-11 rounded-lg border border-border-strong bg-surface p-2.5 text-left transition-colors hover:border-emerald-500/50 hover:bg-emerald-500/5"
+            <div className="mb-4 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs font-semibold text-slate-400">
+                  Hazır AI / Risk Profilleri (Pionex & 3Commas benchmark)
+                </span>
+                {activePresetKey && (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/20 px-2.5 py-0.5 text-[10px] font-bold text-emerald-300">
+                    <Check className="h-3 w-3" /> Aktif Profil: {activePresetKey.toUpperCase()}
+                  </span>
+                )}
+              </div>
+              <div className="grid gap-2.5 sm:grid-cols-3">
+                {PRESET_PROFILES.map((p) => {
+                  const isSelected = activePresetKey === p.key;
+                  return (
+                    <button
+                      key={p.key}
+                      type="button"
+                      onClick={() => {
+                        setDeviationPct(p.dev);
+                        setMaxSafety(p.safety);
+                        setTargetProfitPct(p.tp);
+                        setStepScale(String(p.step));
+                        setVolumeScale(String(p.vol));
+                        toast({
+                          title: `${p.label} profili uygulandı`,
+                          description: `Sapma %${p.dev}, ${p.safety} kademe, TP %${p.tp}, Step Scale ${p.step}, Vol Scale ${p.vol}`,
+                        });
+                      }}
+                      className={cn(
+                        "relative flex flex-col justify-between rounded-xl border p-3 text-left transition-all",
+                        isSelected
+                          ? "border-emerald-500/70 bg-emerald-500/10 shadow-[0_0_15px_rgba(16,185,129,0.15)] ring-1 ring-emerald-500/50"
+                          : "border-border-strong bg-surface hover:border-emerald-500/40 hover:bg-emerald-500/5",
+                      )}
+                    >
+                      <div>
+                        <div className="flex items-center justify-between">
+                          <span className={cn("text-xs font-bold", isSelected ? "text-emerald-300" : "text-slate-200")}>
+                            {p.label}
+                          </span>
+                          <span className="rounded bg-secondary px-1.5 py-0.5 text-[9px] font-semibold text-slate-300">
+                            {p.badge}
+                          </span>
+                        </div>
+                        <p className="mt-1 text-[10px] leading-snug text-slate-400">{p.desc}</p>
+                      </div>
+                      <div className="mt-2.5 flex items-center justify-between border-t border-border/60 pt-2 text-[10px]">
+                        <span className="font-semibold text-cyan-300">Düşüş Koruması: {p.dropCoverage}</span>
+                        <span className="text-slate-400">{p.safety} Kademe · TP %{p.tp}</span>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Canlı Fiyat Düşüş Koruması Rozeti */}
+              {dcaCoverageStats && (
+                <div
+                  className={cn(
+                    "flex flex-col gap-2 rounded-xl border p-3.5 transition-all sm:flex-row sm:items-center sm:justify-between",
+                    dcaCoverageStats.riskTier.border,
+                    dcaCoverageStats.riskTier.bg,
+                  )}
                 >
-                  <span className="block text-xs font-bold text-emerald-300">{p.label}</span>
-                  <span className="mt-0.5 block text-[10px] text-slate-400">{p.desc} — sapma %{p.dev}, {p.safety} kademe, TP %{p.tp}</span>
-                </button>
-              ))}
+                  <div className="space-y-0.5">
+                    <div className="flex items-center gap-2">
+                      <ShieldCheck className={cn("h-4 w-4", dcaCoverageStats.riskTier.color)} />
+                      <span className="text-xs font-bold text-slate-100">
+                        Maksimum Fiyat Düşüş Koruması:{" "}
+                        <span className={cn("num text-sm font-black", dcaCoverageStats.riskTier.color)}>
+                          -%{dcaCoverageStats.dropPct.toFixed(1)}
+                        </span>
+                      </span>
+                      <span className={cn("rounded-full px-2 py-0.5 text-[10px] font-bold", dcaCoverageStats.riskTier.badgeBg)}>
+                        {dcaCoverageStats.riskTier.label}
+                      </span>
+                    </div>
+                    <p className="text-[10px] text-slate-400">
+                      Giriş fiyatından itibaren %{dcaCoverageStats.dropPct.toFixed(1)} değer kaybına kadar {maxSafety} güvenlik emri ile ortalama maliyet düşürülür.
+                    </p>
+                  </div>
+                  <div className="num shrink-0 rounded-lg border border-border/60 bg-surface/80 px-2.5 py-1 text-right text-[11px] text-slate-300">
+                    <span className="block text-[10px] text-slate-500">Planlanan Toplam Sermaye</span>
+                    <span className="font-bold text-slate-100">{fmtUsd(dcaCoverageStats.totalCapital, 2)}</span>
+                    <span className="block text-[9px] text-slate-500">
+                      {dcaCoverageStats.isExact ? "✓ Merdiven kesin" : "≈ Tahmini"}
+                    </span>
+                  </div>
+                </div>
+              )}
             </div>
           )}
           <div className="grid gap-4 lg:grid-cols-2">

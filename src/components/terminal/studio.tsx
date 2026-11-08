@@ -15,7 +15,9 @@ import {
   Info,
   ListTree,
   Loader2,
+  Pause,
   Percent,
+  Play,
   Radio,
   Save,
   Settings2,
@@ -27,6 +29,7 @@ import {
   TriangleAlert,
   Webhook,
   Workflow,
+  XCircle,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -56,6 +59,7 @@ import {
 } from "@/components/terminal/bits";
 import { LadderTable } from "@/components/terminal/ladder";
 import { TvChart, type TvPriceLine } from "@/components/terminal/tv-chart";
+import { DealProgressBar } from "@/components/terminal/deal-progress-bar";
 import dynamic from "next/dynamic";
 // Lazy: backtest-panel pulls the heavy chart/backtest graph — split so the
 // studio chunk stays small (sandbox compile memory peaks).
@@ -64,7 +68,26 @@ const StudioBacktestRunner = dynamic(
   { ssr: false, loading: () => <div className="p-6 text-xs text-slate-500">Backtest modülü yükleniyor…</div> },
 );
 import { EngineError } from "@/hooks/use-engine";
-import { apiAiProviders, apiBotAction, apiBotGrid, apiBotMemoryGenerate, apiBotMemoryList, apiBotTick, apiCalcDca, apiDryRun, apiMarkets, apiParity, apiPatchBot, apiReconcile, getBotMeta, useBotDetail, useBotEvents, useFills } from "@/hooks/use-engine";
+import {
+  apiAiProviders,
+  apiBotAction,
+  apiBotGrid,
+  apiBotMemoryGenerate,
+  apiBotMemoryList,
+  apiBotTick,
+  apiCalcDca,
+  apiDeals,
+  apiDryRun,
+  apiMarkets,
+  apiParity,
+  apiPatchBot,
+  apiReconcile,
+  getBotMeta,
+  useBotDetail,
+  useBotEvents,
+  useFills,
+  type DealsSummary,
+} from "@/hooks/use-engine";
 import { ForensicsTraces } from "@/components/terminal/forensics";
 import { fmtFrac, fmtNum, fmtTimeShort, fmtTs, fmtUsd, fmtUsdSigned, fracToNum, truncateMid } from "@/lib/format";
 import { MICRO_FALLBACK, microOf } from "@/lib/bot-defaults";
@@ -125,6 +148,19 @@ function sessionLabel(v: UserRiskPolicy["session_type"]): string {
 export function Studio({ botId, onBack }: { botId: string; onBack: () => void }) {
   const { bot, loading } = useBotDetail(botId);
   const { fills, loading: fillsLoading } = useFills(botId, { live: true });
+  const [dealsSummary, setDealsSummary] = useState<DealsSummary | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    apiDeals({ bot_id: botId })
+      .then((res) => {
+        if (alive && res?.summary) setDealsSummary(res.summary);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [botId]);
   // Faz 24 (UI/UX Pro Max raporu §3.3.3): Deal Kurtarma — son kademeden sonra
   // likidasyondan kurtarmak/ortalamayı çekmek için manuel ek teminat.
   const [addFundsOpen, setAddFundsOpen] = useState(false);
@@ -375,6 +411,51 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
   })();
   const botCashNum = fracToNum(bot.cash);
 
+  const ladderDropStats = (() => {
+    if (!bot.ladder || bot.ladder.length === 0) return null;
+    const lastRow = bot.ladder[bot.ladder.length - 1];
+    const devPct = (fracToNum(lastRow.cumDeviation ?? null) ?? 0) * 100;
+    let totalNotional = 0;
+    for (const row of bot.ladder) {
+      totalNotional += fracToNum(row.notional) ?? 0;
+    }
+    return {
+      maxDropPct: devPct,
+      totalNotional,
+      totalLevels: bot.ladder.length,
+    };
+  })();
+
+  /* Reddit / Sektör talebi: Marjin botlarında Likidasyon Mesafesi (% to Liq) */
+  const liqDistanceStats = (() => {
+    if (!bot.marginMode || !bot.liqPrice) return null;
+    const liq = fracToNum(bot.liqPrice);
+    const avg = fracToNum(s.avg_price) ?? 0;
+    if (!liq || liq <= 0 || avg <= 0) return null;
+
+    const isShort = bot.kind === "DCA_SHORT";
+    const distPct = isShort ? ((liq - avg) / avg) * 100 : ((avg - liq) / avg) * 100;
+    const clampedDist = Math.max(0, distPct);
+
+    const tier =
+      clampedDist >= 30
+        ? { label: "Güvenli", color: "text-emerald-400", border: "border-emerald-500/40" }
+        : clampedDist >= 15
+          ? { label: "Dikkat", color: "text-amber-400", border: "border-amber-500/40" }
+          : { label: "KRİTİK RİSK", color: "text-rose-400 animate-pulse font-black", border: "border-rose-500/50" };
+
+    return {
+      distPct: clampedDist,
+      tier,
+      liqPrice: liq,
+    };
+  })();
+
+  const feeRatio = (() => {
+    if (!dealsSummary || dealsSummary.totalGrossPnl <= 0) return null;
+    return (dealsSummary.totalFees / dealsSummary.totalGrossPnl) * 100;
+  })();
+
   /* TradingView chart overlay: live bot levels (avg/TP/SL/next safety/liq).
      Plain derivation (no hook — this runs after the early returns above). */
   const chartLines: TvPriceLine[] = (() => {
@@ -383,7 +464,7 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
       const p = fracToNum(v ?? null);
       if (p && p > 0) lines.push({ price: p, color, title, dashed });
     };
-    push(s.avg_price, "#22d3ee", "AVG");
+    push(s.avg_price, "#22d3ee", "BAŞABAŞ (AVG)");
     push(s.tp_price, "#10b981", "TP", true);
     push(s.sl_price, "#f43f5e", "SL", true);
     push(s.next_safety_price, "#f59e0b", `S${s.next_safety_level ?? ""}`, true);
@@ -428,6 +509,61 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
             {bot.id} · {bot.symbol} · {bot.interval}
           </div>
         </div>
+        <div className="ml-auto flex flex-wrap items-center gap-2">
+          {bot.status === "RUNNING" ? (
+            <Button
+              size="sm"
+              variant="outline"
+              className="min-h-9 border-amber-500/50 text-amber-300 hover:bg-amber-500/10"
+              onClick={async () => {
+                try {
+                  await apiPatchBot(bot.id, { status: "PAUSED" });
+                  toast({ title: `${bot.name} duraklatıldı` });
+                } catch (e) {
+                  toast({ title: "Hata", description: String(e), variant: "destructive" });
+                }
+              }}
+            >
+              <Pause className="h-3.5 w-3.5" aria-hidden /> Duraklat
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              variant="outline"
+              className="min-h-9 border-emerald-500/50 text-emerald-300 hover:bg-emerald-500/10"
+              onClick={async () => {
+                try {
+                  await apiPatchBot(bot.id, { status: "RUNNING" });
+                  toast({ title: `${bot.name} başlatıldı` });
+                } catch (e) {
+                  toast({ title: "Hata", description: String(e), variant: "destructive" });
+                }
+              }}
+            >
+              <Play className="h-3.5 w-3.5" aria-hidden /> Başlat
+            </Button>
+          )}
+
+          {s.phase === "Open" && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="min-h-9 border-rose-500/50 text-rose-300 hover:bg-rose-500/10"
+              onClick={async () => {
+                if (!window.confirm(`${bot.name} için açık pozisyon market fiyatından kapatılacak ve bot durdurulacak. Emin misiniz?`)) return;
+                try {
+                  await apiBotAction(bot.id, "CLOSE_ALL");
+                  await apiPatchBot(bot.id, { status: "STOPPED" });
+                  toast({ title: `${bot.name} Kapatıldı`, description: "CLOSE_ALL gönderildi, bot STOPPED." });
+                } catch (e) {
+                  toast({ title: "Kapatma Başarısız", description: String(e), variant: "destructive" });
+                }
+              }}
+            >
+              <XCircle className="h-3.5 w-3.5" aria-hidden /> Marketten Kapat
+            </Button>
+          )}
+        </div>
       </div>
 
       <Tabs defaultValue="genel">
@@ -455,30 +591,147 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
 
         {/* ---------- Genel ---------- */}
         <TabsContent value="genel" className="mt-4 space-y-4">
-          {/* Faz 24 (UI/UX Pro Max raporu §3.1.2): Deal performans şeridi —
-              kapanan deal sayısı, kazanma oranı ve net gerçekleşen kâr; tüccarın
-              ilk baktığı üç sayı artık Genel sekmesinin en üstünde. */}
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-            <div className="rounded-lg border border-border bg-surface p-3">
+          {/* Sektörel Deal Performans Şeridi: Deals Closed, Win Rate, Profit Factor, Avg Deal, Net PnL, Komisyon */}
+          <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3 xl:grid-cols-6">
+            <div className="rounded-xl border border-border bg-surface p-3">
               <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">KAPANAN DEAL</div>
               <div className="num mt-1 text-xl font-bold text-slate-100">{s.deals_closed}</div>
+              <div className="mt-0.5 text-[10px] text-slate-500">Tamamlanan işlem</div>
             </div>
-            <div className="rounded-lg border border-border bg-surface p-3">
+            <div className="rounded-xl border border-border bg-surface p-3">
               <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">KAZANMA ORANI</div>
               <div className={cn("num mt-1 text-xl font-bold", s.wins + s.losses > 0 ? (s.wins / (s.wins + s.losses) >= 0.5 ? "text-emerald-400" : "text-rose-400") : "text-slate-400")}>
-                {s.wins + s.losses > 0 ? `${Math.round((s.wins / (s.wins + s.losses)) * 100)}%` : "—"}
+                {dealsSummary ? `%${dealsSummary.winRate}` : (s.wins + s.losses > 0 ? `%${Math.round((s.wins / (s.wins + s.losses)) * 100)}` : "—")}
               </div>
               <div className="mt-0.5 text-[10px] text-slate-500">{s.wins}W / {s.losses}L</div>
             </div>
-            <div className="rounded-lg border border-border bg-surface p-3">
-              <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">NET GERÇEKLENEN</div>
-              <div className="num mt-1 text-xl font-bold text-slate-100">{s.realized_net ? fmtUsdSigned(s.realized_net, 4) : "—"}</div>
+            <div className="rounded-xl border border-border bg-surface p-3">
+              <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">PROFIT FACTOR</div>
+              <div className={cn("num mt-1 text-xl font-bold",
+                (dealsSummary?.profitFactor ?? 0) >= 1.5
+                  ? "text-emerald-400"
+                  : (dealsSummary?.profitFactor ?? 0) >= 1.0
+                    ? "text-cyan-400"
+                    : "text-rose-400"
+              )}>
+                {dealsSummary?.profitFactor != null
+                  ? dealsSummary.profitFactor > 99
+                    ? "∞"
+                    : dealsSummary.profitFactor.toFixed(2)
+                  : "—"}
+              </div>
+              <div className="mt-0.5 text-[10px] text-slate-500">Brüt Kâr / Kayıp</div>
             </div>
-            <div className="rounded-lg border border-border bg-surface p-3">
-              <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">BRÜT GERÇEKLENEN</div>
-              <div className="num mt-1 text-xl font-bold text-slate-100">{fmtUsdSigned(s.realized_gross, 4)}</div>
+            <div className="rounded-xl border border-border bg-surface p-3">
+              <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">ORT. DEAL KÂRI</div>
+              <div className={cn("num mt-1 text-xl font-bold",
+                (dealsSummary?.avgDealProfit ?? 0) >= 0 ? "text-emerald-400" : "text-rose-400"
+              )}>
+                {dealsSummary?.avgDealProfit != null ? fmtUsdSigned(dealsSummary.avgDealProfit) : "—"}
+              </div>
+              <div className="mt-0.5 text-[10px] text-slate-500">İşlem başına ortalama</div>
+            </div>
+            <div className="rounded-xl border border-border bg-surface p-3">
+              <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">NET GERÇEKLEŞEN</div>
+              <div className={cn("num mt-1 text-xl font-bold",
+                (fracToNum(s.realized_net ?? s.realized_gross) ?? 0) >= 0 ? "text-emerald-400" : "text-rose-400"
+              )}>
+                {s.realized_net ? fmtUsdSigned(s.realized_net, 4) : fmtUsdSigned(s.realized_gross, 4)}
+              </div>
+              <div className="mt-0.5 text-[10px] text-slate-500">Net kâr / zarar</div>
+            </div>
+            <div className="rounded-xl border border-border bg-surface p-3">
+              <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">TOPLAM KOMİSYON</div>
+              <div className="num mt-1 text-xl font-bold text-slate-300">
+                {dealsSummary ? fmtUsd(dealsSummary.totalFees, 4) : fmtUsd(bot.cumulativeFees, 4)}
+              </div>
+              <div className="mt-0.5 text-[10px] text-slate-500">
+                {feeRatio != null ? (
+                  <span className={feeRatio > 30 ? "text-amber-400 font-medium" : "text-slate-400"}>
+                    Aşınma: %{feeRatio.toFixed(1)}
+                  </span>
+                ) : (
+                  "Ödenen işlem ücreti"
+                )}
+              </div>
             </div>
           </div>
+
+          {/* 3Commas benchmark: Görsel Deal İlerleme Çubuğu & Durum Takipçisi */}
+          {s.phase === "Open" ? (
+            <div className="rounded-xl border border-emerald-500/40 bg-surface p-4 shadow-sm">
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-border/60 pb-2.5">
+                <div className="flex items-center gap-2">
+                  <span className="flex h-2.5 w-2.5 rounded-full bg-emerald-400 animate-pulse" />
+                  <span className="text-xs font-bold text-slate-100">AKTİF DEAL İLERLEMESİ</span>
+                  {s.deal_id && (
+                    <span className="font-mono text-[10px] text-slate-400" title={s.deal_id}>
+                      #{truncateMid(s.deal_id, 12, 6)}
+                    </span>
+                  )}
+                  <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-300">
+                    Faz: {s.phase}
+                  </span>
+                  {s.safety_triggered >= (bot.config?.max_safety_orders ?? bot.ladder?.length ?? 5) && (
+                    <span className="rounded bg-rose-500/20 border border-rose-500/40 px-2 py-0.5 text-[10px] font-bold text-rose-300 animate-pulse">
+                      ⚠️ KADEME TÜKENDİ
+                    </span>
+                  )}
+                </div>
+                <div className="flex flex-wrap items-center gap-3 text-xs">
+                  <div className="flex items-center gap-1.5 rounded-md bg-cyan-500/10 border border-cyan-500/30 px-2 py-0.5">
+                    <span className="h-1.5 w-1.5 rounded-full bg-cyan-400 animate-pulse" />
+                    <span className="text-cyan-300 font-semibold">Şimdiki Fiyat: </span>
+                    <span className="num font-black text-cyan-200">{fmtFrac(bot.markPrice ?? s.avg_price)}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400">Başabaş (AVG): </span>
+                    <span className="num font-bold text-slate-100">{fmtFrac(s.avg_price)}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400">Hedef (TP): </span>
+                    <span className="num font-bold text-emerald-400">{fmtFrac(s.tp_price)}</span>
+                  </div>
+                </div>
+              </div>
+
+              <DealProgressBar
+                phase={s.phase}
+                safetyTriggered={s.safety_triggered}
+                maxSafetyOrders={bot.config?.max_safety_orders ?? bot.ladder?.length ?? 5}
+                avgPrice={s.avg_price}
+                tpPrice={s.tp_price}
+                slPrice={s.sl_price}
+                currentPrice={bot.markPrice}
+                unrealizedPnl={bot.unrealizedNow}
+                liqPrice={bot.liqPrice}
+                marginMode={bot.marginMode}
+                nextSafetyPrice={s.next_safety_price}
+                nextSafetyLevel={s.next_safety_level}
+                positionQty={s.position_qty}
+                ladder={bot.ladder}
+                isShort={bot.kind === "DCA_SHORT"}
+                symbol={bot.symbol}
+                compact={false}
+              />
+            </div>
+          ) : (
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border bg-surface px-4 py-3 text-xs text-slate-400">
+              <div className="flex items-center gap-2">
+                <span className="h-2 w-2 rounded-full bg-slate-500" />
+                <span>
+                  {s.phase === "Closing"
+                    ? "Deal Kapanıyor: Kapanış emri piyasada, dolum bekleniyor…"
+                    : `Aktif deal yok (Faz: ${s.phase}). Başlangıç koşulu: ${s.entry_trigger}${s.entry_trigger_met ? " (sağlandı ✓)" : " (koşul bekleniyor)"}`}
+                </span>
+              </div>
+              {ladderDropStats && (
+                <span className="font-semibold text-cyan-300">
+                  Merdiven Koruması: -%{ladderDropStats.maxDropPct.toFixed(1)} ({ladderDropStats.totalLevels} Kademe)
+                </span>
+              )}
+            </div>
+          )}
           {/* Faz 21 (N-8): kernel sticky-halt artık GÖRÜNÜR — kırmızı şerit +
               açma düğmesi. Eski davranışta bot "görünmez şekilde duruyor",
               faz rozeti Open kalıyor, hiçbir emir gitmiyordu. */}
@@ -567,6 +820,18 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
                 <StatCell
                   label="LİKİDASYON"
                   value={bot.liqPrice ? <span className="text-rose-400">{fmtFrac(bot.liqPrice)}</span> : "—"}
+                />
+                <StatCell
+                  label="LİKİDASYON MESAFESİ"
+                  value={
+                    liqDistanceStats ? (
+                      <span className={cn("font-bold", liqDistanceStats.tier.color)}>
+                        %{liqDistanceStats.distPct.toFixed(1)} ({liqDistanceStats.tier.label})
+                      </span>
+                    ) : (
+                      "—"
+                    )
+                  }
                 />
               </>
             )}
@@ -804,6 +1069,36 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
 
         {/* ---------- Ladder ---------- */}
         <TabsContent value="ladder" className="mt-4 space-y-3">
+          {ladderDropStats && (
+            <div className="flex flex-col gap-2 rounded-xl border border-cyan-500/30 bg-cyan-500/5 p-3.5 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex items-center gap-2.5">
+                <ShieldCheck className="h-4 w-4 text-cyan-400" />
+                <div>
+                  <div className="text-xs font-bold text-slate-100">
+                    Maksimum Fiyat Düşüş Koruması:{" "}
+                    <span className="num font-extrabold text-cyan-300">
+                      -%{ladderDropStats.maxDropPct.toFixed(1)}
+                    </span>
+                  </div>
+                  <div className="text-[10px] text-slate-400">
+                    {bot.ladder?.length ?? 0} kademe boyunca güvenlik emirleri ortalama maliyeti planlı olarak aşağı çeker.
+                  </div>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <div className="num rounded-lg border border-border/60 bg-surface px-2.5 py-1">
+                  <span className="block text-[10px] text-slate-500">Kademelerde Toplam Sermaye</span>
+                  <span className="font-bold text-slate-200">{fmtUsd(ladderDropStats.totalNotional, 2)}</span>
+                </div>
+                <div className="num rounded-lg border border-border/60 bg-surface px-2.5 py-1">
+                  <span className="block text-[10px] text-slate-500">Tetiklenen Güvenlik</span>
+                  <span className="font-bold text-emerald-400">
+                    SO {s.safety_triggered} / {bot.ladder?.length ?? 0}
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
           <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
             <span>
               {isHedge ? "Ana bacak (long) DCA merdiveni" : isGrid ? "Grid mesh" : "DCA güvenlik merdiveni"} — {bot.ladder?.length ?? 0} seviye
