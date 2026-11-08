@@ -261,7 +261,8 @@ impl BotRuntime {
             "leverage": self.stepper.cfg.leverage.to_string(),
             "imUsed": self.stepper.im_used.to_string(),
             "liqPrice": crate::engine::current_liq_price(self).map(|p| p.to_string()),
-            "webhookSecret": self.webhook_secret,
+            // SEC-05: webhookSecret snapshot'tan KALDIRILDI — hassas bir şifredir,
+            // her bot detay yanıtında açık metin olarak dökülmemeli.
             "entrySignalMet": self.entry_signal_met,
             // Task 16 — risk motoru yüzeyi
             "warnings": warnings,

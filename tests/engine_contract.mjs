@@ -146,8 +146,10 @@ console.log("=== E) UI proxy ===");
 {
   const r = await req(BASE_UI, "/api/engine/api/bots");
   check("proxy Bearer sunucuda ekleniyor", r.status === 200, `status=${r.status}`);
+  // Faz 29: proxy.ts varken Next plain rewrite'ı uygulamıyor — /api/bots
+  // artık 404 (yol hiçbir şekilde motora çıkmıyor; 401'den de sıkı).
   const direct = await req(BASE_UI, "/api/bots");
-  check("proxy dışı yol anahtarsız 401", direct.status === 401, `status=${direct.status}`);
+  check("proxy dışı yol 404 (rewrite yok — motor kapalı)", direct.status === 404, `status=${direct.status}`);
   const csrf = await fetch(BASE_UI + "/api/engine/api/live/killswitch", {
     method: "POST",
     headers: { "Content-Type": "application/json", Origin: "http://evil.example" },

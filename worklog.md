@@ -1129,3 +1129,17 @@ Work Log:
 - Smoke desenleri: SSE networkidle/load'u engelliyor → domcontentloaded + hidrasyon isareti (footer tazelik rozeti waitForFunction) + port-yarisi kimlik guard'i → 5/5 PASS (9sn).
 - Test piramidi belgelendi: engine_contract.mjs (hizli, 25/25) · bot-matrix.mjs (orta, 10/10) · playwright-smoke.mjs (UI, 5/5) · e2e_engine.py (gecelik derin T1-T21, basina durum notu).
 - Tum sutler temiz ortamda tekrar kosuldu: contract 25/25 · smoke 5/5 · tsc/eslint 0.
+---
+Task ID: FAZ29-MIDDLEWARE-PROXY (Next 16.4.3 middleware → proxy migration + port yarisi kapanisi)
+Agent: main (2026-11-08)
+Task: "core offline" arizasi — kok neden zinciri: UI coktu → :3000'u D:\project\suyonetimi projesi gasp etti → DCABOT UI restart edildi ama Next 16.4.3 artik middleware.ts konvansiyonunu dev derlemede YUKLEMİYOR (deprecated → proxy.ts zorunlu) → /api/engine/* 404 → CORE OFFLINE rozeti.
+
+Kok neden zinciri (kaniit):
+1. Kullanici "core offline" gordu — engine :3002 SAGLAMDI (13/13, tick canli), ariza UI proxy katmanindaydi: /api/engine/api/health → 404.
+2. ui.stderr.log: "middleware file convention is deprecated... use proxy" + restart sonrasi "Both middleware and proxy file detected" (iki dosya gecici olarak bir arada).
+3. Cozum: middleware.ts → proxy.ts (fonksiyon middleware() → proxy(); davranis birebir — SSRF sert kenar + CSRF kapisi + Bearer enjeksiyonu korundu).
+4. Ikinci bulgu: proxy.ts varken Next 16.4.3 next.config rewrites()'i uygulamiyor (plain /api/* → 404). App'in motor erisimi zaten tamamen /api/engine/* uzerinden — davranis degismedi; sozlesme testi yeni gercege guncellendi (proxy-disi yol artik 404 — 401'den de sik).
+5. .next bozuk onbellek + iki-convansiyon kalintisi icin bilinen prosedur: surecleri oldur + .next sil + temiz baslat.
+
+Dogrulama: proxy 200 · contract 25/25 (proxy-disi 404 dahil) · playwright 5/5 (12sn) · tsc/eslint 0 · GET / DCABOT kimlikli (2 eslesme) · engine 13/13.
+Ek: suyonetimi projesi durduruldu (kullanici projesi — npm run dev ile geri alinabilir); smoke'a kimlik sigortasi vardi, dogru calisti.

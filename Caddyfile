@@ -6,9 +6,13 @@
 }
 
 http://localhost:81 {
+	# Tüm /api/* istekleri Next.js middleware üzerinden geçirilir.
+	# Middleware /api/engine/* rotalarına Bearer token ekler (SEC-01).
+	# /api/health ve /api/stream özel durumlar tarafından Next.js'de işlenir.
 	handle /api/* {
-		reverse_proxy localhost:3002
+		reverse_proxy localhost:3000
 	}
+
 	handle {
 		reverse_proxy localhost:3000
 	}

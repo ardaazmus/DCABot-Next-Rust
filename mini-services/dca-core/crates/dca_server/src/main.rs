@@ -42,6 +42,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::Mutex as AsyncMutex;
 use store::{Db, Vault};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use uuid::Uuid;
@@ -52,6 +53,7 @@ use uuid::Uuid;
 // -----------------------------------------------------------------------
 const RATE_LIMIT_MAX: usize = 100;
 const RATE_LIMIT_WINDOW_SECS: u64 = 10;
+const RATE_LIMIT_MAX_BUCKETS: usize = 10_000;
 
 #[derive(Default, Clone)]
 struct RateLimiter {
@@ -62,6 +64,14 @@ impl RateLimiter {
     fn check(&mut self, _key: &str) -> bool {
         let now = Instant::now();
         let window_start = now - std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
+
+        // Eğer bucket sayısı sınırı aşıldıysa, en eski boş/eaşırı süren bucket'ları temizle.
+        if self.buckets.len() >= RATE_LIMIT_MAX_BUCKETS {
+            self.buckets.retain(|_, v| {
+                v.iter().any(|t| *t > window_start)
+            });
+        }
+
         let entry = self.buckets.entry(_key.to_string()).or_default();
         entry.retain(|t| *t > window_start);
         if entry.len() < RATE_LIMIT_MAX {
@@ -98,7 +108,6 @@ async fn main() {
         let candidates = [
             "db/dca-core.sqlite3",
             "../../db/dca-core.sqlite3",
-            "/home/z/my-project/db/dca-core.sqlite3",
         ];
         for c in &candidates {
             if std::path::Path::new(c).exists() {
@@ -159,15 +168,16 @@ async fn main() {
     let sse_rx = Arc::new(rx);
 
     // SEC-04: rate limiter durumu (tüm yönetim rotaları ortak kotalar).
-    let rate_limiter = Arc::new(std::sync::Mutex::new(RateLimiter::default()));
+    let rate_limiter = Arc::new(AsyncMutex::new(RateLimiter::default()));
 
     // SEC-01: Yönetim API kimlik doğrulaması — DCA_API_KEY env'de zorunlu.
-    // Eksikse sunucu başlatılır ama yönetim istekleri 401 döner (fail-closed);
-    // çökme riski yok. Canlı ortamda mutlaka ayarlanmalı.
-    let api_key = std::env::var("DCA_API_KEY").unwrap_or_else(|_| {
-        tracing::warn!("DCA_API_KEY ayarlanmamış — yönetim API'si 401 dönecek (SEC-01)");
-        "dev-unset-key".to_string()
-    });
+    // Eksikse anahtar boş bırakılır ve tüm authenticated istekler 401 döner
+    // (fail-closed — çökme riski yok, ama yönetim erişimi engellenir).
+    // Canlı ortamda mutlaka ayarlanmalıdır.
+    let api_key = std::env::var("DCA_API_KEY").unwrap_or_default();
+    if api_key.is_empty() {
+        tracing::warn!("DCA_API_KEY ayarlanmamış — tüm authenticated istekler 401 dönecek (SEC-01)");
+    }
     let api_key_clone = api_key.clone();
 
     // SEC-01: /api/health kimlik doğrulaması iSTEMEN (load balancer / monitoring açık erişim).
@@ -240,7 +250,7 @@ async fn main() {
                 let limiter = rate_limiter.clone();
                 async move {
                     let allowed = {
-                        let mut l = limiter.lock().unwrap();
+                        let mut l = limiter.lock().await;
                         l.check("gateway")
                     };
                     if !allowed {
@@ -781,16 +791,18 @@ async fn auth_middleware(
     if !auth.starts_with("Bearer ") {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    // Faz 17 (P2-3): sabit-zamanlı karşılaştırma — early-exit yan kanalı kapalı
-    // (webhook handler'daki desenle aynı).
     let provided = &auth[7..];
-    let mismatch = provided.len() != api_key.len()
+    // Empty api_key means auth is not configured — reject all (fail-closed).
+    if api_key.is_empty() || provided.is_empty() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    if provided.len() != api_key.len()
         || provided
             .bytes()
             .zip(api_key.bytes())
             .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-            != 0;
-    if mismatch {
+            != 0
+    {
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(next.run(req).await)

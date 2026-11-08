@@ -1,13 +1,18 @@
 import { NextRequest, NextResponse } from "next/server";
 
 /**
- * Faz 21 (P0-9): motor proxy'si — middleware katmanı.
+ * Faz 21 (P0-9): motor proxy'si — proxy katmanı.
  *
  * Tarayıcı artık motora ASLA doğrudan konuşmaz ve API anahtarı istemci
  * paketine GİRMEZ. Tüm motor çağrıları `/api/engine/*` altına alınır;
- * middleware bunu yakalayıp (rewrites'tan ÖNCE — catch-all route'lar
+ * proxy bunu yakalayıp (rewrites'tan ÖNCE — catch-all route'lar
  * rewrite'ı geçemediği için route-handler yaklaşımı işlemedi) Bearer'ı
  * YALNIZ burada, sunucu tarafında ekleyerek motora taşır.
+ *
+ * Faz 29: Next 16.4.3+ `middleware.ts` dosya konvansiyonu dev derlemede
+ * çalışmayı bıraktı (deprecated → proxy). Dosya `middleware.ts` →
+ * `proxy.ts`, fonksiyon `middleware()` → `proxy()` olarak geçirildi;
+ * davranış birebir korundu.
  *
  * SSRF sert kenar: hedef tamamen sabit ana makine + doğrulanmış sayısal
  * porttan kurulur; istekten gelen hiçbir veri hedef URL'nin host/port/şema
@@ -52,7 +57,7 @@ function originAllowed(req: NextRequest): boolean {
   }
 }
 
-export function middleware(req: NextRequest) {
+export function proxy(req: NextRequest) {
   const { pathname, search } = req.nextUrl;
   if (!pathname.startsWith("/api/engine/")) {
     return NextResponse.next();

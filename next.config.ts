@@ -11,19 +11,15 @@ const nextConfig: NextConfig = {
     ignoreBuildErrors: false,
   },
   reactStrictMode: false,
+  // rewrite yok: tüm /api/* istekleri middleware.ts tarafından yakalanıp
+  // :3002'ye proxy edilir (Bearer kimlik doğrulaması dahil). /api/health ve
+  // /api/stream özel durumlar middleware'de doğrudan :3002'ye yönlendirilir.
+  // Faz 29 NOTU: src/proxy.ts mevcutken Next 16.4.3 bu rewrite'ı UYGULAMIYOR
+  // (gözlem: /api/* → 404). Uygulamanın motor erişimi tamamen /api/engine/*
+  // proxy'sinden geçtiği için davranış değişmiyor; blok yalnızca geçmiş
+  // sözleşme kaydı olarak tutuluyor (geri dönüş senaryosu).
   async rewrites() {
-    // Faz 21 (P0-9): /api/engine/* istemci çağrıları MIDDLEWARE'de yakalanıp
-    // Bearer'la motora taşınır (rewrites middleware'i geçer; route-handler
-    // yaklaşımı afterFiles rewrite dinamik route'lardan önce çalıştığı için
-    // işlemedi). Bu rewrite kalan /api/* yollarını taşır — tarayıcıdan gelen
-    // bu istekler anahtarsızdır, motor 401 verir; anahtar tarayıcıya asla
-    // girmez.
-    return [
-      {
-        source: "/api/:path*",
-        destination: "http://127.0.0.1:3002/api/:path*",
-      },
-    ];
+    return [];
   },
   experimental: {
     ...(localRun ? { cpus: 1, webpackMemoryOptimizations: true } : {}),
