@@ -14,6 +14,7 @@ use dca_math::Instrument;
 use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha2::Sha256;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 pub const MAINNET: &str = "https://api.bybit.com";
 pub const TESTNET: &str = "https://api-testnet.bybit.com";
@@ -22,6 +23,7 @@ pub struct BybitAdapter {
     pub base_url: String,
     pub recv_window: String,
     pub http: reqwest::Client,
+    pub time_offset_ms: AtomicI64,
 }
 
 impl BybitAdapter {
@@ -31,6 +33,14 @@ impl BybitAdapter {
         } else if testnet || std::env::var("DCA_BYBIT_TESTNET").as_deref() == Ok("1") {
             TESTNET.into()
         } else {
+            // Faz 0.5 (B-6): MAINNET fail-closed kapısı — DCA_ALLOW_MAINNET=1 olmadan
+            // gerçek emir hattına bağlanmak yapısal olarak engellenir (test ortamları hariç).
+            let is_test_runner = std::env::current_exe()
+                .map(|p| p.to_string_lossy().contains("deps"))
+                .unwrap_or(false);
+            if !is_test_runner && std::env::var("DCA_ALLOW_MAINNET").as_deref() != Ok("1") {
+                panic!("CRITICAL SAFETY VIOLATION: Attempted Bybit MAINNET connection without DCA_ALLOW_MAINNET=1! Set DCA_BYBIT_TESTNET=1 for paper/testnet or explicitly set DCA_ALLOW_MAINNET=1.");
+            }
             MAINNET.into()
         };
         let recv_window = std::env::var("BYBIT_RECV_WINDOW").unwrap_or_else(|_| "5000".into());
@@ -41,7 +51,49 @@ impl BybitAdapter {
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .expect("reqwest client"),
+            time_offset_ms: AtomicI64::new(0),
         }
+    }
+
+    /// Zaman damgasını sunucu saati farkı (drift offset) ile düzelterek döndürür.
+    pub fn now_ms(&self) -> i64 {
+        raw_system_now_ms().saturating_add(self.time_offset_ms.load(Ordering::Relaxed))
+    }
+
+    /// Bybit /v5/market/time ucundan borsa saatini sorgular ve yerel saat ile arasındaki
+    /// farkı (drift) atomik olarak time_offset_ms içerisine kaydeder.
+    pub async fn sync_server_time(&self) -> Result<i64, String> {
+        let local_before = raw_system_now_ms();
+        let url = format!("{}/v5/market/time", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| format!("bybit time sync network error: {e}"))?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(|e| format!("bybit time sync body error: {e}"))?;
+        if !status.is_success() {
+            let snippet: String = body.chars().take(200).collect();
+            return Err(format!("bybit time sync HTTP error {status}: {snippet}"));
+        }
+        let v: Value = serde_json::from_str(&body).map_err(|e| format!("bybit time sync json error: {e}"))?;
+        let server_ms = if let Some(t) = v.get("time").and_then(|x| x.as_i64()) {
+            t
+        } else if let Some(nano) = v.get("result").and_then(|r| r.get("timeNano")).and_then(|x| x.as_str()).and_then(|s| s.parse::<i64>().ok()) {
+            nano / 1_000_000
+        } else if let Some(sec) = v.get("result").and_then(|r| r.get("timeSecond")).and_then(|x| x.as_str()).and_then(|s| s.parse::<i64>().ok()) {
+            sec * 1000
+        } else {
+            return Err("bybit time sync: server time not found in payload".into());
+        };
+        let local_after = raw_system_now_ms();
+        let local_mid = (local_before + local_after) / 2;
+        let offset = server_ms - local_mid;
+        self.time_offset_ms.store(offset, Ordering::Relaxed);
+        tracing::info!("Bybit server time synced: offset={}ms (server={}, local={})", offset, server_ms, local_mid);
+        Ok(offset)
     }
 
     /// GET sign string: ts + key + recv_window + queryString (as-sent order).
@@ -69,12 +121,25 @@ impl BybitAdapter {
             .send()
             .await
             .map_err(|e| format!("bybit GET {path} failed: {e}"))?;
-        let v: Value = resp.json().await.map_err(|e| e.to_string())?;
+
+        let status = resp.status();
+        let body_text = resp.text().await.map_err(|e| format!("bybit GET {path} read body error: {e}"))?;
+        if !status.is_success() {
+            let snippet: String = body_text.chars().take(200).collect();
+            if status.as_u16() == 429 {
+                return Err(format!("bybit HTTP 429 Too Many Requests on {path}: {snippet}"));
+            }
+            return Err(format!("bybit HTTP {status} on {path}: {snippet}"));
+        }
+        let v: Value = serde_json::from_str(&body_text).map_err(|e| {
+            let snippet: String = body_text.chars().take(200).collect();
+            format!("bybit GET {path} invalid JSON: {e}; snippet: {snippet}")
+        })?;
         check_ret(v, path)
     }
 
     async fn private_get(&self, key: &str, secret: &str, path: &str, query: &str) -> Result<Value, String> {
-        let ts = now_ms().to_string();
+        let ts = self.now_ms().to_string();
         let sign = self.sign_get(&ts, key, secret, query);
         let url = if query.is_empty() {
             format!("{}{}", self.base_url, path)
@@ -91,12 +156,25 @@ impl BybitAdapter {
             .send()
             .await
             .map_err(|e| format!("bybit private GET {path} failed: {e}"))?;
-        let v: Value = resp.json().await.map_err(|e| e.to_string())?;
+
+        let status = resp.status();
+        let body_text = resp.text().await.map_err(|e| format!("bybit private GET {path} read body error: {e}"))?;
+        if !status.is_success() {
+            let snippet: String = body_text.chars().take(200).collect();
+            if status.as_u16() == 429 {
+                return Err(format!("bybit HTTP 429 Too Many Requests on {path}: {snippet}"));
+            }
+            return Err(format!("bybit HTTP {status} on {path}: {snippet}"));
+        }
+        let v: Value = serde_json::from_str(&body_text).map_err(|e| {
+            let snippet: String = body_text.chars().take(200).collect();
+            format!("bybit private GET {path} invalid JSON: {e}; snippet: {snippet}")
+        })?;
         check_ret(v, path)
     }
 
     async fn private_post(&self, key: &str, secret: &str, path: &str, body: &str) -> Result<Value, String> {
-        let ts = now_ms().to_string();
+        let ts = self.now_ms().to_string();
         let sign = self.sign_post(&ts, key, secret, body);
         let url = format!("{}{}", self.base_url, path);
         let resp = self
@@ -111,7 +189,20 @@ impl BybitAdapter {
             .send()
             .await
             .map_err(|e| format!("bybit private POST {path} failed: {e}"))?;
-        let v: Value = resp.json().await.map_err(|e| e.to_string())?;
+
+        let status = resp.status();
+        let body_text = resp.text().await.map_err(|e| format!("bybit private POST {path} read body error: {e}"))?;
+        if !status.is_success() {
+            let snippet: String = body_text.chars().take(200).collect();
+            if status.as_u16() == 429 {
+                return Err(format!("bybit HTTP 429 Too Many Requests on {path}: {snippet}"));
+            }
+            return Err(format!("bybit HTTP {status} on {path}: {snippet}"));
+        }
+        let v: Value = serde_json::from_str(&body_text).map_err(|e| {
+            let snippet: String = body_text.chars().take(200).collect();
+            format!("bybit private POST {path} invalid JSON: {e}; snippet: {snippet}")
+        })?;
         check_ret(v, path)
     }
 
@@ -184,17 +275,27 @@ pub fn sign_hmac(secret: &str, payload: &str) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
-pub fn now_ms() -> i64 {
+pub fn raw_system_now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
 
+pub fn now_ms() -> i64 {
+    raw_system_now_ms()
+}
+
 fn check_ret(v: Value, path: &str) -> Result<Value, String> {
     let code = v.get("retCode").and_then(|x| x.as_i64()).unwrap_or(-1);
     if code != 0 {
         let msg = v.get("retMsg").and_then(|x| x.as_str()).unwrap_or("unknown");
+        if code == 10002 {
+            return Err(format!("bybit {path} retCode=10002 (clock drift/expired timestamp): {msg} - sync_server_time required"));
+        }
+        if code == 10006 {
+            return Err(format!("bybit {path} retCode=10006 (rate limit exceeded): {msg}"));
+        }
         return Err(format!("bybit {path} retCode={code}: {msg}"));
     }
     Ok(v.get("result").cloned().unwrap_or(Value::Null))
@@ -845,5 +946,48 @@ mod tests {
         assert_eq!(s1, s2);
         assert_eq!(s1.len(), 64);
         assert!(s1.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn test_check_ret_ok() {
+        let v = serde_json::json!({
+            "retCode": 0,
+            "retMsg": "OK",
+            "result": {"orderId": "12345"}
+        });
+        let res = check_ret(v, "/test/path").expect("valid retCode 0 should succeed");
+        assert_eq!(res.get("orderId").and_then(|x| x.as_str()), Some("12345"));
+    }
+
+    #[test]
+    fn test_check_ret_clock_drift_10002() {
+        let v = serde_json::json!({
+            "retCode": 10002,
+            "retMsg": "order not exists or too late",
+            "result": null
+        });
+        let err = check_ret(v, "/order/create").unwrap_err();
+        assert!(err.contains("retCode=10002 (clock drift/expired timestamp)"));
+        assert!(err.contains("sync_server_time required"));
+    }
+
+    #[test]
+    fn test_check_ret_rate_limit_10006() {
+        let v = serde_json::json!({
+            "retCode": 10006,
+            "retMsg": "Too many visits",
+            "result": null
+        });
+        let err = check_ret(v, "/market/kline").unwrap_err();
+        assert!(err.contains("retCode=10006 (rate limit exceeded)"));
+    }
+
+    #[test]
+    fn test_bybit_adapter_now_ms_with_offset() {
+        let adapter = BybitAdapter::new(true);
+        let t1 = adapter.now_ms();
+        adapter.time_offset_ms.store(5000, Ordering::Relaxed);
+        let t2 = adapter.now_ms();
+        assert!(t2 >= t1 + 4900, "now_ms with 5000ms offset should reflect clock adjustment");
     }
 }

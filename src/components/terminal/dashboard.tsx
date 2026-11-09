@@ -678,11 +678,49 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
           bodyClassName="p-3"
         >
           {displayedBots.length === 0 ? (
-            <EmptyState
-              icon={Bot}
-              title={botFilter === "open" ? "Açık deal yok" : "Henüz bot yok"}
-              hint={botFilter === "open" ? "Şu anda hiçbir bot açık bir deal yürütmüyor." : "Yeni Bot sihirbazıyla ilk DCA botunuzu başlatın."}
-            />
+            bots.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-slate-700 bg-surface/50 p-6 text-center">
+                <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl border border-emerald-500/30 bg-emerald-500/10 text-emerald-400">
+                  <Bot className="h-6 w-6" />
+                </div>
+                <h3 className="mt-3 text-sm font-bold text-slate-100">DCABOT Terminaline Hoş Geldiniz!</h3>
+                <p className="mx-auto mt-1 max-w-md text-xs text-slate-400">
+                  4096-bit rasyonel aritmetik ve 8 fail-closed risk kapısına sahip kantitatif motorunuz hazır. İlk botunuzu başlatmak için bir yol seçin:
+                </p>
+                <div className="mt-4 grid gap-3 sm:grid-cols-3 text-left">
+                  <button
+                    type="button"
+                    onClick={onNewBot}
+                    className="rounded-lg border border-border bg-base p-3 hover:border-emerald-500/50 hover:bg-emerald-500/5 transition-all text-left"
+                  >
+                    <div className="text-xs font-bold text-emerald-400">1. PAPER Simülasyonu 🚀</div>
+                    <p className="mt-1 text-[11px] text-slate-400">Sıfır riskle sanal bakiye üzerinde DCA veya Grid botu başlatın.</p>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { window.location.search = "?view=settings"; }}
+                    className="rounded-lg border border-border bg-base p-3 hover:border-cyan-500/50 hover:bg-cyan-500/5 transition-all text-left"
+                  >
+                    <div className="text-xs font-bold text-cyan-400">2. Borsa Anahtarı Ekle 🔑</div>
+                    <p className="mt-1 text-[11px] text-slate-400">Bybit veya OKX API anahtarınızı güvenli AES-256 kasasına kaydedin.</p>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { window.location.search = "?view=backtest"; }}
+                    className="rounded-lg border border-border bg-base p-3 hover:border-violet-500/50 hover:bg-violet-500/5 transition-all text-left"
+                  >
+                    <div className="text-xs font-bold text-violet-400">3. Backtest Lab 🧪</div>
+                    <p className="mt-1 text-[11px] text-slate-400">Geçmiş verilerle stratejinizi test edin ve LIVE sertifikası alın.</p>
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <EmptyState
+                icon={Bot}
+                title="Açık deal yok"
+                hint="Şu anda hiçbir bot açık bir deal yürütmüyor."
+              />
+            )
           ) : (
             <div className="thin-scroll max-h-72 space-y-2 overflow-y-auto pr-1">
               {displayedBots.map((b) => (

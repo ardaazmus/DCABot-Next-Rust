@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { isAuthRequired, verifySessionToken, SESSION_COOKIE_NAME } from "@/lib/auth-session";
 
 /**
  * Faz 21 (P0-9): motor proxy'si — proxy katmanı.
@@ -65,6 +66,16 @@ export function proxy(req: NextRequest) {
   // Faz 22 (N-12): CSRF/origin kapısı — cross-origin yazma denemeleri 403.
   if (!originAllowed(req)) {
     return new NextResponse("cross-origin engine write rejected", { status: 403 });
+  }
+  // Faz 0.3 (B-3): UI Auth Guard — DCA_UI_PASSWORD veya DCA_REQUIRE_AUTH aktifse oturumsuz istekler 401.
+  if (isAuthRequired() && pathname !== "/api/engine/api/health") {
+    const token = req.cookies.get(SESSION_COOKIE_NAME)?.value;
+    if (!verifySessionToken(token)) {
+      return new NextResponse(JSON.stringify({ error: "UNAUTHORIZED: Oturum açmanız gerekmektedir" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
   }
   // "/api/engine/api/health" → hedef "/api/health" (önek soyulur).
   const rest = pathname.slice("/api/engine".length) || "/";

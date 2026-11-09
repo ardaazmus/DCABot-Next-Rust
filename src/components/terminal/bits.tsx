@@ -127,13 +127,13 @@ export function ModeBadge({ mode, className }: { mode: string; className?: strin
       className={cn(
         "inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-bold tracking-wider",
         live
-          ? "border-amber-500/50 bg-amber-500/15 text-amber-300"
+          ? "border-rose-500/60 bg-rose-500/20 text-rose-300 shadow-sm shadow-rose-950/40"
           : "border-emerald-500/50 bg-emerald-500/15 text-emerald-300",
         className,
       )}
     >
       <span title={live ? "LIVE — gercek borsa emri (3Commas: Real)" : "PAPER — sanal bakiye, risksiz deneme"}>
-        {live ? "REAL ⚠" : "PAPER"}
+        {live ? "GERÇEK PARA ⚠" : "PAPER"}
       </span>
     </span>
   );

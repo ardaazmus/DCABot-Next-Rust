@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   BadgeCheck,
   Ban,
+  Bell,
   CheckCircle2,
   Copy,
   Cpu,
@@ -114,10 +115,37 @@ export function SettingsView() {
     return info.note;
   })();
   /* P3-1 kara liste */
-  const [bl, setBl] = useState<BlacklistRow[]>([]);  const [blBusy, setBlBusy] = useState(false);
+  const [bl, setBl] = useState<BlacklistRow[]>([]);
+  const [blBusy, setBlBusy] = useState(false);
   const [blError, setBlError] = useState<string | null>(null);
   const [blPair, setBlPair] = useState("");
   const [blReason, setBlReason] = useState("");
+
+  /* Faz 1.3: Bildirim Kanalları Durumu & Testi */
+  const [notifyCfg, setNotifyCfg] = useState<{ telegram_configured: boolean; webhook_configured: boolean; smtp_configured: boolean } | null>(null);
+  const [notifyBusy, setNotifyBusy] = useState(false);
+  useEffect(() => {
+    fetch("/api/engine/api/notifications/config")
+      .then((r) => r.json())
+      .then(setNotifyCfg)
+      .catch(() => setNotifyCfg(null));
+  }, []);
+  const testNotification = async () => {
+    setNotifyBusy(true);
+    try {
+      const res = await fetch("/api/engine/api/notifications/test", { method: "POST" });
+      const data = await res.json();
+      if (data.success) {
+        toast({ title: "Bildirim Gönderildi", description: data.message });
+      } else {
+        toast({ title: "Bildirim Hatası", description: data.error, variant: "destructive" });
+      }
+    } catch {
+      toast({ title: "Hata", description: "Bildirim servisine ulaşılamadı", variant: "destructive" });
+    } finally {
+      setNotifyBusy(false);
+    }
+  };
   const loadBl = useCallback(async () => {
     try {
       const r = await apiBlacklist();
@@ -450,6 +478,65 @@ export function SettingsView() {
                 )}
               </div>
             </div>
+          </div>
+        </Panel>
+
+        {/* Faz 1.3: Bildirim Kanalları & Alert Testi */}
+        <Panel title="Bildirim Kanalları (Alerting & Webhook)" icon={<Bell className="h-4 w-4 text-emerald-400" aria-hidden />}>
+          <p className="text-[11px] leading-relaxed text-slate-400">
+            DCA dolumları (FILL), tasfiye riskleri (LIQUIDATION), kill-switch ve durum değişiklikleri bu kanallara iletilir.
+            Kanallar <span className="font-mono text-slate-300">.env</span> dosyası üzerinden tanımlanır.
+          </p>
+
+          <div className="mt-3 grid gap-3 sm:grid-cols-3">
+            <div className="flex flex-col rounded-lg border border-border bg-base/60 p-3">
+              <div className="text-xs text-slate-400">Telegram Bot</div>
+              <div className="mt-1 flex items-center gap-1.5">
+                <span className={`h-2 w-2 rounded-full ${notifyCfg?.telegram_configured ? "bg-emerald-400" : "bg-slate-500"}`} />
+                <span className="text-xs font-bold text-slate-200">
+                  {notifyCfg?.telegram_configured ? "Aktif / Bağlı" : "Tanımlı Değil"}
+                </span>
+              </div>
+              <div className="mt-1 text-[10px] text-slate-500">TELEGRAM_BOT_TOKEN</div>
+            </div>
+
+            <div className="flex flex-col rounded-lg border border-border bg-base/60 p-3">
+              <div className="text-xs text-slate-400">Giden Webhook</div>
+              <div className="mt-1 flex items-center gap-1.5">
+                <span className={`h-2 w-2 rounded-full ${notifyCfg?.webhook_configured ? "bg-emerald-400" : "bg-slate-500"}`} />
+                <span className="text-xs font-bold text-slate-200">
+                  {notifyCfg?.webhook_configured ? "Aktif / Bağlı" : "Tanımlı Değil"}
+                </span>
+              </div>
+              <div className="mt-1 text-[10px] text-slate-500">NOTIFY_WEBHOOK_URL</div>
+            </div>
+
+            <div className="flex flex-col rounded-lg border border-border bg-base/60 p-3">
+              <div className="text-xs text-slate-400">E-Posta (SMTP)</div>
+              <div className="mt-1 flex items-center gap-1.5">
+                <span className={`h-2 w-2 rounded-full ${notifyCfg?.smtp_configured ? "bg-emerald-400" : "bg-slate-500"}`} />
+                <span className="text-xs font-bold text-slate-200">
+                  {notifyCfg?.smtp_configured ? "Aktif / Bağlı" : "Tanımlı Değil"}
+                </span>
+              </div>
+              <div className="mt-1 text-[10px] text-slate-500">NOTIFY_SMTP_HOST</div>
+            </div>
+          </div>
+
+          <div className="mt-4 flex items-center justify-between border-t border-border pt-3">
+            <span className="text-xs text-slate-400">
+              Kanallara test olayı gönderip entegrasyonu doğrulayın:
+            </span>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={testNotification}
+              disabled={notifyBusy}
+              className="border-border hover:bg-slate-800"
+            >
+              {notifyBusy ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : <Bell className="mr-2 h-3.5 w-3.5 text-emerald-400" />}
+              Test Bildirimi Gönder
+            </Button>
           </div>
         </Panel>
         {/* Faz 25 (UIX-23): YZ sağlayıcı yapılandırması tek yer — Kokpit TR özeti,

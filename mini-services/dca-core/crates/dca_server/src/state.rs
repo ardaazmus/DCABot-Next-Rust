@@ -357,6 +357,8 @@ pub struct AppState {
     /// başında konur, sonunda kalkar; `persist_event` varsa iliştirir.
     /// Tick-dışı yazımlar (webhook/aksiyon) NULL kalır — hizası dürüsttür.
     pub tick_trace: Mutex<HashMap<String, String>>,
+    /// Faz 1.6 (B-8): sembol+interval bazlı paylaşımlı kline önbelleği — rate limit ve 429 koruması
+    pub kline_cache: std::sync::Mutex<HashMap<String, (i64, Vec<dca_exchange::Kline>)>>,
 }
 
 impl AppState {
@@ -399,8 +401,27 @@ impl AppState {
             portfolio_cache: std::sync::Mutex::new(None),
             webhook_seen: Mutex::new(HashMap::new()),
             tick_trace: Mutex::new(HashMap::new()),
+            kline_cache: std::sync::Mutex::new(HashMap::new()),
         });
         (state, rx)
+    }
+
+    /// Faz 1.6 (B-8): kline önbelleği okuma (TTL kontrolü ile)
+    pub fn get_cached_klines(&self, key: &str, max_age_ms: i64) -> Option<Vec<dca_exchange::Kline>> {
+        let cache = self.kline_cache.lock().ok()?;
+        if let Some((ts, klines)) = cache.get(key) {
+            if now_ms() - *ts < max_age_ms {
+                return Some(klines.clone());
+            }
+        }
+        None
+    }
+
+    /// Faz 1.6 (B-8): kline önbelleği yazma
+    pub fn set_cached_klines(&self, key: String, klines: Vec<dca_exchange::Kline>) {
+        if let Ok(mut cache) = self.kline_cache.lock() {
+            cache.insert(key, (now_ms(), klines));
+        }
     }
 
     /// Faz 5: venue BYBIT VE ucu demo/testnet ise adaptörü ver (otomatik

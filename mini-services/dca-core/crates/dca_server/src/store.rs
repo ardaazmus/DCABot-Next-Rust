@@ -17,6 +17,8 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL").map_err(|e| e.to_string())?;
         conn.pragma_update(None, "synchronous", "NORMAL").map_err(|e| e.to_string())?;
         conn.pragma_update(None, "foreign_keys", "ON").map_err(|e| e.to_string())?;
+        // Faz 0.9 (B-7): busy_timeout PRAGMA — eşzamanlı okuma/yazma kilitlerinde SQLITE_BUSY önlenir
+        conn.pragma_update(None, "busy_timeout", "5000").map_err(|e| e.to_string())?;
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS bots (

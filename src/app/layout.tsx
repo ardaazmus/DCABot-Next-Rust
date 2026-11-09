@@ -1,18 +1,42 @@
 import type { Metadata } from "next";
-import { Inter, JetBrains_Mono } from "next/font/google";
+import localFont from "next/font/local";
 import "./globals.css";
 import { Toaster } from "@/components/ui/toaster";
 
-const inter = Inter({
+const inter = localFont({
+  src: [
+    {
+      path: "./fonts/Inter-latin.woff2",
+      weight: "100 900",
+      style: "normal",
+    },
+    {
+      path: "./fonts/Inter-latin-ext.woff2",
+      weight: "100 900",
+      style: "normal",
+    },
+  ],
   variable: "--font-inter",
-  subsets: ["latin", "latin-ext"],
   display: "swap",
+  fallback: ["Inter", "-apple-system", "BlinkMacSystemFont", "Segoe UI", "Roboto", "sans-serif"],
 });
 
-const jetbrainsMono = JetBrains_Mono({
+const jetbrainsMono = localFont({
+  src: [
+    {
+      path: "./fonts/JetBrainsMono-latin.woff2",
+      weight: "100 800",
+      style: "normal",
+    },
+    {
+      path: "./fonts/JetBrainsMono-latin-ext.woff2",
+      weight: "100 800",
+      style: "normal",
+    },
+  ],
   variable: "--font-jetbrains-mono",
-  subsets: ["latin", "latin-ext"],
   display: "swap",
+  fallback: ["JetBrains Mono", "Consolas", "Courier New", "monospace"],
 });
 
 export const metadata: Metadata = {

@@ -1528,6 +1528,15 @@ async fn persist_fill(app: &AppState, bot_id: &str, f: &FillRecord) -> Result<bo
         ],
     )
     .map_err(|e| e.to_string())?;
+
+    // Faz 0.9 (B-4): fills tablosu retention — her 64 dolum yazımında son 50.000 kayıt tutulur, disk dolması engellenir
+    static FILL_WRITE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if FILL_WRITE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 64 == 0 {
+        let _ = conn.execute(
+            "DELETE FROM fills WHERE id < (SELECT MIN(id) FROM (SELECT id FROM fills ORDER BY id DESC LIMIT 50000))",
+            [],
+        );
+    }
     Ok(res > 0)
 }
 

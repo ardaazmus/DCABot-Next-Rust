@@ -1,0 +1,39 @@
+version: "3.8"
+
+services:
+  dcabot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dcabot:latest
+    container_name: dcabot-terminal
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - DCA_DB_PATH=/app/data/dcabot.sqlite3
+      - DCA_BYBIT_TESTNET=1
+      - DCA_ALLOW_MAINNET=0
+      - DCA_API_KEY=${DCA_API_KEY:-dcabot_secret_key_change_me}
+      - ENGINE_API_KEY=${DCA_API_KEY:-dcabot_secret_key_change_me}
+      - DCA_VAULT_KEY=${DCA_VAULT_KEY:-dcabot_vault_master_key_32_chars_long!}
+      - DCA_UI_PASSWORD=${DCA_UI_PASSWORD:-}
+      - DCA_REQUIRE_AUTH=${DCA_REQUIRE_AUTH:-0}
+      - DCA_PORTFOLIO_MAX_NOTIONAL_PCT=85
+      - DCA_PORTFOLIO_MAX_DAILY_LOSS_PCT=10
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - NOTIFY_WEBHOOK_URL=${NOTIFY_WEBHOOK_URL:-}
+    volumes:
+      - dcabot-data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:3000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  dcabot-data:
+    driver: local

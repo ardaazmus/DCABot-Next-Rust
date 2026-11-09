@@ -182,7 +182,9 @@ async fn main() {
     let api_key_clone = api_key.clone();
 
     // SEC-01: /api/health kimlik doğrulaması iSTEMEN (load balancer / monitoring açık erişim).
-    let health_routes = Router::new().route("/api/health", get(health));
+    let health_routes = Router::new()
+        .route("/api/health", get(health))
+        .route("/metrics", get(prometheus_metrics));
     // P0-8: TradingView webhook'u auth middleware DIŞINDA — TradingView alert'i
     // Bearer başlığı ekleyemez. Uç kendi savunma katmanlarıyla korunur:
     // sabit-zamanlı per-bot secret + ±60sn replay penceresi + DUPLICATE dedup
@@ -197,6 +199,8 @@ async fn main() {
         .route("/api/equity", get(equity_curve))
         .route("/api/deals", get(deals::list_deals))
         .route("/api/daily-pnl", get(deals::daily_pnl))
+        .route("/api/notifications/config", get(notifications_config))
+        .route("/api/notifications/test", post(notifications_test))
         .route("/api/bots", get(list_bots).post(create_bot))
         .route("/api/bots/:id", get(get_bot).patch(patch_bot).delete(delete_bot))
         .route("/api/bots/:id/actions", post(bot_actions))
@@ -327,12 +331,15 @@ async fn main() {
                 .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::PATCH, axum::http::Method::DELETE])
                 .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::AUTHORIZATION]),
         )
-        .with_state(app_state);
+        .with_state(app_state.clone());
 
-    // SEC-01: varsayılan localhost bind — 0.0.0.0 tüm arayüzleri açar.
+    let shutdown_state = app_state.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3002").await.expect("bind 3002");
     tracing::info!("dca-core engine listening on :3002");
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_state))
+        .await
+        .unwrap();
 }
 
 /// Faz 7: hazır strateji kütüphanesi — sektör-standart klasikler (bütün metin
@@ -371,6 +378,128 @@ async fn seed_pine_library(app: &Arc<AppState>) {
     }
 }
 
+/// Faz 0.9 (B-4): SIGINT / SIGTERM graceful shutdown — bağlantıları durdurur, WAL checkpoint (TRUNCATE) yapar
+async fn shutdown_signal(app_state: Arc<AppState>) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => { s.recv().await; }
+            Err(_) => { std::future::pending::<()>().await; }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    tracing::info!("[shutdown] Graceful shutdown tetiklendi: SQLite WAL checkpoint yapılıyor...");
+    if let Ok(conn) = app_state.db.conn.lock() {
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+    tracing::info!("[shutdown] WAL checkpoint tamamlandı. Motor güvenle kapatılıyor.");
+}
+
+/// Faz 0.6 (B-4): Prometheus metrik ucu (/metrics)
+async fn prometheus_metrics(State(app): State<Arc<AppState>>) -> impl IntoResponse {
+    let started = app.started_at;
+    let now = state::now_ms();
+    let uptime_sec = (now - started).max(0) / 1000;
+    let last_tick = app.last_tick_at.lock().map(|g| *g).unwrap_or(0);
+    let tick_age_sec = if last_tick > 0 { (now - last_tick).max(0) / 1000 } else { 0 };
+
+    let (bot_count, running_count, stopped_count, active_deals) = {
+        let runtimes = app.runtimes.lock().await;
+        let mut running = 0;
+        let mut stopped = 0;
+        let mut deals = 0;
+        for (_, rt) in runtimes.iter() {
+            if rt.status == "RUNNING" { running += 1; } else { stopped += 1; }
+            if !rt.stepper.position.qty.is_zero() || !rt.live_open_orders.is_empty() { deals += 1; }
+        }
+        (runtimes.len(), running, stopped, deals)
+    };
+
+    let sse_subs = app.sse.receiver_count();
+
+    let db_size = std::env::var("DCA_DB_PATH")
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+        .unwrap_or(0);
+
+    let body = format!(
+        "# HELP dcabot_uptime_seconds Engine uptime in seconds\n\
+# TYPE dcabot_uptime_seconds counter\n\
+dcabot_uptime_seconds {uptime_sec}\n\
+# HELP dcabot_bots_total Total number of configured bots\n\
+# TYPE dcabot_bots_total gauge\n\
+dcabot_bots_total {bot_count}\n\
+dcabot_bots_status{{status=\"RUNNING\"}} {running_count}\n\
+dcabot_bots_status{{status=\"STOPPED\"}} {stopped_count}\n\
+# HELP dcabot_active_deals Active trading deals\n\
+# TYPE dcabot_active_deals gauge\n\
+dcabot_active_deals {active_deals}\n\
+# HELP dcabot_sse_subscribers Active SSE clients\n\
+# TYPE dcabot_sse_subscribers gauge\n\
+dcabot_sse_subscribers {sse_subs}\n\
+# HELP dcabot_tick_last_timestamp_ms Last supervisor tick timestamp in ms\n\
+# TYPE dcabot_tick_last_timestamp_ms gauge\n\
+dcabot_tick_last_timestamp_ms {last_tick}\n\
+# HELP dcabot_tick_age_seconds Time elapsed since last engine tick in seconds\n\
+# TYPE dcabot_tick_age_seconds gauge\n\
+dcabot_tick_age_seconds {tick_age_sec}\n\
+# HELP dcabot_db_size_bytes SQLite database file size in bytes\n\
+# TYPE dcabot_db_size_bytes gauge\n\
+dcabot_db_size_bytes {db_size}\n"
+    );
+
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
+}
+
+/// Faz 1.3: Bildirim konfigürasyon durumu sorgulama
+async fn notifications_config() -> Json<Value> {
+    let cfg = notify_cfg();
+    Json(json!({
+        "telegram_configured": cfg.as_ref().map(|c| c.telegram.is_some()).unwrap_or(false),
+        "webhook_configured": cfg.as_ref().map(|c| c.webhook.is_some()).unwrap_or(false),
+        "smtp_configured": cfg.as_ref().map(|c| c.smtp.is_some()).unwrap_or(false),
+    }))
+}
+
+/// Faz 1.3: Bildirim test tetikleme
+async fn notifications_test(State(app): State<Arc<AppState>>) -> Json<Value> {
+    let cfg = notify_cfg();
+    if cfg.is_none() {
+        return Json(json!({
+            "success": false,
+            "error": "Hiçbir bildirim kanalı (Telegram, Webhook, SMTP) yapılandırılmamış. .env dosyasını kontrol edin."
+        }));
+    }
+    let _ = app.sse.send(SseEvent {
+        event: "TEST".into(),
+        data: json!({
+            "message": "DCABOT Terminal Bildirim Testi — Sistem başarıyla bağlandı.",
+            "ts": state::now_ms()
+        }).to_string(),
+    });
+    Json(json!({
+        "success": true,
+        "message": "Test bildirimi tüm aktif kanallara iletildi."
+    }))
+}
+
 /// Faz 8: Telegram bildirim kanalı — TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
 /// ikisi de set edildiyse SSE olay akışına abone olur; FILL/LIQUIDATION/RISK/
 /// WEBHOOK_START/KILL_SWITCH/FREEZE/BOT_STATE olaylarını Bot API'ye iletir.
@@ -380,7 +509,7 @@ async fn seed_pine_library(app: &Arc<AppState>) {
 ///   • Outgoing webhook : NOTIFY_WEBHOOK_URL  ({event, data, ts} JSON POST)
 ///   • E-posta (SMTP)   : NOTIFY_SMTP_HOST + NOTIFY_SMTP_TO (+USER/PASS/FROM)
 /// Hiçbiri set değilse abone olunmaz — tamamen opsiyonel.
-const NOTIFY_EVENTS: &[&str] = &["FILL", "LIQUIDATION", "RISK", "WEBHOOK_START", "KILL_SWITCH", "FREEZE", "BOT_STATE"];
+const NOTIFY_EVENTS: &[&str] = &["FILL", "LIQUIDATION", "RISK", "WEBHOOK_START", "KILL_SWITCH", "FREEZE", "BOT_STATE", "TEST"];
 
 struct NotifyCfg {
     telegram: Option<(String, String)>,
@@ -1538,6 +1667,12 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
     // a LIVE bot requires an active vault key for the venue.
     let mut credentials: Option<VenueCreds> = None;
     if mode == "LIVE" {
+        // Faz 0.5 (B-6): LIVE Mainnet Gate — DCA_ALLOW_MAINNET=1 olmadan gerçek emir oluşturulamaz
+        let is_testnet_env = std::env::var("DCA_BYBIT_TESTNET").as_deref() == Ok("1");
+        let allow_mainnet = std::env::var("DCA_ALLOW_MAINNET").as_deref() == Ok("1");
+        if !is_testnet_env && !allow_mainnet {
+            return Err(err422("LIVE_MAINNET_LOCKED: Gerçek ana ağda (Mainnet) LIVE bot başlatmak için DCA_ALLOW_MAINNET=1 ortam değişkeni zorunludur (B-6 fail-closed kapısı). Testnet için DCA_BYBIT_TESTNET=1 kullanın."));
+        }
         // Faz 13B: HEDGE LIVE kilidi KALDIRILDI — bacak-başına stepper (EX-06
         // çözümü) + positionIdx eşlemesi (Faz 4.5/5) tam; Demo kabulü sonrası canlı.
         // Hesap hedge-moddaysa POS_MODE denetimi emirleri positionIdx ile eşler.
@@ -2652,7 +2787,15 @@ async fn klines(State(app): State<Arc<AppState>>, Query(q): Query<KlinesQuery>) 
         Err(e) => return Json(json!({"error": e, "bars": []})),
     };
     let limit = q.limit.unwrap_or(200).min(1000);
-    let kl = match q.venue.as_deref().unwrap_or("BYBIT") {
+    let venue = q.venue.as_deref().unwrap_or("BYBIT");
+    let cache_key = format!("{venue}:{category}:{}:{iv}:{limit}", q.symbol);
+
+    // Faz 1.6 (B-8): 10 saniyelik paylaşımlı kline önbelleği — mükerrer istekleri ve 429 ban riskini önler
+    if let Some(cached) = app.get_cached_klines(&cache_key, 10_000) {
+        return Json(json!({"bars": cached, "cached": true}));
+    }
+
+    let kl = match venue {
         "BINANCE" => app.binance.klines(&category, &q.symbol, &iv, limit).await,
         "OKX" => match dca_exchange::okx::okx_bar(&iv) {
             Ok(oiv) => app.okx.klines(&category, &q.symbol, oiv, limit).await,
@@ -2661,7 +2804,10 @@ async fn klines(State(app): State<Arc<AppState>>, Query(q): Query<KlinesQuery>) 
         _ => app.bybit.klines(&category, &q.symbol, &iv, limit).await,
     };
     match kl {
-        Ok(bars) => Json(json!({"bars": bars})),
+        Ok(bars) => {
+            app.set_cached_klines(cache_key, bars.clone());
+            Json(json!({"bars": bars, "cached": false}))
+        }
         Err(e) => Json(json!({"error": e, "bars": []})),
     }
 }

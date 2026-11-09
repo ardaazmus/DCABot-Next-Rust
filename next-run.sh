@@ -1,3 +1,6 @@
 #!/bin/bash
-cd /home/z/my-project
-exec /usr/local/bin/bun run dev
+# Portable Next.js dev runner
+set -e
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT_DIR"
+exec npm run dev

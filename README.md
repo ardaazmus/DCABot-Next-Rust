@@ -94,34 +94,50 @@ Dikkat: `deviation_pct` KESİR olarak yazılır (`0.005` = %0,5); `start_cash` p
 ## 2. Dizin Yapısı
 
 ```
-/home/z/my-project
-├── src/app/page.tsx                 # Terminal UI (tek route — client-side view switching)
-├── src/components/terminal/         # Kokpit, Fleet, Studio (7 sekme), Wizard (5 adım),
-│                                    # Hesaplayıcı, Backtest Lab, Ayarlar, grafikler
-├── src/hooks/use-engine.ts          # engineFetch (XTransformPort), SSE store, polling hooks
+.
+├── src/app/                         # Next.js App Router (Self-hosted offline fontlar, error/loading sınırları)
+├── src/components/terminal/         # Kokpit, Filo, Stüdyo, Yeni Bot, Hesaplayıcı, Backtest Lab, Ayarlar
+├── src/hooks/use-engine.ts          # engineFetch (/api/engine/* proxy), SSE store, polling hooks
 ├── src/lib/engine-types.ts          # Rust motor wire tipleri (exact decimal strings)
 ├── src/lib/format.ts                # fmtFrac / fmtUsd / fmtTs — half-even display yardımcıları
-├── docs/BYBIT_RESEARCH.md           # Bybit v5 derin araştırma (canlı doğrulanmış, 731 satır)
-├── db/dca-core.sqlite3              # SQLite WAL (bots, fills, events, deals, vault_keys…)
-└── mini-services/dca-core/          # RUST ÇEKİRDEK (Cargo workspace, 6 crate)
+├── Dockerfile                       # Multi-stage üretim Docker imajı (Rust + Node standalone)
+├── docker-compose.yml               # Tek komutla orkestrasyon ve SQLite kalıcı veri hacmi
+├── scripts/                         # Standalone postbuild, backup, yerel yönetim scriptleri
+├── docs/BYBIT_RESEARCH.md           # Bybit v5 derin araştırma (canlı doğrulanmış)
+└── mini-services/dca-core/          # RUST KANTİTATİF MOTOR (Cargo workspace, 8 crate, 296 birim test)
     ├── crates/dca_math/             # M01–M21: Fraction 4096-bit + tüm normatif formüller
     ├── crates/dca_kernel/           # Bar, OrderIntent, SimulationStepper (tek olay çekirdeği)
-    ├── crates/dca_risk/             # 8 Fail-Closed Gate saf fonksiyonları
-    ├── crates/dca_strategy/         # DCA/Grid/Infinity/Hedge motorları + backtest runner
-    ├── crates/dca_exchange/         # Bybit v5 (öncelik), Binance, Paper venue
-    └── crates/dca_server/           # axum REST+SSE :3002, SQLite WAL, vault, bot supervisor
+    ├── crates/dca_risk/             # 8 Fail-Closed Gate saf fonksiyonları + portfolio daily loss cap
+    ├── crates/dca_strategy/         # DCA/Grid/Infinity/Hedge motorları + backtest & LIVE certify gate
+    ├── crates/dca_exchange/         # Bybit v5 (fail-closed mainnet gate), Binance, OKX, Paper venue
+    ├── crates/dca_signals/          # İndikatör motoru (RSI/MACD/BB/ATR/ADX/Supertrend) + sinyal ağacı
+    ├── crates/dca_pine/             # Pine Script v5 yorumlayıcı ve AST derleyici
+    └── crates/dca_server/           # axum REST+SSE :3002, SQLite WAL (busy_timeout), vault, /metrics
 ```
 
-## 3. Rust Çekirdek — Çalıştırma
+## 3. Çalıştırma Seçenekleri
+
+### A. Docker ile Tek Komutta (Önerilen Üretim Dağıtımı)
 
 ```bash
-cd mini-services/dca-core
-bun run dev        # release binary yoksa derler, sonra :3002'de servis eder
-bun run test       # cargo test --workspace (60 test)
-bun run build      # cargo build --release
+docker compose up -d
+```
+Arayüz `http://localhost:3000`, motor `http://localhost:3002/api/health` ve Prometheus metrikleri `http://localhost:3002/metrics` adresinde anında aktif olur.
+
+### B. Yerel Geliştirme (Windows / Linux / macOS)
+
+```bash
+# Motor testlerini çalıştır (296 test)
+cargo test --manifest-path mini-services/dca-core/Cargo.toml
+
+# Motoru başlat (Port 3002)
+cargo run --manifest-path mini-services/dca-core/Cargo.toml --bin dca_server
+
+# Arayüzü başlat (Port 3000)
+npm run dev
 ```
 
-Port sabit: **3002**. Next.js gateway üzerinden erişim: `/api/<yol>?XTransformPort=3002`.
+Port sabit: **3002** (Motor) ve **3000** (Next.js UI). UI tüm motor çağrılarını sunucu tarafında `/api/engine/*` proxy'si üzerinden yetkilendirerek iletir.
 
 ## 4. Matematiksel Çekirdek (M01–M21)
 
@@ -142,7 +158,7 @@ Port sabit: **3002**. Next.js gateway üzerinden erişim: `/api/<yol>?XTransform
 | M20 | SL–merdiven çakışma dedektörü: `SL_trig(A_k) ≥ P_{k+1}` ulaşılır | 2 |
 | M21 | NYSE tatil takvimi (Meeus/Jones/Butcher Paskalya), EDT/EST, 23:00–22:00 UTC emtia, borç faizi N·r/360 | 5 |
 
-**Toplam: 60 test — hepsi yeşil.** Float tipi yalnızca raporlama sınırında (Sharpe display) kullanılır.
+**Toplam: 296 birim test (8 crate) — hepsi yeşil.** Float tipi yalnızca raporlama sınırında (Sharpe display) kullanılır.
 
 ## 5. 8 Fail-Closed Risk Kapısı
 

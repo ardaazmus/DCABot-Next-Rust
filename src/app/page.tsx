@@ -19,6 +19,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Drawer, DrawerContent, DrawerHeader, DrawerTitle } from "@/components/ui/drawer";
 import { KillButton } from "@/components/terminal/killswitch";
+import { AuthDialog } from "@/components/terminal/auth-dialog";
 import {
   BacktestLazy,
   CalculatorLazy,
@@ -91,8 +92,20 @@ function DataFreshness({ lastUpdatedAt, offline }: { lastUpdatedAt: number | nul
 }
 
 export default function Page() {
-  const [view, setView] = useState<View>("dashboard");
-  const [botId, setBotId] = useState<string | null>(null);
+  const [view, setView] = useState<View>(() => {
+    if (typeof window === "undefined") return "dashboard";
+    const p = new URLSearchParams(window.location.search);
+    const v = p.get("view") as View | null;
+    return v && ["dashboard", "fleet", "studio", "wizard", "calc", "backtest", "knowledge", "settings"].includes(v)
+      ? v
+      : "dashboard";
+  });
+  const [botId, setBotId] = useState<string | null>(() => {
+    if (typeof window === "undefined") return null;
+    const p = new URLSearchParams(window.location.search);
+    return p.get("botId");
+  });
+  const [authLocked, setAuthLocked] = useState(false);
   /* P1 + P6 */
   const [moreOpen, setMoreOpen] = useState(false);
   const reduceMotion = useReducedMotion();
@@ -101,14 +114,55 @@ export default function Page() {
 
   const online = health?.status === "ok";
 
+  // Faz 0.3 (B-3): Oturum / Kimlik doğrulama kontrolü
+  useEffect(() => {
+    fetch("/api/auth/check")
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.authRequired && !d.authenticated) {
+          setAuthLocked(true);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // Faz 1.1 (P1): URL Senkronizasyonu & Tarayıcı Geri/İleri (popstate) Desteği
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const onPopState = () => {
+      const p = new URLSearchParams(window.location.search);
+      const pv = (p.get("view") as View) || "dashboard";
+      const pb = p.get("botId");
+      setView(pv);
+      setBotId(pv === "studio" ? pb : null);
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  const syncUrl = (v: View, id: string | null) => {
+    if (typeof window === "undefined") return;
+    const params = new URLSearchParams();
+    if (v !== "dashboard") params.set("view", v);
+    if (v === "studio" && id) params.set("botId", id);
+    const qs = params.toString();
+    const newUrl = qs ? `?${qs}` : window.location.pathname;
+    if (window.location.search !== (qs ? `?${qs}` : "")) {
+      window.history.pushState(null, "", newUrl);
+    }
+  };
+
   const openStudio = (id: string) => {
     setBotId(id);
     setView("studio");
+    syncUrl("studio", id);
   };
   const go = (v: View) => {
     if (v !== "studio") setBotId(null);
     setMoreOpen(false);
     setView(v);
+    syncUrl(v, null);
   };
 
   const navActive = (id: View): boolean => (id === "fleet" && view === "studio") || view === id;
@@ -340,6 +394,15 @@ export default function Page() {
           </div>
         </DrawerContent>
       </Drawer>
+
+      {authLocked && (
+        <AuthDialog
+          onAuthenticated={() => {
+            setAuthLocked(false);
+            refetch();
+          }}
+        />
+      )}
     </div>
   );
 }

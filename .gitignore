@@ -64,3 +64,4 @@ __pycache__/
 *.pyc
 3100
 .zcode/
+backups/

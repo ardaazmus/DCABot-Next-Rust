@@ -6,8 +6,9 @@
     "local:start": "powershell -NoProfile -File scripts/start-local.ps1",
     "local:stop": "powershell -NoProfile -File scripts/stop-local.ps1",
     "dev": "next dev -p 3000 --webpack 2>&1 | tee dev.log",
-    "build": "next build && cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/",
-    "start": "NODE_ENV=production bun .next/standalone/server.js 2>&1 | tee server.log",
+    "build": "next build && node scripts/postbuild-standalone.mjs",
+    "start": "node .next/standalone/server.js",
+    "test": "node --test tests/engine_contract.mjs",
     "lint": "eslint .",
     "restart:engine": "powershell -NoProfile -File scripts/restart-engine.ps1",
     "restart:ui": "powershell -NoProfile -File scripts/restart-ui.ps1"
