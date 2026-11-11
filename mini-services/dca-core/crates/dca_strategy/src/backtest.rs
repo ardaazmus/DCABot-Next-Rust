@@ -56,8 +56,6 @@ pub fn bars_to_signal(bars: &[Bar]) -> Vec<BarData> {
         .collect()
 }
 
-/// Aggregate a series into `bucket_ms` bars (UTC-aligned epoch buckets).
-/// Zero look-ahead: output bar i only contains source bars within its bucket.
 pub fn resample(bars: &[BarData], bucket_ms: i64) -> Vec<BarData> {
     let mut out: Vec<BarData> = Vec::new();
     for b in bars {
@@ -615,7 +613,14 @@ pub fn run_backtest(
             stepper.log_advisory_pub(bar.t, "PINE", "PINE_EXIT", detail);
         }
 
-        let eq = stepper.equity(&c).map_err(|e| e.to_string())?;
+        let mut eq = stepper.equity(&c).map_err(|e| e.to_string())?;
+        // Arena 1.5 Düzeltmesi: Hedge bacağının equity'si tam start_cash içerir.
+        // İki bacağın start_cash'i toplanmaz; hedge bacağının net PnL katkısı (equity - start_cash) eklenir.
+        if let Some(hs) = hedge_stepper.as_ref() {
+            let he = hs.equity(&c).map_err(|e| e.to_string())?;
+            let hpnl = he.sub(&hs.start_cash).map_err(|e| e.to_string())?;
+            eq = eq.add(&hpnl).map_err(|e| e.to_string())?;
+        }
         start_equity.get_or_insert_with(|| eq.clone());
         update_drawdown(&mut dd_state, &eq).map_err(|e| e.to_string())?;
         equity_curve.push(EquityPoint { ts: bar.t, equity: eq.to_string() });

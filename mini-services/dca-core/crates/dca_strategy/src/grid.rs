@@ -86,6 +86,11 @@ impl GridEngine {
             .into_iter()
             .map(|p| dca_math::m02::tick_down(&p, &inst.tick_size).unwrap_or(p))
             .collect();
+        for w in mesh.windows(2) {
+            if w[1] <= w[0] {
+                return Err("grid bounds or tick size invalid: two adjacent levels collapse to the same price tick".into());
+            }
+        }
         // M15 fee breaker — Task 16 (spec 2.2) + Faz 21 (N-10/P1-18): kontrol
         // ARTIK gerçek mesh üzerinden — EN DAR segment + asimetrik gerçek
         // ücretler (maker-in / taker-out). Eski kod ortalamayı

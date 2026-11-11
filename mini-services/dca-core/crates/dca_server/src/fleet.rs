@@ -432,7 +432,7 @@ pub async fn fleet_overview(State(app): State<Arc<AppState>>) -> Json<Value> {
 /// NAV: bots.start_cash toplamı (db kilidi ayrı ve kısa — çakışmaz).
 /// Gross: snapshot'lardan qty × son-bar-kapanışı (mark yoksa deal sayılmaz).
 pub fn refresh_portfolio_cache(app: &crate::state::AppState, rts: &HashMap<String, crate::state::BotRuntime>) {
-    let nav = (|| -> Option<Fraction> {
+    let db_nav = (|| -> Option<Fraction> {
         let conn = app.db.conn.lock().ok()?;
         let mut stmt = conn.prepare("SELECT start_cash FROM bots").ok()?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0)).ok()?;
@@ -445,25 +445,93 @@ pub fn refresh_portfolio_cache(app: &crate::state::AppState, rts: &HashMap<Strin
     })()
     .unwrap_or_else(Fraction::zero);
 
+    let mut runtime_equity_sum = Fraction::zero();
+    let mut has_runtime_bots = false;
     let mut gross = Fraction::zero();
+
     for rt in rts.values() {
         if rt.status != "RUNNING" && rt.status != "FROZEN" && rt.status != "PAUSED" {
             continue;
         }
-        let snap = rt.engine_kind.snapshot();
-        if snap.deal_id.is_none() {
-            continue;
+        has_runtime_bots = true;
+        // 3. Mark price
+        let mark = rt
+            .stepper
+            .last_close
+            .as_deref()
+            .and_then(|s| Fraction::from_any_str(s).ok());
+
+        // 1. Account for main leg equity
+        let main_eq = mark.as_ref().and_then(|m| rt.stepper.equity(m).ok()).unwrap_or_else(|| rt.stepper.cash.clone());
+        runtime_equity_sum = runtime_equity_sum.add(&main_eq).unwrap_or_else(|_| runtime_equity_sum.clone());
+
+        // 2. Account for hedge leg equity (delta above start_cash to prevent 2x capital double-count)
+        if let (Some(hs), Some(m)) = (rt.hedge_stepper.as_ref(), mark.as_ref()) {
+            if let Ok(he) = hs.equity(m) {
+                let hedge_delta = he.sub(&hs.start_cash).unwrap_or_else(|_| Fraction::zero());
+                runtime_equity_sum = runtime_equity_sum.add(&hedge_delta).unwrap_or_else(|_| runtime_equity_sum.clone());
+            }
         }
-        if let Some(mark_s) = rt.stepper.last_close.as_deref() {
-            if let Ok(mark) = Fraction::from_any_str(mark_s) {
-                let qty = parse_frac(&snap.position_qty);
-                let notional = qty.mul(&mark).unwrap_or_else(|_| Fraction::zero());
+
+        // 4. Main position gross notional
+        if let Some(ref m) = mark {
+            if !rt.stepper.position.qty.is_zero() {
+                let notional = rt.stepper.position.qty.mul(m).unwrap_or_else(|_| Fraction::zero());
                 gross = gross.add(&notional).unwrap_or_else(|_| gross.clone());
             }
         }
+
+        // 5. Hedge position gross notional
+        if let Some(hs) = &rt.hedge_stepper {
+            if !hs.position.qty.is_zero() {
+                let h_mark = hs.last_close.as_deref().and_then(|s| Fraction::from_any_str(s).ok()).or_else(|| mark.clone());
+                if let Some(hm) = h_mark {
+                    let h_notional = hs.position.qty.mul(&hm).unwrap_or_else(|_| Fraction::zero());
+                    gross = gross.add(&h_notional).unwrap_or_else(|_| gross.clone());
+                }
+            }
+        }
+
+        // 6. Pending limit order reserves (Add orders)
+        for p in &rt.stepper.pending {
+            if p.kind == dca_kernel::OrderKind::Add {
+                if let Some(pp) = &p.price {
+                    let res_notional = p.qty.mul(pp).unwrap_or_else(|_| Fraction::zero());
+                    gross = gross.add(&res_notional).unwrap_or_else(|_| gross.clone());
+                }
+            }
+        }
+        if let Some(hs) = &rt.hedge_stepper {
+            for p in &hs.pending {
+                if p.kind == dca_kernel::OrderKind::Add {
+                    if let Some(pp) = &p.price {
+                        let res_notional = p.qty.mul(pp).unwrap_or_else(|_| Fraction::zero());
+                        gross = gross.add(&res_notional).unwrap_or_else(|_| gross.clone());
+                    }
+                }
+            }
+        }
     }
+
+    let nav = if has_runtime_bots && runtime_equity_sum.is_positive() {
+        runtime_equity_sum
+    } else {
+        db_nav
+    };
+
     if let Ok(mut slot) = app.portfolio_cache.lock() {
         *slot = Some((crate::state::now_ms(), nav, gross));
+    }
+}
+
+/// Atomically increase gross notional in portfolio cache when an Add order passes the cap check
+pub fn portfolio_cache_add_candidate(app: &crate::state::AppState, candidate: &Fraction) {
+    if let Ok(mut slot) = app.portfolio_cache.lock() {
+        if let Some((_ts, _nav, gross)) = slot.as_mut() {
+            if let Ok(new_gross) = gross.add(candidate) {
+                *gross = new_gross;
+            }
+        }
     }
 }
 

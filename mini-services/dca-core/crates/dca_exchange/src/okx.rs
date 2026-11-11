@@ -31,10 +31,22 @@ pub const REQUIRED_POS_MODE: &str = "long_short_mode";
 pub struct OkxAdapter {
     pub base_url: String,
     pub http: reqwest::Client,
+    pub is_demo: bool,
 }
 
 impl OkxAdapter {
     pub fn new() -> Self {
+        let is_demo = std::env::var("DCA_OKX_DEMO").as_deref() == Ok("1")
+            || std::env::var("DCA_OKX_TESTNET").as_deref() == Ok("1");
+
+        // Faz 0.5 (B-6): MAINNET fail-closed kapısı — demo değilse ve DCA_ALLOW_MAINNET=1 yoksa engelle
+        let is_test_runner = std::env::current_exe()
+            .map(|p| p.to_string_lossy().contains("deps"))
+            .unwrap_or(false);
+        if !is_demo && !is_test_runner && std::env::var("DCA_ALLOW_MAINNET").as_deref() != Ok("1") {
+            panic!("CRITICAL SAFETY VIOLATION: Attempted OKX MAINNET connection without DCA_ALLOW_MAINNET=1! Set DCA_OKX_DEMO=1 for demo or explicitly set DCA_ALLOW_MAINNET=1.");
+        }
+
         let base_url = std::env::var("OKX_BASE_URL")
             .or_else(|_| std::env::var("DCA_OKX_BASE_URL"))
             .unwrap_or_else(|_| MAINNET.into());
@@ -44,6 +56,7 @@ impl OkxAdapter {
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .expect("reqwest"),
+            is_demo,
         }
     }
 
@@ -72,11 +85,14 @@ impl OkxAdapter {
         let prehash = format!("{ts}{method}{request_path}{body}");
         let sign = sign_base64(&creds.secret, &prehash);
         let url = format!("{}{}", self.base_url, request_path);
-        let req = if method == "POST" {
+        let mut req = if method == "POST" {
             self.http.post(&url).body(body.to_string())
         } else {
             self.http.get(&url)
         };
+        if self.is_demo {
+            req = req.header("x-simulated-trading", "1");
+        }
         let resp = req
             .header("Content-Type", "application/json")
             .header("OK-ACCESS-KEY", creds.key.trim())
@@ -529,14 +545,7 @@ impl VenueAdapter for OkxAdapter {
             // Spot: miktar base cinsindendir (EX-02 düzeltmesi).
             req.qty.to_half_even_display(8)
         };
-        let pos_side = if req.category == "linear" {
-            match req.side {
-                dca_math::Side::Buy => Some("long"),
-                dca_math::Side::Sell => Some("short"),
-            }
-        } else {
-            None
-        };
+        let pos_side = resolve_okx_pos_side(&req.category, req.position_idx, req.side, req.reduce_only);
         let mut body = serde_json::json!({
             "instId": inst_id,
             "tdMode": if req.category == "linear" { "isolated" } else { "cash" },
@@ -738,7 +747,31 @@ impl VenueAdapter for OkxAdapter {
     }
 }
 
-/// EX-08 yardımcıı: swap instId'nin ctVal'ını okur (contract → coin dönüşümü).
+/// OKX v5 Linear vadeli emirlerinde posSide eşleme kuralı (P0 Düzeltmesi).
+/// Long pozisyon (1) için hem alış hem kapanış satışı "long" gönderilmelidir.
+/// Short pozisyon (2) için hem satış hem kapanış alışı "short" gönderilmelidir.
+pub fn resolve_okx_pos_side(category: &str, position_idx: i32, side: dca_math::Side, reduce_only: bool) -> Option<&'static str> {
+    if category != "linear" {
+        return None;
+    }
+    match position_idx {
+        1 => Some("long"),
+        2 => Some("short"),
+        _ => {
+            if reduce_only {
+                match side {
+                    dca_math::Side::Sell => Some("long"),
+                    dca_math::Side::Buy => Some("short"),
+                }
+            } else {
+                match side {
+                    dca_math::Side::Buy => Some("long"),
+                    dca_math::Side::Sell => Some("short"),
+                }
+            }
+        }
+    }
+}
 impl OkxAdapter {
     async fn instrument_ct_val(&self, inst_id: &str) -> Result<Fraction, String> {
         let v = self.public_get("/api/v5/public/instruments", &format!("instType=SWAP&instId={inst_id}")).await?;
@@ -814,5 +847,27 @@ mod okx_tests {
         assert_eq!(map_okx_state("partially_filled"), "PartiallyFilled");
         assert_eq!(map_okx_state("filled"), "Filled");
         assert_eq!(map_okx_state("canceled"), "Cancelled");
+    }
+
+    #[test]
+    fn test_okx_pos_side_resolution() {
+        // Spot için posSide olmamalı
+        assert_eq!(resolve_okx_pos_side("spot", 1, dca_math::Side::Buy, false), None);
+
+        // Linear Long bacağı (idx 1): hem açılış (Buy) hem kapanış (Sell) posSide="long"
+        assert_eq!(resolve_okx_pos_side("linear", 1, dca_math::Side::Buy, false), Some("long"));
+        assert_eq!(resolve_okx_pos_side("linear", 1, dca_math::Side::Sell, true), Some("long"));
+
+        // Linear Short bacağı (idx 2): hem açılış (Sell) hem kapanış (Buy) posSide="short"
+        assert_eq!(resolve_okx_pos_side("linear", 2, dca_math::Side::Sell, false), Some("short"));
+        assert_eq!(resolve_okx_pos_side("linear", 2, dca_math::Side::Buy, true), Some("short"));
+
+        // Net / One-Way mod (idx 0):
+        // Kapanışta: Long kapatan Sell -> "long", Short kapatan Buy -> "short"
+        assert_eq!(resolve_okx_pos_side("linear", 0, dca_math::Side::Sell, true), Some("long"));
+        assert_eq!(resolve_okx_pos_side("linear", 0, dca_math::Side::Buy, true), Some("short"));
+        // Açılışta: Buy -> "long", Sell -> "short"
+        assert_eq!(resolve_okx_pos_side("linear", 0, dca_math::Side::Buy, false), Some("long"));
+        assert_eq!(resolve_okx_pos_side("linear", 0, dca_math::Side::Sell, false), Some("short"));
     }
 }

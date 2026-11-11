@@ -1667,19 +1667,26 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
     // a LIVE bot requires an active vault key for the venue.
     let mut credentials: Option<VenueCreds> = None;
     if mode == "LIVE" {
-        // Faz 0.5 (B-6): LIVE Mainnet Gate — DCA_ALLOW_MAINNET=1 olmadan gerçek emir oluşturulamaz
-        let is_testnet_env = std::env::var("DCA_BYBIT_TESTNET").as_deref() == Ok("1");
-        let allow_mainnet = std::env::var("DCA_ALLOW_MAINNET").as_deref() == Ok("1");
-        if !is_testnet_env && !allow_mainnet {
-            return Err(err422("LIVE_MAINNET_LOCKED: Gerçek ana ağda (Mainnet) LIVE bot başlatmak için DCA_ALLOW_MAINNET=1 ortam değişkeni zorunludur (B-6 fail-closed kapısı). Testnet için DCA_BYBIT_TESTNET=1 kullanın."));
-        }
-        // Faz 13B: HEDGE LIVE kilidi KALDIRILDI — bacak-başına stepper (EX-06
-        // çözümü) + positionIdx eşlemesi (Faz 4.5/5) tam; Demo kabulü sonrası canlı.
-        // Hesap hedge-moddaysa POS_MODE denetimi emirleri positionIdx ile eşler.
         let venue_uc = req.venue.to_uppercase();
         if venue_uc != "BYBIT" && venue_uc != "OKX" {
             return Err(err422("Bu venue'de LIVE kanal kapalı (Binance fill-reconciliation ile doğrulanmadı) — PAPER modunu kullan"));
         }
+        // Faz 0.5 (B-6): LIVE Mainnet Gate — venue bazlı testnet/demo kapısı (Arena P0-3 düzeltmesi)
+        let is_testnet_env = match venue_uc.as_str() {
+            "BYBIT" => std::env::var("DCA_BYBIT_TESTNET").as_deref() == Ok("1"),
+            "OKX" => std::env::var("DCA_OKX_DEMO").as_deref() == Ok("1") || std::env::var("DCA_OKX_TESTNET").as_deref() == Ok("1"),
+            _ => false,
+        };
+        let allow_mainnet = std::env::var("DCA_ALLOW_MAINNET").as_deref() == Ok("1");
+        if !is_testnet_env && !allow_mainnet {
+            return Err(err422(format!(
+                "LIVE_MAINNET_LOCKED: {venue_uc} gerçek ana ağda (Mainnet) LIVE bot başlatmak için DCA_ALLOW_MAINNET=1 ortam değişkeni zorunludur (B-6 fail-closed kapısı). Testnet/Demo için {} kullanın.",
+                if venue_uc == "OKX" { "DCA_OKX_DEMO=1" } else { "DCA_BYBIT_TESTNET=1" }
+            )));
+        }
+        // Faz 13B: HEDGE LIVE kilidi KALDIRILDI — bacak-başına stepper (EX-06
+        // çözümü) + positionIdx eşlemesi (Faz 4.5/5) tam; Demo kabulü sonrası canlı.
+        // Hesap hedge-moddaysa POS_MODE denetimi emirleri positionIdx ile eşler.
         credentials = match store::load_active_key(&app.db, &app.vault, &venue_uc) {
             Ok(Some(c)) => {
                 if venue_uc == "OKX" && c.passphrase.as_deref().map(|p| p.trim().is_empty()).unwrap_or(true) {
@@ -1905,8 +1912,18 @@ async fn patch_bot(State(app): State<Arc<AppState>>, Path(id): Path<String>, Jso
         state::persist_status(&app, &id, &s);
         let _ = app.sse.send(SseEvent { event: "BOT_STATE".into(), data: json!({"botId": id, "status": s}).to_string() });
     } else if let dca_strategy::EngineTag::Dca(e) = &mut rt.engine_kind {
-        e.patch(req.target_profit_pct, req.stop_loss_pct, req.trailing_enabled)
+        e.patch(req.target_profit_pct.clone(), req.stop_loss_pct.clone(), req.trailing_enabled)
             .map_err(|e| err422(e))?;
+        // Arena 1.10 Düzeltmesi: rt.cfg alanlarını da güncelle ki DB'ye ve snapshot'a güncel config yazılsın.
+        if let Some(tp) = &req.target_profit_pct {
+            rt.cfg.target_profit_pct = tp.clone();
+        }
+        if let Some(sl) = &req.stop_loss_pct {
+            rt.cfg.stop_loss_pct = sl.clone();
+        }
+        if let Some(tr) = req.trailing_enabled {
+            rt.cfg.trailing_enabled = tr;
+        }
         // BOT-06: yamayı DB config'ine de kalıcı yaz — restart sonrası korunur.
         {
             let conn = app.db.conn.lock().map_err(|e| err422(e.to_string()))?;
@@ -1959,6 +1976,13 @@ async fn delete_bot(State(app): State<Arc<AppState>>, Path(id): Path<String>) ->
             Some(r) => r,
             None => return Err(err404("bot not found")),
         };
+        // Arena 1.10 Düzeltmesi: LIVE açık pozisyonu varken bot silinemez (sahipsiz pozisyon kalmaması için fail-closed)
+        if rt.mode == "LIVE" && !rt.stepper.position.qty.is_zero() {
+            return Err(err422(format!(
+                "Açık pozisyonu olan LIVE bot silinemez (Açık miktar: {}). Lütfen önce 'Tümünü Kapat' (PANIC) ile pozisyonu kapatın veya işlemin tamamlanmasını bekleyin.",
+                rt.stepper.position.qty.to_half_even_display(8)
+            )));
+        }
         (
             rt.mode == "LIVE",
             rt.credentials.clone(),

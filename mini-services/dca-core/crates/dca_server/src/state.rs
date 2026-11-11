@@ -233,7 +233,10 @@ impl BotRuntime {
             .map(|x| x.to_string());
         if let (Some(hs), Some(m)) = (self.hedge_stepper.as_ref(), mark_now.as_ref()) {
             if let Ok(he) = hs.equity(m) {
-                eq_comb = Some(eq_comb.and_then(|e| e.add(&he).ok()).unwrap_or(he));
+                // Arena 1.5 Düzeltmesi: hs'nin equity'si tam start_cash içerir.
+                // İki bacağın start_cash'i toplanmaz; hedge bacağının net PnL katkısı eklenir.
+                let hpnl = he.sub(&hs.start_cash).unwrap_or_else(|_| dca_math::fraction::Fraction::zero());
+                eq_comb = eq_comb.and_then(|e| e.add(&hpnl).ok());
             }
         }
         let equity_now = eq_comb.map(|x| x.to_string());

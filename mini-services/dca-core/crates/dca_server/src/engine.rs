@@ -26,6 +26,8 @@ use tokio::sync::broadcast;
 pub struct PreSignals {
     pub tree_ok: Option<bool>,
     pub pine_out: Option<Result<dca_pine::BarVerdict, String>>,
+    pub sig_engine: Option<std::sync::Arc<dca_signals::SignalEngine>>,
+    pub sig_root: Option<dca_signals::SignalNode>,
 }
 
 pub async fn process_bar(
@@ -84,7 +86,14 @@ pub async fn process_bar(
     // forming bar dropped; evaluation timestamp = now (last closed bar ≤ now).
     // H-1 adim 2: ag fetch'i yok — karar kilitsiz Faz 2'de hesaplandi;
     // fail-closed yazilari orada yapildi. UI gostergesi burada guncellenir.
-    let tree_ok: Option<bool> = pre.tree_ok.map(|met| {
+    // Sıfır Look-Ahead: bar işlenirken sinyal motoru varsa tam o barın t anındaki karar alınır;
+    // aksi halde (veya Pine) pre sinyali fallback kullanılır.
+    let resolved_tree_ok = if let (Some(eng), Some(root)) = (&pre.sig_engine, &pre.sig_root) {
+        Some(eng.evaluate_at_time(root, bar.t))
+    } else {
+        pre.tree_ok
+    };
+    let tree_ok: Option<bool> = resolved_tree_ok.map(|met| {
         rt.entry_signal_met = Some(met);
         met
     });
@@ -1261,24 +1270,25 @@ pub async fn dispatch_action(
                 if cap > 0 {
                     // Kilit-siz cache okuması — runtimes kilidi bu noktada
                     // ZATEN çağırıcıda; tekrar istemek deadlock üretir.
-                    let Some((nav, gross)) = crate::fleet::portfolio_cache_read(app, 30_000) else {
-                        return Ok(()); // taze değil: kapı bu turu atlar (fail-open)
-                    };
-                    let candidate = price.mul(&qty).unwrap_or_else(|_| Fraction::zero());
-                    if crate::fleet::portfolio_cap_exceeded(&gross, &candidate, &nav, cap) {
-                        let msg = format!(
-                            "PORTFOLIO CAP: {} emri yerlestirilmedi — acik brut notional + aday {} NAV'in %{} sinirini asar (su anki brut/NAV agirligi asildi). Emir yok; seviye sonraki barda yeniden degerlendirilir. Esigi yukseltmek icin DCA_PORTFOLIO_MAX_NOTIONAL_PCT.",
-                            role,
-                            candidate,
-                            cap
-                        );
-                        crate::state::persist_event(app, &rt.bot_id, "WARN", "", &msg).await;
-                        let _ = sse.send(SseEvent {
-                            event: "LOG".into(),
-                            data: json!({"botId": rt.bot_id, "level": "WARN", "message": msg, "ts": ts}).to_string(),
-                        });
-                        return Ok(());
+                    if let Some((nav, gross)) = crate::fleet::portfolio_cache_read(app, 30_000) {
+                        let candidate = price.mul(&qty).unwrap_or_else(|_| Fraction::zero());
+                        if crate::fleet::portfolio_cap_exceeded(&gross, &candidate, &nav, cap) {
+                            let msg = format!(
+                                "PORTFOLIO CAP: {} emri yerlestirilmedi — acik brut notional + aday {} NAV'in %{} sinirini asar (su anki brut/NAV agirligi asildi). Emir yok; seviye sonraki barda yeniden degerlendirilir. Esigi yukseltmek icin DCA_PORTFOLIO_MAX_NOTIONAL_PCT.",
+                                role,
+                                candidate,
+                                cap
+                            );
+                            crate::state::persist_event(app, &rt.bot_id, "WARN", "", &msg).await;
+                            let _ = sse.send(SseEvent {
+                                event: "LOG".into(),
+                                data: json!({"botId": rt.bot_id, "level": "WARN", "message": msg, "ts": ts}).to_string(),
+                            });
+                            return Ok(());
+                        }
+                        crate::fleet::portfolio_cache_add_candidate(app, &candidate);
                     }
+                    // taze değilse: kapı bu turu atlar (fail-open)
                 }
             }
             match rt.mode.as_str() {
@@ -1364,33 +1374,34 @@ pub async fn dispatch_action(
                 );
                 if cap > 0 {
                     // Kilit-siz cache okuması (PlaceLimit kolu ile aynı desen).
-                    let Some((nav, gross)) = crate::fleet::portfolio_cache_read(app, 30_000) else {
-                        return Ok(()); // taze değil: kapı bu turu atlar (fail-open)
-                    };
-                    let candidate = match &quote_notional {
-                        Some(q) => q.clone(),
-                        None => rt
-                            .stepper
-                            .last_close
-                            .as_deref()
-                            .and_then(|s| Fraction::from_any_str(s).ok())
-                            .and_then(|mark| mark.mul(&qty).ok())
-                            .unwrap_or_else(Fraction::zero),
-                    };
-                    if crate::fleet::portfolio_cap_exceeded(&gross, &candidate, &nav, cap) {
-                        let msg = format!(
-                            "PORTFOLIO CAP: {} emri yerlestirilmedi — acik brut notional + aday {} NAV'in %{} sinirini asar. Emir yok; seviye sonraki barda yeniden degerlendirilir. Esigi yukseltmek icin DCA_PORTFOLIO_MAX_NOTIONAL_PCT.",
-                            role,
-                            candidate,
-                            cap
-                        );
-                        crate::state::persist_event(app, &rt.bot_id, "WARN", "", &msg).await;
-                        let _ = sse.send(SseEvent {
-                            event: "LOG".into(),
-                            data: json!({"botId": rt.bot_id, "level": "WARN", "message": msg, "ts": ts}).to_string(),
-                        });
-                        return Ok(());
+                    if let Some((nav, gross)) = crate::fleet::portfolio_cache_read(app, 30_000) {
+                        let candidate = match &quote_notional {
+                            Some(q) => q.clone(),
+                            None => rt
+                                .stepper
+                                .last_close
+                                .as_deref()
+                                .and_then(|s| Fraction::from_any_str(s).ok())
+                                .and_then(|mark| mark.mul(&qty).ok())
+                                .unwrap_or_else(Fraction::zero),
+                        };
+                        if crate::fleet::portfolio_cap_exceeded(&gross, &candidate, &nav, cap) {
+                            let msg = format!(
+                                "PORTFOLIO CAP: {} emri yerlestirilmedi — acik brut notional + aday {} NAV'in %{} sinirini asar. Emir yok; seviye sonraki barda yeniden degerlendirilir. Esigi yukseltmek icin DCA_PORTFOLIO_MAX_NOTIONAL_PCT.",
+                                role,
+                                candidate,
+                                cap
+                            );
+                            crate::state::persist_event(app, &rt.bot_id, "WARN", "", &msg).await;
+                            let _ = sse.send(SseEvent {
+                                event: "LOG".into(),
+                                data: json!({"botId": rt.bot_id, "level": "WARN", "message": msg, "ts": ts}).to_string(),
+                            });
+                            return Ok(());
+                        }
+                        crate::fleet::portfolio_cache_add_candidate(app, &candidate);
                     }
+                    // taze değilse: kapı bu turu atlar (fail-open)
                 }
             }
             match rt.mode.as_str() {
@@ -1879,20 +1890,23 @@ async fn poll_inner(
     // (Eski davranışta her bar için yeniden çekiliyordu; fetch'ler 'en son
     // kapalı' pencereye baktığından karar eşdeğerdir — 60x daha az ağ.)
     let pre = if ctx.strategy_blocked_hint {
-        PreSignals { tree_ok: None, pine_out: None }
+        PreSignals { tree_ok: None, pine_out: None, sig_engine: None, sig_root: None }
     } else {
-        let tree_ok: Option<bool> = match ctx.entry_signal.clone() {
+        let (tree_ok, sig_engine, sig_root) = match ctx.entry_signal.clone() {
             Some(sc) => {
                 let cat = if ctx.is_futures { "linear" } else { "spot" };
                 match build_live_signal_engine(app, &ctx.venue, cat, &ctx.symbol, &ctx.interval_str, &sc.root).await {
-                    Ok((eng, _asof)) => Some(eng.evaluate_at_time(&sc.root, crate::state::now_ms())),
+                    Ok((eng, _asof)) => {
+                        let evaluated = eng.evaluate_at_time(&sc.root, crate::state::now_ms());
+                        (Some(evaluated), Some(std::sync::Arc::new(eng)), Some(sc.root))
+                    }
                     Err(e) => {
                         crate::state::persist_event(app, bot_id, "WARN", "SIGNAL", &format!("signal evaluation failed — fail-closed: {e}")).await;
-                        Some(false)
+                        (Some(false), None, None)
                     }
                 }
             }
-            None => None,
+            None => (None, None, None),
         };
         let pine_out: Option<Result<dca_pine::BarVerdict, String>> = if ctx.pine_script.is_some() {
             let cat = if ctx.is_futures { "linear" } else { "spot" };
@@ -1916,7 +1930,7 @@ async fn poll_inner(
         } else {
             None
         };
-        PreSignals { tree_ok, pine_out }
+        PreSignals { tree_ok, pine_out, sig_engine, sig_root }
     };
 
     // ---------------- H-1 FAZ 3: kilitli uygulama ----------------

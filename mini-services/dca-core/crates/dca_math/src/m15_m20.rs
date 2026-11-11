@@ -24,7 +24,7 @@ pub fn arithmetic_mesh(lower: &Fraction, upper: &Fraction, n: usize) -> Result<V
 }
 
 /// M15 — Geometric mesh with EXACT integer n-th roots: P_j^n = L^(n-j) * U^j.
-/// P_j = nth_root(L^(n-j) * U^j, n) — zero-float via big-int Newton iteration.
+/// P_j = nth_root(L^(n-j) * U^j, n) — zero-float via big-int Newton iteration with rational scaling.
 pub fn geometric_mesh(lower: &Fraction, upper: &Fraction, n: usize) -> Result<Vec<Fraction>, MathError> {
     if n == 0 {
         return Err(MathError::DomainViolation("grid n must be > 0".into()));
@@ -44,19 +44,33 @@ pub fn geometric_mesh(lower: &Fraction, upper: &Fraction, n: usize) -> Result<Ve
     if li <= num_bigint::BigInt::ZERO || ui <= li {
         return Err(MathError::DomainViolation("grid bounds must be positive, lower < upper".into()));
     }
+
+    // Precision scale (10^8) ensures roots don't truncate to whole integers when bounds are close (e.g. 100..101)
+    let precision_scale = num_bigint::BigInt::from(10u32).pow(8u32);
+    let final_den = &common_den * &precision_scale;
+
     let mut out = Vec::with_capacity(n + 1);
     for j in 0..=n {
-        // value = li^(n-j) * ui^j ; root index n
-        let pow_val = if j == 0 {
-            li.pow(n as u32)
+        let root = if j == 0 {
+            li.clone() * &precision_scale
         } else if j == n {
-            ui.pow(n as u32)
+            ui.clone() * &precision_scale
         } else {
-            li.pow((n - j) as u32) * ui.pow(j as u32)
+            let pow_val = (li.pow((n - j) as u32) * ui.pow(j as u32)) * precision_scale.pow(n as u32);
+            integer_nth_root(&pow_val, n as u32)
         };
-        let root = integer_nth_root(&pow_val, n as u32);
-        out.push(Fraction::new(root, common_den.clone())?);
+        out.push(Fraction::new(root, final_den.clone())?);
     }
+
+    // Verify strict monotonicity (no duplicate adjacent levels)
+    for w in out.windows(2) {
+        if w[1] <= w[0] {
+            return Err(MathError::DomainViolation(
+                "grid bounds or step too small: geometric mesh generated duplicate or non-increasing levels".into(),
+            ));
+        }
+    }
+
     Ok(out)
 }
 
@@ -146,6 +160,23 @@ pub fn m20_conflict_scan(
     let mut cost = base_qty.mul(anchor_p0)?;
     let mut triggers = Vec::with_capacity(levels.len());
     let mut first_unreachable: Option<usize> = None;
+
+    // Check conflict between initial base position (before any safety orders fill) and level 0 (first safety order)
+    if !levels.is_empty() {
+        let sl_0 = if direction == Direction::Long {
+            anchor_p0.mul(&Fraction::one().sub(stop_loss_pct)?)?
+        } else {
+            anchor_p0.mul(&Fraction::one().add(stop_loss_pct)?)?
+        };
+        let unreachable_0 = if direction == Direction::Long {
+            sl_0 >= levels[0].price
+        } else {
+            sl_0 <= levels[0].price
+        };
+        if unreachable_0 {
+            first_unreachable = Some(0);
+        }
+    }
 
     for (idx, l) in levels.iter().enumerate() {
         let next_price = &l.price;
@@ -302,5 +333,31 @@ mod tests {
         .unwrap();
         let (viable, first, _) = m20_conflict_scan(Direction::Long, &f("0.10"), &f("1"), &f("100"), &levels).unwrap();
         assert!(viable, "expected viable, first_unreachable={:?}", first);
+    }
+
+    #[test]
+    fn geometric_grid_no_duplicate_levels_on_integer_bounds() {
+        // Audit 1.8: lower=100, upper=101, n=2. Without scaling, integer roots produce [100, 100, 101].
+        let mesh = geometric_mesh(&f("100"), &f("101"), 2).unwrap();
+        assert_eq!(mesh.len(), 3);
+        assert_eq!(mesh[0].to_string(), "100");
+        assert_eq!(mesh[2].to_string(), "101");
+        assert!(mesh[0] < mesh[1]);
+        assert!(mesh[1] < mesh[2]);
+        assert_eq!(mesh[1].to_half_even_display(4), "100.4988");
+    }
+
+    #[test]
+    fn m20_stop_before_first_safety_triggers_conflict() {
+        // Audit 1.8: P0=100, d=5% (first safety order at 95). SL=2% (triggers at 98).
+        // Before first safety fills, SL at 98 will trigger and close the deal.
+        let levels = crate::m02::build_dca_plan(
+            &f("100"), &f("1"), &f("1"), &f("0.05"), &f("1"), &f("1"),
+            3, Direction::Long, &f("0.01"), &f("0.001"), crate::m02::SizingMode::BaseQty,
+        )
+        .unwrap();
+        let (viable, first, _) = m20_conflict_scan(Direction::Long, &f("0.02"), &f("1"), &f("100"), &levels).unwrap();
+        assert!(!viable);
+        assert_eq!(first, Some(0));
     }
 }

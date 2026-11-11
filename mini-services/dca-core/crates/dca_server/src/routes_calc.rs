@@ -47,6 +47,7 @@ pub(crate) struct DcaCalcReq {
     taker_fee: String,
     leverage: String,
     market: String, // spot | linear
+    direction: Option<String>, // long | short (defaults to long)
 }
 
 pub(crate) async fn calc_dca(Json(req): Json<DcaCalcReq>) -> Result<axum::response::Response, axum::response::Response> {
@@ -60,7 +61,10 @@ pub(crate) async fn calc_dca(Json(req): Json<DcaCalcReq>) -> Result<axum::respon
     let tick = fr(&req.tick_size)?;
     let step = fr(&req.step_size)?;
     let leverage = fr(&req.leverage)?;
-    let direction = Direction::Long; // calculator focuses Long; Short variant exposed via separate UI calc
+    let direction = match req.direction.as_deref() {
+        Some(d) if d.eq_ignore_ascii_case("short") => Direction::Short,
+        _ => Direction::Long,
+    };
 
     let sizing_mode = if req.sizing_mode == "QUOTE_NOTIONAL" { SizingMode::QuoteNotional } else { SizingMode::BaseQty };
 
@@ -124,7 +128,9 @@ pub(crate) async fn calc_dca(Json(req): Json<DcaCalcReq>) -> Result<axum::respon
             deduction: Fraction::zero(),
         }];
         let w = im.clone();
-        if let Ok(Some(p)) = dca_math::m03_m07::liquidation_price(1, &q, &anchor, &w, &brackets, &Fraction::zero()) {
+        let wac = cost.div(&q).unwrap_or_else(|_| anchor.clone());
+        let pos_side: i8 = if direction == Direction::Long { 1 } else { -1 };
+        if let Ok(Some(p)) = dca_math::m03_m07::liquidation_price(pos_side, &q, &wac, &w, &brackets, &Fraction::zero()) {
             liq = Some(p.to_half_even_display(6));
         }
     }
@@ -210,4 +216,35 @@ pub(crate) async fn calc_grid(Json(req): Json<GridCalcReq>) -> Result<axum::resp
         "totalInvested": invested,
     }))
     .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_calc_dca_short_and_wac_liquidation() {
+        let req = DcaCalcReq {
+            anchor: "100".into(),
+            base_order_size: "100".into(),
+            safety_order_size: "100".into(),
+            sizing_mode: "QUOTE_NOTIONAL".into(),
+            deviation_pct: "0.02".into(),
+            step_scale: "1.0".into(),
+            volume_scale: "1.0".into(),
+            max_safety_orders: 2,
+            target_profit_pct: "0.02".into(),
+            use_net_tp: true,
+            stop_loss_pct: Some("0.05".into()),
+            tick_size: "0.01".into(),
+            step_size: "0.001".into(),
+            maker_fee: "0.001".into(),
+            taker_fee: "0.001".into(),
+            leverage: "10".into(),
+            market: "linear".into(),
+            direction: Some("short".into()),
+        };
+        let resp = calc_dca(Json(req)).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
 }

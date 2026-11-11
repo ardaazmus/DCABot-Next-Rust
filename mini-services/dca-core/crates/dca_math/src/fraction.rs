@@ -77,6 +77,11 @@ impl Fraction {
         if trimmed.is_empty() {
             return Err(MathError::InvalidDecimalString(s.to_string()));
         }
+        if let Some((n, d)) = trimmed.split_once('/') {
+            let num = BigInt::from_str(n.trim()).map_err(|_| MathError::InvalidDecimalString(s.to_string()))?;
+            let den = BigInt::from_str(d.trim()).map_err(|_| MathError::InvalidDecimalString(s.to_string()))?;
+            return Self::new(num, den);
+        }
         let parts: Vec<&str> = trimmed.split(['e', 'E']).collect();
         let (mantissa_str, exp_val) = match parts.len() {
             1 => (parts[0], 0i64),
@@ -457,5 +462,14 @@ mod tests {
     #[test]
     fn pow_exact() {
         assert_eq!(f("1.1").pow_u(3).unwrap().to_string(), "1331/1000");
+    }
+
+    #[test]
+    fn fraction_display_vs_from_decimal_str() {
+        // Audit Section 2 finding: Fraction::Display writes n/d ("1/2"), which must be parseable by from_decimal_str
+        let frac = Fraction::new(BigInt::from(1), BigInt::from(2)).unwrap();
+        assert_eq!(frac.to_string(), "1/2");
+        let parsed = Fraction::from_decimal_str(&frac.to_string()).unwrap();
+        assert_eq!(parsed, frac);
     }
 }

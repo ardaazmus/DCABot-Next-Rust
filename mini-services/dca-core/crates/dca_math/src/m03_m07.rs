@@ -97,14 +97,16 @@ pub fn funding_expense_from_cashflow(cashflow: &Fraction) -> Result<Fraction, Ma
 }
 
 /// M05 — Exact net take-profit price covering cumulative funding F, exit fee f_out,
-/// target net quote profit T.
-/// Long:  P_TP = (q*A + F + T) / (q*(1 - f_out)), aligned UP to tick.
-/// Short: P_TP = (q*A - F - T) / (q*(1 + f_out)), aligned DOWN to tick.
+/// Net Take Profit (M05): hem çıkış komisyonu, hem fonlama, hem de giriş komisyonlarını (entry_fees)
+/// karşılayarak net kâr hedefini (target_net_profit T) garanti eden fiyat.
+/// Long:  P_TP = (q*A + F + Fee_in + T) / (q*(1 - f_out)), aligned UP to tick.
+/// Short: P_TP = (q*A - F - Fee_in - T) / (q*(1 + f_out)), aligned DOWN to tick.
 pub fn calculate_net_take_profit(
     direction: i8,
     qty: &Fraction,
     avg_price: &Fraction,
     cumulative_funding: &Fraction,
+    entry_fees: &Fraction,
     exit_fee_rate: &Fraction,
     target_net_profit: &Fraction,
     tick_size: &Fraction,
@@ -114,12 +116,12 @@ pub fn calculate_net_take_profit(
     }
     let raw = if direction == 1 {
         let qa = qty.mul(avg_price)?;
-        let num = qa.add(cumulative_funding)?.add(target_net_profit)?;
+        let num = qa.add(cumulative_funding)?.add(entry_fees)?.add(target_net_profit)?;
         let den = qty.mul(&Fraction::one().sub(exit_fee_rate)?)?;
         num.div(&den)?
     } else {
         let qa = qty.mul(avg_price)?;
-        let num = qa.sub(cumulative_funding)?.sub(target_net_profit)?;
+        let num = qa.sub(cumulative_funding)?.sub(entry_fees)?.sub(target_net_profit)?;
         let den = qty.mul(&Fraction::one().add(exit_fee_rate)?)?;
         num.div(&den)?
     };
@@ -264,9 +266,9 @@ mod tests {
 
     #[test]
     fn net_tp_long_covers_fees_and_funding() {
-        // q=2, A=80, F=1, f_out=0.001, T=10, tick 0.01
-        // raw = (160 + 1 + 10) / (2*0.999) = 171/1.998 = 85.585585...
-        let p = calculate_net_take_profit(1, &f("2"), &f("80"), &f("1"), &f("0.001"), &f("10"), &f("0.01")).unwrap();
+        // q=2, A=80, F=1, fee_in=0, f_out=0.001, T=10, tick 0.01
+        // raw = (160 + 1 + 0 + 10) / (2*0.999) = 171/1.998 = 85.585585...
+        let p = calculate_net_take_profit(1, &f("2"), &f("80"), &f("1"), &f("0"), &f("0.001"), &f("10"), &f("0.01")).unwrap();
         assert_eq!(p.to_half_even_display(2), "85.59"); // tickUp
         // Verify net profit at P exactly >= T:
         let gross = f("2").mul(&p.sub(&f("80")).unwrap()).unwrap(); // 2*(85.59-80)
@@ -276,8 +278,18 @@ mod tests {
     }
 
     #[test]
+    fn net_tp_long_covers_entry_fees_exactly() {
+        // Arena 1.7: 100 alış, 1 adet, %0.1 giriş fee (0.10), %0.1 çıkış fee (0.001), %1 net hedef (1.00)
+        let p = calculate_net_take_profit(1, &f("1"), &f("100"), &f("0"), &f("0.1"), &f("0.001"), &f("1.0"), &f("0.01")).unwrap();
+        let gross = f("1").mul(&p.sub(&f("100")).unwrap()).unwrap();
+        let exit_fee = f("1").mul(&p).unwrap().mul(&f("0.001")).unwrap();
+        let net = gross.sub(&f("0.1")).unwrap().sub(&exit_fee).unwrap();
+        assert!(net >= f("1.0"), "Net kâr giriş ve çıkış komisyonları sonrası tam hedefe (1.0) ulaşmalı");
+    }
+
+    #[test]
     fn net_tp_short_aligned_down() {
-        let p = calculate_net_take_profit(-1, &f("2"), &f("80"), &f("0"), &f("0.001"), &f("10"), &f("0.01")).unwrap();
+        let p = calculate_net_take_profit(-1, &f("2"), &f("80"), &f("0"), &f("0"), &f("0.001"), &f("10"), &f("0.01")).unwrap();
         assert!(p < f("80"));
     }
 

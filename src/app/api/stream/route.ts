@@ -12,6 +12,8 @@
  * geçmeyen hedef bağlanmaz.
  */
 
+import { isAuthRequired, verifySessionToken, SESSION_COOKIE_NAME } from "@/lib/auth-session";
+
 export const dynamic = "force-dynamic";
 
 /** Yalnız bu ana makinelere proxy yapılır (loopback motoru). */
@@ -24,7 +26,24 @@ function enginePort(): string {
   return /^\d{2,5}$/.test(raw) && Number(raw) > 0 && Number(raw) < 65536 ? raw : "3002";
 }
 
-export async function GET() {
+export async function GET(req: Request) {
+  // Faz 0.3 (B-3): UI Auth Guard — DCA_UI_PASSWORD veya DCA_REQUIRE_AUTH aktifse oturumsuz istekler 401.
+  if (isAuthRequired()) {
+    const cookieHeader = req.headers.get("cookie") || "";
+    const cookieMap = Object.fromEntries(
+      cookieHeader.split(";").map((c) => {
+        const [k, ...v] = c.trim().split("=");
+        return [k, v.join("=")];
+      })
+    );
+    const token = cookieMap[SESSION_COOKIE_NAME];
+    if (!verifySessionToken(token)) {
+      return new Response(JSON.stringify({ error: "UNAUTHORIZED: Oturum açmanız gerekmektedir" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+  }
   // Sabit uç nokta: istekten gelen hiçbir veri URL'ye girmez.
   let target: URL;
   try {

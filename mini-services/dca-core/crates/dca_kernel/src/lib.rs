@@ -129,6 +129,7 @@ pub struct SimulationStepper {
     pub instrument: Instrument,
     pub cfg: StepperConfig,
     pub position: PositionState,
+    pub start_cash: Fraction,
     pub cash: Fraction,
     /// Initial margin committed to the open position (margin mode only).
     pub im_used: Fraction,
@@ -194,6 +195,7 @@ impl SimulationStepper {
             instrument,
             cfg,
             position: PositionState::new(dir),
+            start_cash: start_cash.clone(),
             cash: start_cash,
             im_used: Fraction::zero(),
             cumulative_fees: Fraction::zero(),
@@ -593,16 +595,17 @@ impl SimulationStepper {
             }
             // Task 16 Gate 8b — gap-through SAFETY adds batch (aynı bar, aynı açılış fiyatı)
             if realism == FillRealism::OpenGapBetter && order.kind == OrderKind::Add && order.role == "SAFETY" {
-                // Gate 5 hacim payı kuralını tampon dahil yeniden uygula
+                // Gate 5 hacim payı kuralını tampon dahil yeniden uygula (Arena 2 Gap Batch düzeltmesi)
+                let candidate_batch = gap_batch_qty.add(&order.qty).unwrap_or_else(|_| gap_batch_qty.clone());
                 let total = self
                     .filled_qty_this_bar
-                    .add(&gap_batch_qty).and_then(|x| x.add(&order.qty))
+                    .add(&candidate_batch)
                     .unwrap_or_else(|_| Fraction::zero());
                 if Fraction::cmp(&volume_cap, &total) == std::cmp::Ordering::Less {
                     self.pending.push(order);
                     continue;
                 }
-                gap_batch_qty = total;
+                gap_batch_qty = candidate_batch;
                 gap_batch.push(order);
                 continue;
             }

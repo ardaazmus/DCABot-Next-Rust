@@ -224,6 +224,7 @@ impl DcaEngine {
                 qty,
                 avg,
                 &self.funding_deal,
+                &self.deal_fees,
                 &exit_rate,
                 &target_quote,
                 &self.inst.tick_size,
@@ -738,6 +739,8 @@ impl DcaEngine {
                                             if let Some(rt) = self.resting_tp.take() {
                                                 acts.push(Action::CancelResting { id: rt.order_id });
                                             }
+                                            // P0 SAFETY İptali: Trailing çıkışında açık SAFETY emirleri iptal edilir
+                                            acts.push(Action::CancelResting { id: format!("{}-SAFETY-*", self.bot_id) });
                                             acts.push(Action::PlaceMarket {
                                                 id: order_id(&self.next_seq_id(), "TRAIL", 0),
                                                 side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
@@ -803,6 +806,8 @@ impl DcaEngine {
                     if let Some(rt) = self.resting_tp.take() {
                         acts.push(Action::CancelResting { id: rt.order_id });
                     }
+                    // P0 SAFETY İptali: Manuel kapanışta açık SAFETY emirleri iptal edilir
+                    acts.push(Action::CancelResting { id: format!("{}-SAFETY-*", self.bot_id) });
                     acts.push(Action::PlaceMarket {
                         id: order_id(&self.next_seq_id(), "MANUAL", 0),
                         side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
@@ -825,6 +830,8 @@ impl DcaEngine {
                     if let Some(rt) = self.resting_tp.take() {
                         acts.push(Action::CancelResting { id: rt.order_id });
                     }
+                    // P0 SAFETY İptali: Manuel kapanışta açık SAFETY emirleri iptal edilir
+                    acts.push(Action::CancelResting { id: format!("{}-SAFETY-*", self.bot_id) });
                     acts.push(Action::PlaceMarket {
                         id: order_id(&self.next_seq_id(), "MANUAL", 0),
                         side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
@@ -942,6 +949,8 @@ impl DcaEngine {
             if let Some(rt) = self.resting_tp.take() {
                 acts.push(Action::CancelResting { id: rt.order_id });
             }
+            // P0 SAFETY İptali: Deal kapandığında (TP/SL/Trail/Manual) açık kalan SAFETY emirleri derhal iptal edilir
+            acts.push(Action::CancelResting { id: format!("{}-SAFETY-*", self.bot_id) });
             let realized = self.mirror.realized_gross.clone();
             // M-17: mirror bir sonraki deal'da sıfırlanır — kapanış realizasyonunu
             // kümülatif deftere devretmeden kaybedilmez.
@@ -992,15 +1001,17 @@ impl DcaEngine {
     /// Margin call: the position was force-closed at the liquidation boundary.
     /// Mirror is already flat (runner force_close); reset deal bookkeeping.
     pub fn force_liquidate(&mut self) {
-        // M-17: liquidasyon öncesi mirror'da birikmiş realizasyonu kümülatif
-        // deftere devret (mirror sıfırlansa da bot ömrü k/z'si korunur).
-        self.cum_realized_gross = self
-            .cum_realized_gross
-            .add(&self.mirror.realized_gross.clone())
-            .unwrap_or_else(|_| self.cum_realized_gross.clone());
-        self.losses += 1;
-        self.deals_closed += 1;
-        self.phase = DcaPhase::Cooldown;
+        // Arena 1.6 Çift Sayım Önlemi: Eğer on_fill bu kapanışı zaten işleyip Cooldown'a
+        // aldıysa, kümülatif realizasyonu, zararı ve deal sayısını ikinci kez artırma.
+        if self.phase != DcaPhase::Cooldown {
+            self.cum_realized_gross = self
+                .cum_realized_gross
+                .add(&self.mirror.realized_gross.clone())
+                .unwrap_or_else(|_| self.cum_realized_gross.clone());
+            self.losses += 1;
+            self.deals_closed += 1;
+            self.phase = DcaPhase::Cooldown;
+        }
         self.cooldown_remaining = self.cfg.cooldown_bars;
         self.close_orders_out = 0;
         self.closes_seen = 0;
@@ -1723,5 +1734,64 @@ mod m17_realized_ledger_tests {
         let acts = e.on_bar(&ctx(&bar(20_000, "50"), Fraction::from_decimal_str("50").unwrap()));
         assert!(acts.iter().any(|a| matches!(a, Action::PlaceMarket { role: "BASE", .. })), "backoff sonrası geçerli boyutta deal açılmalı");
         assert_eq!(e.phase, DcaPhase::BasePending);
+    }
+
+    #[test]
+    fn tp_or_manual_close_cancels_all_resting_safety_orders() {
+        let mut e = DcaEngine::new("safety-cancel-test", BotConfig::default(), Instrument::default()).unwrap();
+        // Base emrini aç
+        let _ = e.on_bar(&ctx(&bar(1_000, "100"), Fraction::from_u64(100)));
+        assert_eq!(e.phase, DcaPhase::BasePending);
+        // Base dolumu
+        let base_fill = fill(&format!("{}-BASE-1", e.bot_id), "BASE", Side::Buy, OrderKind::Add, "100", "1", 1_000);
+        e.on_fill(&base_fill);
+        assert_eq!(e.phase, DcaPhase::Open);
+
+        // Manuel kapatma isteği tetikle
+        e.manual_close_requested = true;
+        let close_acts = e.on_bar(&ctx(&bar(2_000, "100"), Fraction::from_u64(100)));
+        // CancelResting SAFETY wildcard aksiyonu üretilmiş olmalı
+        let has_safety_cancel = close_acts.iter().any(|a| {
+            if let Action::CancelResting { id } = a {
+                id == &format!("{}-SAFETY-*", e.bot_id)
+            } else {
+                false
+            }
+        });
+        assert!(has_safety_cancel, "manuel kapanışta SAFETY emirleri wildcard iptal edilmeli");
+
+        // Kapanış dolumu geldiğinde de on_fill SAFETY iptali üretmeli
+        let close_fill = fill(&format!("{}-MANUAL-1", e.bot_id), "MANUAL", Side::Sell, OrderKind::Reduce, "100", "1", 2_000);
+        let fill_acts = e.on_fill(&close_fill);
+        assert_eq!(e.phase, DcaPhase::Cooldown);
+        let has_fill_safety_cancel = fill_acts.iter().any(|a| {
+            if let Action::CancelResting { id } = a {
+                id == &format!("{}-SAFETY-*", e.bot_id)
+            } else {
+                false
+            }
+        });
+        assert!(has_fill_safety_cancel, "deal kapandığında on_fill SAFETY emirlerini iptal etmeli");
+    }
+
+    #[test]
+    fn liquidated_close_then_force_liquidate_does_not_double_count() {
+        let mut e = DcaEngine::new("liq-double-test", BotConfig::default(), Instrument::default()).unwrap();
+        let _ = e.on_bar(&ctx(&bar(1_000, "100"), Fraction::from_u64(100)));
+        let base_fill = fill(&format!("{}-BASE-1", e.bot_id), "BASE", Side::Buy, OrderKind::Add, "100", "1", 1_000);
+        e.on_fill(&base_fill);
+        assert_eq!(e.phase, DcaPhase::Open);
+
+        // Likidasyon kapanış dolumu (LIQ)
+        let liq_fill = fill(&format!("{}-LIQ-1", e.bot_id), "LIQ", Side::Sell, OrderKind::Reduce, "80", "1", 2_000);
+        e.on_fill(&liq_fill);
+        assert_eq!(e.phase, DcaPhase::Cooldown);
+        assert_eq!(e.losses, 1);
+        assert_eq!(e.deals_closed, 1);
+
+        // Runner hemen ardından force_liquidate() çağırır
+        e.force_liquidate();
+        assert_eq!(e.losses, 1, "force_liquidate on_fill sonrası losses'ı ikinci kez artırmamalı");
+        assert_eq!(e.deals_closed, 1, "force_liquidate on_fill sonrası deals_closed'ı ikinci kez artırmamalı");
     }
 }

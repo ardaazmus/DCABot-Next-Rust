@@ -233,8 +233,9 @@ export function Wizard({ onCreated }: WizardProps) {
   const isShort = kind === "DCA_SHORT";
   const isFuturesDca = kind === "FUTURES_DCA";
   const isHedgeKind = kind === "HEDGE_PROTECTIVE" || kind === "HEDGE_DUAL";
-  const marketType: "spot" | "linear" = isShort || kind === "FUTURES_GRID" || isFuturesDca || leverage > 1 ? "linear" : "spot";
-  const category: "spot" | "linear" = isShort || kind === "FUTURES_GRID" || isFuturesDca ? "linear" : "spot";
+  const isFuturesMarket = isShort || kind === "FUTURES_GRID" || isFuturesDca || isHedgeKind;
+  const marketType: "spot" | "linear" = isFuturesMarket || leverage > 1 ? "linear" : "spot";
+  const category: "spot" | "linear" = isFuturesMarket ? "linear" : "spot";
 
   /* ---- Faz 19 (UIX-11): Lab'den taşınan config'i tek seferlik prefill ---- */
   useEffect(() => {
@@ -407,6 +408,7 @@ export function Wizard({ onCreated }: WizardProps) {
             taker_fee: instrument ? String(fracToNum(instrument.taker_fee_rate) ?? 0.001) : "0.001",
             leverage: String(leverage),
             market: marketType,
+            direction: isShort ? "short" : "long",
           });
           if (calcSeq.current === mySeq) setCalcDca(r);
           setCalcGrid(null);

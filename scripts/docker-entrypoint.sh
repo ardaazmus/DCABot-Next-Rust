@@ -5,9 +5,31 @@ set -e
 export DCA_DB_PATH="${DCA_DB_PATH:-/app/data/dcabot.sqlite3}"
 export DCA_BYBIT_TESTNET="${DCA_BYBIT_TESTNET:-1}"
 export DCA_ALLOW_MAINNET="${DCA_ALLOW_MAINNET:-0}"
-export DCA_API_KEY="${DCA_API_KEY:-$(head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 32)}"
+
+DATA_DIR=$(dirname "$DCA_DB_PATH")
+mkdir -p "$DATA_DIR"
+
+# Persist generated API and Vault keys across container restarts
+if [ -z "$DCA_API_KEY" ]; then
+  if [ -f "$DATA_DIR/.api_key" ]; then
+    export DCA_API_KEY=$(cat "$DATA_DIR/.api_key")
+  else
+    export DCA_API_KEY=$(head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 32)
+    echo "$DCA_API_KEY" > "$DATA_DIR/.api_key"
+    chmod 600 "$DATA_DIR/.api_key" 2>/dev/null || true
+  fi
+fi
 export ENGINE_API_KEY="${ENGINE_API_KEY:-$DCA_API_KEY}"
-export DCA_VAULT_KEY="${DCA_VAULT_KEY:-$(head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 32)}"
+
+if [ -z "$DCA_VAULT_KEY" ]; then
+  if [ -f "$DATA_DIR/.vault_key" ]; then
+    export DCA_VAULT_KEY=$(cat "$DATA_DIR/.vault_key")
+  else
+    export DCA_VAULT_KEY=$(head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 32)
+    echo "$DCA_VAULT_KEY" > "$DATA_DIR/.vault_key"
+    chmod 600 "$DATA_DIR/.vault_key" 2>/dev/null || true
+  fi
+fi
 
 echo "=================================================="
 echo " Starting DCABOT Quantitative Production Runtime  "

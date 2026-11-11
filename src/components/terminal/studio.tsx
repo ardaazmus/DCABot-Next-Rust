@@ -331,7 +331,7 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
     const anchor = anchorNum !== null && anchorNum > 0 ? String(anchorNum) : avgNum !== null && avgNum > 0 ? String(avgNum) : null;
     const sl = cfg.stop_loss_pct;
     if (!anchor || !sl) return;
-    const isFutures = cfg.kind.includes("FUTURES");
+    const isFutures = cfg.kind.includes("FUTURES") || cfg.kind === "DCA_SHORT" || cfg.kind.includes("HEDGE") || Number(cfg.leverage) > 1;
     const category = isFutures ? "linear" : "spot";
     // Mikro-yapi BORSADAN gelir (sabit degil): enstruman yoksa kategori fallback'i.
     apiMarkets(category, bot.symbol)
@@ -357,6 +357,7 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
           taker_fee: micro.takerFee,
           leverage: cfg.leverage ?? "1",
           market: category,
+          direction: cfg.kind === "DCA_SHORT" ? "short" : "long",
         });
       })
       .then((r) => {

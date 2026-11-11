@@ -319,6 +319,7 @@ function DcaCalc({
   const [sl, setSl] = useState(3);
   const [slOn, setSlOn] = useState(true);
   const [leverage, setLeverage] = useState(1);
+  const [direction, setDirection] = useState<"long" | "short">("long");
   const [res, setRes] = useState<CalcDcaResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -353,6 +354,7 @@ function DcaCalc({
           taker_fee: micro.takerFee,
           leverage: String(leverage),
           market,
+          direction,
         });
         setRes(r);
       } catch (e) {
@@ -365,7 +367,7 @@ function DcaCalc({
     return () => {
       if (timer.current) clearTimeout(timer.current);
     };
-  }, [anchor, base, safety, deviation, stepScale, volumeScale, maxSafety, tp, netTp, sl, slOn, leverage, market, micro]);
+  }, [anchor, base, safety, deviation, stepScale, volumeScale, maxSafety, tp, netTp, sl, slOn, leverage, market, direction, micro]);
 
   const m20From = res?.m20.firstUnreachableLevel ?? null;
 
@@ -413,6 +415,30 @@ function DcaCalc({
               LINEAR
             </button>
           </div>
+          {market === "linear" && (
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setDirection("long")}
+                className={cn(
+                  "flex-1 rounded-lg border px-2 py-1.5 text-[11px] font-bold",
+                  direction === "long" ? "border-emerald-500/60 bg-emerald-500/10 text-emerald-300" : "border-border text-slate-500"
+                )}
+              >
+                LONG
+              </button>
+              <button
+                type="button"
+                onClick={() => setDirection("short")}
+                className={cn(
+                  "flex-1 rounded-lg border px-2 py-1.5 text-[11px] font-bold",
+                  direction === "short" ? "border-rose-500/60 bg-rose-500/10 text-rose-300" : "border-border text-slate-500"
+                )}
+              >
+                SHORT
+              </button>
+            </div>
+          )}
           {market === "linear" && <SlideField label="Kaldıraç" value={leverage} min={1} max={50} step={1} fmt={(v) => `${v}x`} onChange={(v) => setLeverage(Math.round(v))} />}
         </div>
       </Panel>

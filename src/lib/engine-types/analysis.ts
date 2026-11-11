@@ -22,6 +22,7 @@ export interface CalcDcaRequest {
   taker_fee: string;
   leverage: string;
   market: "spot" | "linear";
+  direction?: "long" | "short";
 }
 
 export interface CalcDcaResult {
