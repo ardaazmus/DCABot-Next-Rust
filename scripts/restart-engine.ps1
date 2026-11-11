@@ -27,6 +27,7 @@ if ($old) {
 
 $env:DCA_DB_PATH = Join-Path $runtimeDirectory 'paper.sqlite3'
 $env:DCA_BYBIT_TESTNET = '1'
+$env:DCA_OKX_DEMO = '1'
 $env:RUST_LOG = 'info'
 $env:NEXT_TELEMETRY_DISABLED = '1'
 

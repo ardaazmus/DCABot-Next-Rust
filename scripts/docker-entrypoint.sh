@@ -4,6 +4,7 @@ set -e
 # Default environment variables
 export DCA_DB_PATH="${DCA_DB_PATH:-/app/data/dcabot.sqlite3}"
 export DCA_BYBIT_TESTNET="${DCA_BYBIT_TESTNET:-1}"
+export DCA_OKX_DEMO="${DCA_OKX_DEMO:-1}"
 export DCA_ALLOW_MAINNET="${DCA_ALLOW_MAINNET:-0}"
 
 DATA_DIR=$(dirname "$DCA_DB_PATH")
