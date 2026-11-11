@@ -438,6 +438,8 @@ impl DcaEngine {
             return acts;
         }
         let base_seq = self.next_seq();
+        self.funding_deal = Fraction::zero();
+        self.deal_fees = Fraction::zero();
         acts.push(Action::PlaceMarket {
             id: order_id(&self.bot_id, "BASE", base_seq),
             side: if self.direction == Direction::Long { dca_math::Side::Buy } else { dca_math::Side::Sell },
@@ -488,13 +490,10 @@ impl DcaEngine {
             }
         }
         // Task 16 (spec 2.8): ilk N güvenlik emrini tahtaya yaz (single-active yerine).
-        // Faz 17: yeni deal — deal-bazlı funding sıfırlanır (P1-5), yerleştirme
-        // imleci N'e ayarlanır (P1-16: top-up L(N+1)'den devam eder, çift yok).
-        // Faz 18 (P1-2): deal-bazlı komisyon defteri de yeni deal'da sıfırlanır.
+        // Faz 17: yerleştirme imleci N'e ayarlanır (P1-16: top-up L(N+1)'den devam eder, çift yok).
+        // Faz 18/Audit 1.7: deal_fees ve funding_deal try_open_deal'da sıfırlanır, on_fill'den gelen base fee korunur.
         // Faz 19 (P1-4): yeni deal önceki deal'in dinlenen TP'sini taşımaz —
         // eski emir rölanti tahtada kalmasın diye iptal niyeti yayılır.
-        self.funding_deal = Fraction::zero();
-        self.deal_fees = Fraction::zero();
         if let Some(rt) = self.resting_tp.take() {
             acts.push(Action::CancelResting { id: rt.order_id });
         }

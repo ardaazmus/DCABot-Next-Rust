@@ -32,6 +32,7 @@ async function gotoApp(page, path = "/") {
       { timeout: 60_000 },
     )
     .catch(() => {}); // rozet yoksa test beklentileri yine de çalışır
+  await page.waitForSelector("text=CORE v", { timeout: 30_000 }).catch(() => {});
   await page.waitForTimeout(500);
 }
 
@@ -41,6 +42,10 @@ test("kokpit: KPI kartları + bot listesi + footer durumu", async ({ page }) => 
   await gotoApp(page);
   await expect(page.getByText("TOPLAM ÖZKAYNAK", { exact: false })).toBeVisible({ timeout: 20000 });
   await expect(page.getByText(/bot filosu/i).first()).toBeVisible();
+  const newsToggle = page.getByText(/Piyasa Nabzı & Kaynak Durumu/i);
+  if (await newsToggle.isVisible().catch(() => false)) {
+    await newsToggle.click();
+  }
   await expect(page.getByText("Borsa Duyuruları")).toBeVisible();
   await expect(page.locator("footer")).toContainText("KORUMA:");
 });
