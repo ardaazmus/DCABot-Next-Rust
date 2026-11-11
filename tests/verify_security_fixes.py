@@ -13,6 +13,29 @@ import re
 import urllib.request
 import urllib.error
 import sys
+from urllib.parse import urlparse
+
+# Faz 26: Mimosa SSRF taraması bu dosyadaki urlopen çağrılarını işaretliyordu.
+# Bu betik BİR GÜVENLİK DOĞRULAMA ARACIDIR: hedefler bilerek loopback'tir
+# (motorun 127.0.0.1:3002). Yine de tek yardımcı üzerinden şema/host
+# allowlist'i zorluyoruz — aynı zamanda SSRF dedektörüne "hedef kısıtlı"
+# sinyali verir.
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost"}
+_LOOPBACK_BASE = "http://127.0.0.1:3002"
+
+
+def _check_loopback(url: str) -> str:
+    u = urlparse(url)
+    if u.scheme != "http" or u.hostname not in _LOOPBACK_HOSTS:
+        raise ValueError(f"test yalnız loopback hedefi kabul eder: {url}")
+    return url
+
+
+def open_loopback(req_or_url, timeout: int = 3):
+    """urlopen wrapper: hedefi loopback allowlist'ine zorlar (SSRF kapısı)."""
+    url = req_or_url.full_url if isinstance(req_or_url, urllib.request.Request) else req_or_url
+    _check_loopback(url)
+    return urllib.request.urlopen(req_or_url, timeout=timeout)  # loopback doğrulandı — bilinçli
 
 API_KEY = os.environ.get("DCA_API_KEY", "")
 if not API_KEY and os.path.exists(".local-runtime/local-keys.env"):
@@ -40,7 +63,7 @@ def check(name, ok, msg=""):
 # 1. SEC-FIND-03: /api/stream without auth
 try:
     req = urllib.request.Request("http://127.0.0.1:3002/api/stream")
-    with urllib.request.urlopen(req, timeout=3) as resp:
+    with open_loopback(req, timeout=3) as resp:
         check("SSE unauthenticated blocked", False, f"status was {resp.status}")
 except urllib.error.HTTPError as e:
     check("SSE unauthenticated blocked", e.code == 401, f"HTTP {e.code}")
@@ -51,7 +74,7 @@ except Exception as e:
 try:
     req = urllib.request.Request("http://127.0.0.1:3002/api/stream")
     req.add_header("Authorization", f"Bearer {API_KEY}")
-    with urllib.request.urlopen(req, timeout=3) as resp:
+    with open_loopback(req, timeout=3) as resp:
         ct = resp.headers.get("Content-Type", "")
         check("SSE Bearer auth accepted", resp.status == 200 and "text/event-stream" in ct, f"status {resp.status}, ct: {ct}")
 except Exception as e:
@@ -60,7 +83,7 @@ except Exception as e:
 # 3. SEC-FIND-03: /api/stream with token query param
 try:
     req = urllib.request.Request(f"http://127.0.0.1:3002/api/stream?token={API_KEY}")
-    with urllib.request.urlopen(req, timeout=3) as resp:
+    with open_loopback(req, timeout=3) as resp:
         ct = resp.headers.get("Content-Type", "")
         check("SSE query token auth accepted", resp.status == 200 and "text/event-stream" in ct, f"status {resp.status}, ct: {ct}")
 except Exception as e:
@@ -81,7 +104,7 @@ try:
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"},
         method="POST"
     )
-    with urllib.request.urlopen(req, timeout=5) as resp:
+    with open_loopback(req, timeout=5) as resp:
         check("SSRF metadata block", False, f"unexpected success {resp.status}")
 except urllib.error.HTTPError as e:
     check("SSRF metadata block", e.code == 400, f"HTTP {e.code}")
@@ -103,7 +126,7 @@ try:
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"},
         method="POST"
     )
-    with urllib.request.urlopen(req, timeout=5) as resp:
+    with open_loopback(req, timeout=5) as resp:
         check("SSRF localhost block", False, f"unexpected success {resp.status}")
 except urllib.error.HTTPError as e:
     check("SSRF localhost block", e.code == 400, f"HTTP {e.code}")
@@ -125,7 +148,7 @@ try:
         headers={"Content-Type": "application/json"},
         method="POST"
     )
-    with urllib.request.urlopen(req, timeout=5) as resp:
+    with open_loopback(req, timeout=5) as resp:
         check("Webhook oversized payload block", False, f"unexpected success {resp.status}")
 except urllib.error.HTTPError as e:
     check("Webhook oversized payload block", e.code == 413, f"HTTP {e.code}")
@@ -135,7 +158,7 @@ except Exception as e:
 # 7. Next.js /api/health
 try:
     req = urllib.request.Request("http://127.0.0.1:3000/api/health")
-    with urllib.request.urlopen(req, timeout=5) as resp:
+    with open_loopback(req, timeout=5) as resp:
         data = json.loads(resp.read().decode("utf-8"))
         check("Next.js /api/health proxy", resp.status == 200 and data.get("service") == "dca-core", f"HTTP {resp.status}, service: {data.get('service')}")
 except Exception as e:
