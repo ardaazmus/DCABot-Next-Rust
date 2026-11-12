@@ -6,7 +6,10 @@
 # ==========================================
 
 # --- Stage 1: Rust Engine ---
-FROM rust:1.85-slim-bookworm AS rust-builder
+# Faz 28 (CI-kanıt): rust:1.85'te uuid 1.28 (rustc >= 1.89) ve icu 2.x
+# (>= 1.88) derlenemez — builder, workspace'in derlendiği güncel stable'ı
+# izler. "slim-bookworm" sürüm etiketi güncel stable rust'a gider.
+FROM rust:slim-bookworm AS rust-builder
 WORKDIR /build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
