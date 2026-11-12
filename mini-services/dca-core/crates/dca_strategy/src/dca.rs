@@ -587,7 +587,11 @@ impl DcaEngine {
     /// Dynamic config patch (TP/SL/trailing) on active deal.
     pub fn patch(&mut self, target_profit_pct: Option<String>, stop_loss_pct: Option<Option<String>>, trailing_enabled: Option<bool>) -> Result<(), String> {
         if let Some(tp) = target_profit_pct {
-            if Fraction::from_decimal_str(&tp).map_err(|e| e.to_string())?.is_zero() {
+            // Faz 26 (KAPSAMLI_DENETİM P2): yalnız sıfır değil NEGATİF de reddi —
+            // create akışı 422 verirken patch yolu "-0.02" TP'yi kabul edip
+            // compute_tp'ye ters-hedef yolluyordu (asla tetiklenmeyen TP).
+            let tp_f = Fraction::from_decimal_str(&tp).map_err(|e| e.to_string())?;
+            if !tp_f.is_positive() {
                 return Err("TP must be > 0".into());
             }
             self.cfg.target_profit_pct = tp;

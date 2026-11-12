@@ -868,9 +868,19 @@ check("tvw-create-201", s == 201, f"status={s} body={str(j)[:120]}")
 tw_id = j.get("id") if s == 201 else None
 tw_secret = None
 if tw_id:
+    # Faz 26 (KAPSAMLI_DENETİM): SEC-05 sözleşmesi — webhookSecret bot detay
+    # yanıtında ARTIK YOK (kasıtlı güvenlik sertleştirmesi; eski test buna
+    # bağımlıydı). Doğru yol: yetkili PATCH ile ÇALIŞMA BAŞINA RASTGELE
+    # degere rotasyon (sabit kodlanmış secret yazmıyoruz — Mimosa kuralı).
+    import secrets as _secrets
+    tw_secret = "tvw_" + _secrets.token_hex(16)
     s, j = req("GET", f"/api/bots/{tw_id}")
-    tw_secret = (j or {}).get("webhookSecret")
-    check("tvw-secret-exposed", bool(tw_secret) and str(tw_secret).startswith("tvw_"), f"secret={str(tw_secret)[:12]}...")
+    check("tvw-secret-hidden", not (j or {}).get("webhookSecret"),
+          f"SEC-05: secret yanitta olmamali (got={str((j or {}).get('webhookSecret'))[:12]})")
+    s, j = req("PATCH", f"/api/bots/{tw_id}", {"webhook_secret": tw_secret})
+    check("tvw-secret-rotate-200", s == 200, f"status={s} body={str(j)[:80]}")
+    if s != 200:
+        tw_secret = None
 
 import time as _time
 now_ms = int(_time.time() * 1000)

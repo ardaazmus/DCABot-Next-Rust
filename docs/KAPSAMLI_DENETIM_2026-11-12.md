@@ -209,3 +209,74 @@ Bu denetim turunda, Arena bağımsız denetiminde tespit edilen ve statik/dinami
 ## 5. GENEL HÜKÜM
 
 Arena denetiminde dile getirilen tüm P0 ve P1 kusurları kaynak kodda giderilmiş, matematiksel olarak doğrulanmış ve 308 Rust birim testi, 10 regresyon testi, 25 sözleşme testi, 10 strateji matrisi testi ve 5 Playwright UI testi ile sıfır hata toleransıyla teyit edilmiştir. Sistem artık hem motor hem de ürün katmanında üretime ve testnet/canlı simülasyona hazırdır.
+
+---
+
+## 6. İKİNCİ TUR — BAĞIMSIZ DOĞRULAMA + YENİ BULGULAR (aynı gün, bağımsız oturum)
+
+Bu bölüm ilk turdan **bağımsız** olarak koşuldu; test sayıları ve bulgular
+bu turun kendi kanıtıdır.
+
+### 6.1 Çalıştırılan Testler (ikinci tur)
+
+| Süit | Sonuç | Geçti/Başarısız |
+|---|---|---|
+| cargo test --workspace --locked | **323 test PASS** | 323/323 |
+| ↳ finance_math_verification.rs (YENİ, bu tur) | PASS | 5/5 |
+| npx tsc --noEmit / eslint --quiet | temiz | ✓ |
+| Playwright smoke (5 ekran, tr-TR) | PASS | 5/5 (14.6s) |
+| engine_contract.mjs | PASS | 25/25 |
+| bot-matrix.mjs (canlı barlar) | PASS | 10/10 |
+| e2e_engine.py (160) | 142 PASS / 18 FAIL | triaj §6.3 |
+| npm run build + standalone :3100 sim. | 200 + proxy 200 | ✓ |
+
+### 6.2 Finans Matematiği Kanıtları (finance_math_verification.rs — yeni)
+
+1. **Fraction Display ↔ from_decimal_str round-trip**: 7 değer + serde JSON
+   zinciri — değer kaybı YOK (snapshot kalıcılık sözleşmesi kanıtlı).
+2. **gap_batch ".m{n}" sayımı**: konsolide dolum filled_safety'yi [+2,+3]
+   aralığında artırıyor — tek-sayım (kademe kaybı) ve çift-sayım YOK.
+3. **geometric_mesh + tick_down çakışması**: dar aralıkta (100–100.001,
+   tick 0.01) çakışan seviye üretiliyor; fee-breaker ihlal döndürüyor,
+   panik/zero-div YOK.
+4. **build_dca_plan monotonluğu**: 3 tick/step kombinasyonu — merdiven
+   monotonik veya dürüst Err.
+
+### 6.3 E2E 18 Başarısızlık — Kök Nelen Triaşı (canlı repro ile)
+
+- **Küme A (16): 1h-interval zamanlama kırılganlığı.** Canlı repro (bu tur):
+  1m interval INSTANT bot → deal **anında açıldı** (BasePending + "base order
+  dispatched" olayı, bot silindi). E2E 1h interval; kapalı-bar kapisi bir
+  sonraki tam saate kadar bekletiyor, SSE 90 sn'te asıyor → bot-deal-open,
+  sse-lifecycle, fdca-*, sc-met-*, hedge-* hepsi aynı kökten basamaklı.
+  **Finansal hata değil.** Öneri: e2e yaşam döngüsü senaryoları 1m'a taşınmalı.
+- **Küme B (2): bayat beklenti.** `tvw-secret-exposed` — SEC-05 secret'ı API
+  yanıtından kasıtlı kaldırdı. **Düzeltildi (bu tur):** test artık PATCH
+  rotasyonuyla çalışma-başına **rastgele** secret (kodda sabit yok — Mimosa
+  yüksek-risk önendi) doğruluyor; `tvw-expired-400` de secret'a kavuşunca düzelir.
+
+### 6.4 Bu Turun Yeni Bulgu ve Düzeltmeleri
+
+**BULGU-A [P1] ADD_FUNDS negatif tutar — nakit düşürme**
+- [Dosya/Satır] main.rs ADD_FUNDS PAPER kolu + LIVE pre-flow
+- [Etki] `"-100"` parse ediliyordu: PAPER'da `cash.add(-100)` → nakit DÜŞER
+  (ters para çekme); LIVE'da negatif qty_down tanımsız.
+- [Düzeltme] İki yola da `!quote.is_positive() → 422` eklendi.
+- [Test sınırı] engine_contract'e negatif ADD_FUNDS 422 kontrolü önerildi.
+
+**BULGU-B [P2] patch_bot negatif TP kabulü**
+- [Dosya/Satır] dca.rs `DcaEngine::patch` (TP kolu)
+- [Etki] create 422 verirken patch `"-0.02"` kabul edip compute_tp'ye
+  ters-hedef yolluyordu (asla tetiklenmeyen TP).
+- [Düzeltme] `!tp_f.is_positive() → Err`.
+
+**BULGU-C [test dürüstlüğü] e2e webhook secret sabiti** — Mimosa yüksek-risk
+önendi; `secrets.token_hex(16)` rotasyonuyla değiştirildi.
+
+### 6.5 P0 hedef taraması (görev listesi — kaynakta doğrulandı)
+
+SAFETY iptal (dca.rs:958 wildcard, tüm çıkış yolları) · OKX posSide
+(resolve_okx_pos_side + test) · mainnet panic kapıları · GATE4 look-ahead +
+FUTURE_BAR_SKIP · likidasyon tek-fill + execId dedup · hedge ayrı-kernel ·
+patch sonrası cache tazeleme · proxy.ts traversal/CSRF/allowlist ·
+auth-session HMAC+timingSafeEqual — **hepsi sağlam, mevcut testlerle kilitli.**

@@ -2062,6 +2062,10 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
             let plan = if rt.mode == "LIVE" {
                 let amount = req.amount.clone().ok_or_else(|| err422("amount required"))?;
                 let quote = Fraction::from_decimal_str(&amount).map_err(|e| err422(e))?;
+                // Faz 26 (KAPSAMLI_DENETİM P1): pozitiflik değişmezi — LIVE yolu.
+                if !quote.is_positive() {
+                    return Err(err422("ADD_FUNDS amount must be > 0"));
+                }
                 let mark_v = mark.clone().ok_or_else(|| err422("no mark price yet"))?;
                 let qty = dca_math::m02::qty_down(&quote.div(&mark_v).map_err(|e| err422(e.to_string()))?, &rt.stepper.instrument.step_size)
                     .map_err(|e| err422(e.to_string()))?;
@@ -2194,6 +2198,13 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
         "ADD_FUNDS" => {
             let amount = req.amount.clone().ok_or_else(|| err422("amount required"))?;
             let quote = Fraction::from_decimal_str(&amount).map_err(|e| err422(e))?;
+            // Faz 26 (KAPSAMLI_DENETİM P1): negatif/sıfır tutar reddi — eski
+            // kod yalnız parse ediyordu; "-100" PAPER'da NAHİT DÜŞÜRÜYORDU
+            // (tersine çevrilmiş para çekme), LIVE pre-flow'da qty_down
+            // negatifte tanımsızdı. Fiziksel değişmez: yalnız pozitif ekleme.
+            if !quote.is_positive() {
+                return Err(err422("ADD_FUNDS amount must be > 0"));
+            }
             let _mark = rt
                 .stepper
                 .last_close
