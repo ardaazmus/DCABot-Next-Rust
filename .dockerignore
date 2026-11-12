@@ -1,0 +1,36 @@
+# Faz 28 (P2-2 — bağımsız denetim): build bağlamını küçült + sızdırma yüzeyini kapat.
+# COPY . . hiçbir .env / yerel-anahtar dosyasını builder katmanına taşımasın.
+.git
+.gitignore
+.github
+.claude
+.zcode
+.idea
+.vscode
+
+# Derleme artefaktları — bağlama girmez (target GB'larca olabilir)
+mini-services/dca-core/target
+mini-services/dca-core/**/*.old
+node_modules
+.next
+out
+coverage
+dist
+
+# Sır / yerel çalışma dosyaları
+.env
+.env.*
+!.env.example
+.local-runtime
+*.log
+logs
+
+# Döküman/test bağlamı imaja girmez (build gerektirmez)
+docs
+tests
+*.md
+!README.md
+
+# OS/araç çöpleri
+Thumbs.db
+.DS_Store

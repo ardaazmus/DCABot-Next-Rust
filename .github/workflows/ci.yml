@@ -54,3 +54,34 @@ jobs:
         run: npx tsc --noEmit --incremental false
       - name: eslint
         run: npx eslint src --quiet
+
+  # Faz 28 (P1-8 — bağımsız denetim): P0-1 compose hardening + P1-5/6 Docker
+  # değişiklikleri CI'da kanıtla — imaj DERLEBİLİR ve koşum dosyaları non-root
+  # kullanıcıya ait olmalı. Build süresi uzun olduğundan bu job koşullu
+  # çalışır: Dockerfile/.dockerignore/compose/entrypoint değiştiğinde.
+  docker:
+    name: Docker image + npm audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            docker:
+              - 'Dockerfile'
+              - '.dockerignore'
+              - 'docker-compose.yml'
+              - 'scripts/docker-entrypoint.sh'
+      - name: npm audit (prod deps, high+)
+        if: ${{ steps.changes.outputs.docker == 'true' }}
+        run: npm audit --omit=dev --audit-level=high
+      - name: docker build (multi-stage kanıt)
+        if: ${{ steps.changes.outputs.docker == 'true' }}
+        run: docker build -t dcabot:ci .
+      - name: runner non-root doğrulaması
+        if: ${{ steps.changes.outputs.docker == 'true' }}
+        run: |
+          ID=$(docker run --rm --entrypoint id dcabot:ci)
+          echo "$ID"
+          echo "$ID" | grep -q "uid=10001(dca)" || { echo "::error::runner root olarak koşuyor — P1-6 regresyonu"; exit 1; }

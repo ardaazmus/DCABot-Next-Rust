@@ -1,5 +1,18 @@
 version: "3.8"
 
+# Faz 28 (P0-1 hardening — bağımsız denetim §3 P0-1):
+#  - Sabit secret fallback'leri KALDIRILDI: DCA_API_KEY / DCA_VAULT_KEY host
+#    env'inden gelir; boşsa entrypoint rastgele üretip /app/data'da kalıcılar.
+#    (Eski sabit değerler env'i "dolu" gösterdiği için rastgele üretim yolu
+#    hiç devreye girmiyordu.)
+#  - Port yalnız loopback'e bağlanır: "127.0.0.1:3000:3000". Dış erişim
+#    TLS/VPN (Cloudflare Tunnel vb.) arkasından verilmelidir.
+#  - DCA_REQUIRE_AUTH=1 varsayılan: UI oturum açmadan yönetim API'sine
+#    erişemez. DCA_UI_PASSWORD boşsa entrypoint rastgele üretir + log yazar.
+#  - DCA_PORTFOLIO_MAX_DAILY_LOSS_PCT KALDIRILDI: motor bu değişkeni
+#    TÜKETMİYORDU (bağımsız denetim P1-2) — aktifmiş gibi sunmak yerine
+#    gerçek portföy kesicisi ayrı iş olarak planlanır.
+
 services:
   dcabot:
     build:
@@ -9,26 +22,28 @@ services:
     container_name: dcabot-terminal
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       - NODE_ENV=production
       - DCA_DB_PATH=/app/data/dcabot.sqlite3
       - DCA_BYBIT_TESTNET=1
       - DCA_ALLOW_MAINNET=0
-      - DCA_API_KEY=${DCA_API_KEY:-dcabot_secret_key_change_me}
-      - ENGINE_API_KEY=${DCA_API_KEY:-dcabot_secret_key_change_me}
-      - DCA_VAULT_KEY=${DCA_VAULT_KEY:-dcabot_vault_master_key_32_chars_long!}
+      # Boş bırakılırsa entrypoint rastgele üretir ve /app/data içinde kalıcılar.
+      - DCA_API_KEY=${DCA_API_KEY:-}
+      - ENGINE_API_KEY=${ENGINE_API_KEY:-}
+      - DCA_VAULT_KEY=${DCA_VAULT_KEY:-}
+      # UI oturumu: auth varsayılan AÇIK; parola host env'den, boşsa rastgele.
+      - DCA_REQUIRE_AUTH=1
       - DCA_UI_PASSWORD=${DCA_UI_PASSWORD:-}
-      - DCA_REQUIRE_AUTH=${DCA_REQUIRE_AUTH:-0}
       - DCA_PORTFOLIO_MAX_NOTIONAL_PCT=85
-      - DCA_PORTFOLIO_MAX_DAILY_LOSS_PCT=10
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
       - NOTIFY_WEBHOOK_URL=${NOTIFY_WEBHOOK_URL:-}
     volumes:
       - dcabot-data:/app/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:3000/"]
+      # Faz 28 (P1-6): yalnız UI değil — motor readiness'i de denetlenir.
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:3000/ && curl -sf http://127.0.0.1:3002/api/health"]
       interval: 30s
       timeout: 5s
       retries: 3

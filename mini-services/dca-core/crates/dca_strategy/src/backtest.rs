@@ -791,6 +791,7 @@ fn dispatch_leg(
 ) -> Result<(), String> {
     let id = match &action {
         Action::PlaceLimit { id, .. } | Action::PlaceMarket { id, .. } | Action::CancelResting { id } => id.clone(),
+        Action::DealClosed { .. } => String::new(),
         Action::Log { .. } => String::new(),
     };
     if id.starts_with("bt-hedge") {
@@ -855,6 +856,9 @@ fn dispatch(stepper: &mut SimulationStepper, action: Action, ts: i64) -> Result<
                 stepper.pending.retain(|o| o.id != id);
             }
         }
+        // Faz 28 (P1-3): backtest'te deals defteri yazılmaz (kalıcılık
+        // engine/server tarafı sorumluluğu) — no-op.
+        Action::DealClosed { .. } => {}
         Action::Log { .. } => {}
     }
     Ok(())

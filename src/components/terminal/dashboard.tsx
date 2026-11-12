@@ -439,8 +439,10 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
     if (!summary) return 0;
     const realized = fracToNum(summary.totalRealizedGross) ?? 0;
     const fees = fracToNum(summary.totalFees) ?? 0;
+    // Faz 28 (P1-3): funding maliyeti ekonomik PnL'den düşülür (mevcut yoksa 0).
+    const funding = fracToNum(summary.totalFunding) ?? 0;
     const unrealized = fracToNum(summary.totalUnrealizedPnl) ?? 0;
-    return realized - fees + unrealized;
+    return realized - fees - funding + unrealized;
   }, [summary]);
 
   return (
@@ -554,6 +556,7 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
               {fmtUsdSigned(summary?.totalUnrealizedPnl ?? "0")}
             </span>{" "}
             · Komisyon <span className="num text-slate-400">{fmtUsd(summary?.totalFees, 2)}</span>
+            · Funding <span className="num text-slate-400">{fmtUsd(-(fracToNum(summary?.totalFunding) ?? 0), 2)}</span>
           </div>
         </div>
 

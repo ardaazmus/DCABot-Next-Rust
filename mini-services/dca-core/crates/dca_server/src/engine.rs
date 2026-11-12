@@ -1238,6 +1238,33 @@ pub async fn dispatch_action(
     ts: i64,
     sse: &broadcast::Sender<SseEvent>,
 ) -> Result<(), String> {
+    // Faz 28 (P0-2 — bağımsız denetim): KILL/FREEZE devredeyken fill-tepki
+    // kaskadından (on_base_filled top-up, gap_batch, TP recomputation
+    // yanları) YENİ Add emri çıkması engellenir. Eski akışta sweep fill'i
+    // işler, on_fill yeni Place aksiyonu üretir ve dispatch bunu kuyruğa
+    // alıyordu — şalter "yeni emir üretimi durur" vaadini çiğniyordu.
+    // Reduce/TP/SL koruyucu çıkışlar serbest kalır (bilinçli politika).
+    if matches!(
+        action,
+        Action::PlaceMarket { role: "BASE", .. }
+            | Action::PlaceLimit { role: "SAFETY", .. }
+            | Action::PlaceMarket { role: "SAFETY", .. }
+    ) && (app.kill_engaged().await || app.freeze_engaged().await)
+    {
+        let role_desc = match &action {
+            Action::PlaceMarket { role, .. } | Action::PlaceLimit { role, .. } => *role,
+            _ => "?",
+        };
+        let msg = format!(
+            "KILL/FREEZE devrede — fill-sonrası yeni Add emri ({role_desc}) REDDEDİLDİ, kuyruğa alınmadı"
+        );
+        crate::state::persist_event(app, &rt.bot_id, "WARN", "KILL_SWITCH", &msg).await;
+        let _ = sse.send(SseEvent {
+            event: "RISK".into(),
+            data: json!({"botId": rt.bot_id, "code": "ADD_SUPPRESSED", "message": msg, "ts": crate::state::now_ms()}).to_string(),
+        });
+        return Ok(());
+    }
     // Faz 21 (N-2, KRİTİK): positionIdx emrin GİTTİĞİ bacağın yönünden
     // türetilir. Hedge bacağı (id "-hedge" önekli) ana bacağın TERSİdir;
     // eski kod her iki bacak için de ana bacağın yönünü kullanıyordu —
@@ -1255,6 +1282,29 @@ pub async fn dispatch_action(
         }
     };
     match action {
+        // Faz 28 (P1-3): kalıcı deals defteri — tek işlemde idempotent yazım.
+        // Send-notu: conn kiliti KISA blokta tutulur; event await'i blok
+        // DIŞINDA owned mesajla yapılır (std guard async akışa sızmasın).
+        Action::DealClosed { deal_no, opened_ts, closed_ts, gross_pnl, fees, funding, net_pnl, safety_triggered, reason } => {
+            let ledger_msg: Option<(&'static str, String)> = {
+                let conn = match app.db.conn.lock() {
+                    Ok(c) => c,
+                    Err(e) => return Err(e.to_string()),
+                };
+                let inserted = conn.execute(
+                    "INSERT OR IGNORE INTO deals(bot_id, deal_no, opened_ts, closed_ts, gross_pnl, fees, funding, net_pnl, safety_triggered, status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'CLOSED')",
+                    rusqlite::params![rt.bot_id, deal_no as i64, opened_ts, closed_ts, gross_pnl, fees, funding, net_pnl, safety_triggered as i64],
+                );
+                match inserted {
+                    Ok(n) if n > 0 => Some(("INFO", format!("deal #{} kalıcı deftere yazıldı (net {}, {})", deal_no, net_pnl, reason))),
+                    Ok(_) => None, // duplicate — idempotent yoksayma
+                    Err(e) => Some(("CRITICAL", format!("deal defter yazımı başarısız (deal #{}): {e} — muhasebe mutabakatı gerekli", deal_no))),
+                }
+            };
+            if let Some((level, msg)) = ledger_msg {
+                crate::state::persist_event(app, &rt.bot_id, level, "DEAL_LEDGER", &msg).await;
+            }
+        }
         Action::PlaceLimit { id, side, price, qty, role } => {
             // Faz 19 (P1-4): TP de resting reduce-only limit — GRID_CLOSE ile
             // aynı kapanış muafiyetleri (GATE6 yok, reduce_only, positionIdx
@@ -1270,25 +1320,41 @@ pub async fn dispatch_action(
                 if cap > 0 {
                     // Kilit-siz cache okuması — runtimes kilidi bu noktada
                     // ZATEN çağırıcıda; tekrar istemek deadlock üretir.
-                    if let Some((nav, gross)) = crate::fleet::portfolio_cache_read(app, 30_000) {
-                        let candidate = price.mul(&qty).unwrap_or_else(|_| Fraction::zero());
-                        if crate::fleet::portfolio_cap_exceeded(&gross, &candidate, &nav, cap) {
-                            let msg = format!(
-                                "PORTFOLIO CAP: {} emri yerlestirilmedi — acik brut notional + aday {} NAV'in %{} sinirini asar (su anki brut/NAV agirligi asildi). Emir yok; seviye sonraki barda yeniden degerlendirilir. Esigi yukseltmek icin DCA_PORTFOLIO_MAX_NOTIONAL_PCT.",
-                                role,
-                                candidate,
-                                cap
-                            );
-                            crate::state::persist_event(app, &rt.bot_id, "WARN", "", &msg).await;
-                            let _ = sse.send(SseEvent {
-                                event: "LOG".into(),
-                                data: json!({"botId": rt.bot_id, "level": "WARN", "message": msg, "ts": ts}).to_string(),
-                            });
-                            return Ok(());
+                    // Faz 28 (P1-1 — bağımsız denetim): kapı artık FAIL-CLOSED.
+                    // Bayat cache, NAV <= 0 veya hesap hatasında emir reddedilir
+                    // (eski davranış "kapı bu turu atlar" = fail-open'dı). NAV
+                    // pozitifse standart eşik karşılaştırması uygulanır; exposure
+                    // hesabı artık LIVE açık Add emir rezervlerini de kapsar
+                    // (fleet.rs refresh_portfolio_cache).
+                    let cap_gate = crate::fleet::portfolio_cache_read(app, 30_000);
+                    let blocked = match cap_gate {
+                        None => true, // bayat/erisilemez cache → fail-closed
+                        Some((nav, gross)) => {
+                            if !nav.is_positive() {
+                                true // NAV ölçülemez → fail-closed
+                            } else {
+                                let candidate = price.mul(&qty).unwrap_or_else(|_| Fraction::zero());
+                                let exceeded = crate::fleet::portfolio_cap_exceeded(&gross, &candidate, &nav, cap);
+                                if !exceeded {
+                                    crate::fleet::portfolio_cache_add_candidate(app, &candidate);
+                                }
+                                exceeded
+                            }
                         }
-                        crate::fleet::portfolio_cache_add_candidate(app, &candidate);
+                    };
+                    if blocked {
+                        let msg = format!(
+                            "PORTFOLIO CAP (fail-closed): {} emri yerlestirilmedi — cache bayat, NAV olculemez veya acik brut notional + aday, NAV'in %{} sinirini asti. Emir yok; seviye sonraki barda yeniden degerlendirilir. Esigi yukseltmek icin DCA_PORTFOLIO_MAX_NOTIONAL_PCT.",
+                            role,
+                            cap
+                        );
+                        crate::state::persist_event(app, &rt.bot_id, "WARN", "", &msg).await;
+                        let _ = sse.send(SseEvent {
+                            event: "LOG".into(),
+                            data: json!({"botId": rt.bot_id, "level": "WARN", "message": msg, "ts": ts}).to_string(),
+                        });
+                        return Ok(());
                     }
-                    // taze değilse: kapı bu turu atlar (fail-open)
                 }
             }
             match rt.mode.as_str() {

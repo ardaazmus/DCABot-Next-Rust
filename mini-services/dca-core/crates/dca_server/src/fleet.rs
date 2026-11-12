@@ -511,6 +511,18 @@ pub fn refresh_portfolio_cache(app: &crate::state::AppState, rts: &HashMap<Strin
                 }
             }
         }
+
+        // Faz 28 (P1-1 — bağımsız denetim): LIVE AÇIK EMİR rezervleri —
+        // borsada bekleyen Add emirleri de potansiyel pozisyondur; eski
+        // hesap yalnız kernel pending'e bakınca LIVE onaylı emirleri eksik
+        // sayıyordu. Emir defteri ID bazlı olduğundan kernel-pending ile
+        // çift sayım yok (bir emir ya pending'dir ya venue'da).
+        for o in &rt.live_open_orders {
+            if o.kind == dca_kernel::OrderKind::Add {
+                let res_notional = o.qty.mul(&o.price).unwrap_or_else(|_| Fraction::zero());
+                gross = gross.add(&res_notional).unwrap_or_else(|_| gross.clone());
+            }
+        }
     }
 
     let nav = if has_runtime_bots && runtime_equity_sum.is_positive() {

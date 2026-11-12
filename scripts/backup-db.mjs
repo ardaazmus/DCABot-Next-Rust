@@ -1,7 +1,19 @@
 #!/usr/bin/env node
+/**
+ * Faz 28 (P1-7 — bağımsız denetim): SQLite yedekleme — WAL-tutarlı.
+ *
+ * ESKİ DURUM: copyFileSync ile canlı WAL-mod DB'nin ana dosyası kopyalanıyordu
+ * — aktif yazım ortasında yırtık/tutarsız snapshot üretebiliyordu (ANA + WAL
+ * ayrı kopyalanır; aradaki yazım anlık görüntüde kaybolur).
+ *
+ * YENİ DURUM: node:sqlite (Node >= 22.5) ile `VACUUM INTO` — motorun
+ * işaretlediği tutarlı anlık görüntü, tek dosya, WAL/SHM yok. node:sqlite
+ * yoksa (eski Node) davranış eskisi gibi kopya + açık uyarı.
+ *
+ * Retention: son 7 gün korunur.
+ */
 import fs from "node:fs";
 import path from "node:path";
-import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -9,7 +21,7 @@ const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, "..");
 
 const dbPath = process.env.DCA_DB_PATH || path.join(rootDir, ".local-runtime", "paper.sqlite3");
-const backupDir = path.join(rootDir, "backups");
+const backupDir = process.env.DCA_BACKUP_DIR || path.join(rootDir, "backups");
 
 console.log(`[backup] Starting database backup routine for: ${dbPath}`);
 
@@ -26,19 +38,31 @@ const timestamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDa
 const backupFile = path.join(backupDir, `dcabot_backup_${timestamp}.sqlite3`);
 
 try {
-  // 1. Copy database snapshot
-  fs.copyFileSync(dbPath, backupFile);
-  const walPath = `${dbPath}-wal`;
-  if (fs.existsSync(walPath)) {
-    fs.copyFileSync(walPath, `${backupFile}-wal`);
-  }
-  const shmPath = `${dbPath}-shm`;
-  if (fs.existsSync(shmPath)) {
-    fs.copyFileSync(shmPath, `${backupFile}-shm`);
+  // 1. Tutarlı anlık görüntü — node:sqlite VACUUM INTO (tutarlı + sıkıştırır).
+  let usedVacuum = false;
+  try {
+    const { DatabaseSync } = await import("node:sqlite");
+    const src = new DatabaseSync(dbPath, { readOnly: true });
+    // VACUUM INTO: kaynak DB'nin transaction-anlık görüntüsünden bağımsız,
+    // kendi kendine yeterli tek dosya üretir (WAL da dahil). Yol SQL string
+    // literal'i — tek tırnak, içtekiler kaçırılır.
+    const lit = `'${backupFile.replace(/\\/g, "/").replace(/'/g, "''")}'`;
+    src.exec(`VACUUM INTO ${lit}`);
+    src.close();
+    usedVacuum = true;
+  } catch (err) {
+    // node:sqlite yok / açılamadı (eski Node veya DB kilitli) → eski yolla
+    // kopyala; uyarıyı SAHTELEMEK yok — log açıkça "tutarlı değil" der.
+    console.warn(`[backup] WARN: VACUUM INTO kullanılamadı (${err.message}) — ham kopya DEVAM EDİYOR; bu kopya canlı yazım anında tutarsız olabilir.`);
+    fs.copyFileSync(dbPath, backupFile);
+    for (const suffix of ["-wal", "-shm"]) {
+      const side = `${dbPath}${suffix}`;
+      if (fs.existsSync(side)) fs.copyFileSync(side, `${backupFile}${suffix}`);
+    }
   }
 
   const stat = fs.statSync(backupFile);
-  console.log(`[backup] Snapshot created: ${backupFile} (${stat.size} bytes)`);
+  console.log(`[backup] Snapshot created: ${backupFile} (${stat.size} bytes, mode=${usedVacuum ? "vacuum-into (tutarlı)" : "raw-copy (riskli)"})`);
 
   // 2. Retention: Keep last 7 days of backups
   const maxAgeMs = 7 * 24 * 60 * 60 * 1000;

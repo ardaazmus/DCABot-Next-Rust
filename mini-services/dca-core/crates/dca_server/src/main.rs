@@ -41,6 +41,7 @@ use crate::routes_common::{err403, err404, err422, fill_marks_json, is_blacklist
 use state::{AppState, SseEvent};
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
@@ -254,14 +255,34 @@ async fn main() {
         .route("/api/vault/keys/:id", delete(remove_key))
         // SEC-01: kimlik doğrulama middleware'i (yönetim routes'ları).
         .route_layer(middleware::from_fn_with_state(api_key_clone, auth_middleware))
-        // SEC-04: rate limiting (100 istek / 10 sn, burst 20).
+        // SEC-04: rate limiting — 400 istek / 10 sn per istemci (P2-1).
         .layer(
             middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
                 let limiter = rate_limiter.clone();
                 async move {
+                    // Faz 28 (P2-1 — bağımsız denetim): per-IP bucket — eski
+                    // tek "gateway" kovası TÜM istemcileri birleştiriyordu;
+                    // yoğun bir dashboard tarayıcısı webhook/api trafiğini
+                    // boğabiliyordu. Anahtar: proxy arkasındaysa ilk XFF hop'u
+                    // (engine yalnız loopback'e bind — XFF'i Next proxy yazar;
+                    // doğrudan maruz kalmada XFF SAHTELENEBİLİR — o senaryoda
+                    // XFF güvenilir bir kimlik DEĞİLDİR), yoksa gerçek
+                    // ConnectInfo IP'si.
+                    let key = req
+                        .headers()
+                        .get("x-forwarded-for")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.split(',').next())
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_else(|| {
+                            req.extensions()
+                                .get::<axum::extract::ConnectInfo<SocketAddr>>()
+                                .map(|c| c.0.ip().to_string())
+                                .unwrap_or_else(|| "unknown".into())
+                        });
                     let allowed = {
                         let mut l = limiter.lock().await;
-                        l.check("gateway")
+                        l.check(&key)
                     };
                     if !allowed {
                         return Err(StatusCode::TOO_MANY_REQUESTS);
@@ -336,7 +357,12 @@ async fn main() {
     let shutdown_state = app_state.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3002").await.expect("bind 3002");
     tracing::info!("dca-core engine listening on :3002");
-    axum::serve(listener, app)
+    // Faz 28 (P2-1): ConnectInfo servis eder — rate limiter gerçek istemci
+    // IP'sini (XFF yoksa) okur.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
         .with_graceful_shutdown(shutdown_signal(shutdown_state))
         .await
         .unwrap();
@@ -1087,6 +1113,7 @@ fn summarize_from_cache(cache: &std::collections::HashMap<String, serde_json::Va
     let mut total_unreal = Fraction::zero();
     let mut total_realized = Fraction::zero();
     let mut total_fees = Fraction::zero();
+    let mut total_funding = Fraction::zero();
     let mut active_bots = 0u32;
     let mut active_deals = 0u32;
     let mut long_exp = Fraction::zero();
@@ -1105,6 +1132,7 @@ fn summarize_from_cache(cache: &std::collections::HashMap<String, serde_json::Va
         total_unreal = total_unreal.add(&fr(&v["unrealizedNow"])).unwrap_or_else(|_| total_unreal.clone());
         total_realized = total_realized.add(&fr(&v["stats"]["realized_gross"])).unwrap_or_else(|_| total_realized.clone());
         total_fees = total_fees.add(&fr(&v["cumulativeFees"])).unwrap_or_else(|_| total_fees.clone());
+        total_funding = total_funding.add(&fr(&v["cumulativeFunding"])).unwrap_or_else(|_| total_funding.clone());
         let qty = fr(&v["stats"]["position_qty"]);
         let avg = fr(&v["stats"]["avg_price"]);
         let notional = qty.mul(&avg).unwrap_or_else(|_| Fraction::zero());
@@ -1146,6 +1174,7 @@ fn summarize_from_cache(cache: &std::collections::HashMap<String, serde_json::Va
         "totalUnrealizedPnl": total_unreal.to_string(),
         "totalRealizedGross": total_realized.to_string(),
         "totalFees": total_fees.to_string(),
+        "totalFunding": total_funding.to_string(),
         "activeBots": active_bots,
         "totalBots": cache.len(),
         "activeDeals": active_deals,
@@ -1165,6 +1194,7 @@ async fn summarize_locked(State(app): State<Arc<AppState>>) -> Json<Value> {
     let mut short_exposure = Fraction::zero();
     let mut total_realized = Fraction::zero();
     let mut total_fees = Fraction::zero();
+    let mut total_funding = Fraction::zero();
     let mut equity_total = Fraction::zero();
     let mut total_unrealized = Fraction::zero();
     let mut allocation: HashMap<String, f64> = HashMap::new();
@@ -1212,6 +1242,9 @@ async fn summarize_locked(State(app): State<Arc<AppState>>) -> Json<Value> {
         total_fees = total_fees
             .add(&rt.stepper.cumulative_fees.clone())
             .unwrap_or_else(|_| total_fees.clone());
+        total_funding = total_funding
+            .add(&rt.stepper.cumulative_funding.clone())
+            .unwrap_or_else(|_| total_funding.clone());
         // Real equity = cash + committed IM + unrealized PnL at the last mark
         // (SimulationStepper::equity — margin-aware; zero-float throughout).
         match rt.stepper.last_close.as_deref().and_then(|s| Fraction::from_any_str(s).ok()) {
@@ -1248,6 +1281,7 @@ async fn summarize_locked(State(app): State<Arc<AppState>>) -> Json<Value> {
         "totalUnrealizedPnl": total_unrealized.to_string(),
         "totalRealizedGross": total_realized.to_string(),
         "totalFees": total_fees.to_string(),
+        "totalFunding": total_funding.to_string(),
         "activeBots": active_bots,
         "totalBots": total_bots,
         "activeDeals": active_deals,
@@ -1297,6 +1331,12 @@ struct CreateBotReq {
     /// istisna). Onay kalıcı olarak olay akışına yazılır.
     #[serde(default)]
     cert_acknowledged: bool,
+    /// Faz 28 (P1-4 — bağımsız denetim): bilinçli-onayın GEREKÇESİ.
+    /// cert_acknowledged=true iken zorunludur (422 CERT_ACK_REASON_REQUIRED);
+    /// gerekçe WARN olayının kalıcı metnine yazılır — boş onay audit değerini
+    /// düşürür ("kim, neden" kaydı olmadan istisna kapatılamaz).
+    #[serde(default)]
+    cert_reason: Option<String>,
     /// Faz 22 (P0-10 kalanı): kullanıcının GERÇEK denediği strateji
     /// konfigürasyon sayısı — DSR söndürmesi bunu kullanır (dahili 9 varyant
     /// alt sınırdır). 0/eksik = sadece dahili varyantlar.
@@ -1767,12 +1807,34 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
             let failed: Vec<String> = gate.gates.iter().filter(|g| !g.pass).map(|g| format!("{} (eşik {}, değer {})", g.label, g.threshold, g.value)).collect();
             // ÜRÜN-1: bilinçli-onay istisnası — kapı felsefesi korunur (onay
             // şart + kalıcı WARN), Demo/uzman kullanımı için kanal açılır.
+            // Faz 28 (P1-4): onay gerekçesiz kabul edilmez — audit zinciri
+            // "kim + neden" ikilisini tam istemek zorundadır.
+            let cert_reason = req
+                .cert_reason
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.chars().take(300).collect::<String>());
             if req.cert_acknowledged {
+                let Some(cert_reason) = cert_reason else {
+                    state::persist_event(&app, &id, "WARN", "CERT_GATE", "cert_acknowledged=true ancak cert_reason yok — istisna reddedildi").await;
+                    return Err((
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(json!({
+                            "error": "LIVE sertifika kapısı: bilinçli onay istisnası için cert_reason zorunlu",
+                            "code": "CERT_ACK_REASON_REQUIRED",
+                            "verdict": gate.verdict,
+                            "gates": gate.gates,
+                            "hint": "cert_acknowledged=true + cert_reason (örn. 'backtest 200 deal üstünde doğrulandı, kapı eşikleri manuel gözden geçirildi') gönderin",
+                        })),
+                    )
+                        .into_response());
+                };
                 let failed_list = failed.join(" · ");
-                state::persist_event(&app, &id, "WARN", "CERT_GATE", &format!("sertifika kapısı KALDI ama kullanıcı bilinçli onayıyla AŞILDI (cert_acknowledged=true). Kalan kapılar: {failed_list}")).await;
+                state::persist_event(&app, &id, "WARN", "CERT_GATE", &format!("sertifika kapısı KALDI ama kullanıcı bilinçli onayıyla AŞILDI (cert_acknowledged=true, gerekçe: \"{cert_reason}\"). Kalan kapılar: {failed_list}")).await;
                 let _ = app.sse.send(SseEvent {
                     event: "RISK".into(),
-                    data: json!({"botId": id, "code": "CERT_GATE_ACK", "message": format!("LIVE sertifika kapısı bilinçli onayla aşıldı — kalan kapılar: {failed_list}"), "ts": state::now_ms()}).to_string(),
+                    data: json!({"botId": id, "code": "CERT_GATE_ACK", "message": format!("LIVE sertifika kapısı bilinçli onayla aşıldı (gerekçe: {cert_reason}) — kalan kapılar: {failed_list}"), "ts": state::now_ms()}).to_string(),
                 });
                 state::persist_event(&app, &id, "INFO", "CERT_GATE", "bilinçli onaylı istisna ile kuruluma devam ediliyor").await;
             } else {
@@ -1788,7 +1850,7 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
                     "code": "CERT_GATE_FAILED",
                     "verdict": gate.verdict,
                     "gates": gate.gates,
-                    "hint": "bilinçli sorumluluk onayıyla devam için cert_acknowledged=true gönderin (WARN olayıyla kayıt altına alınır)",
+                    "hint": "bilinçli sorumluluk onayıyla devam için cert_acknowledged=true + cert_reason (gerekçe metni) gönderin (WARN olayıyla kayıt altına alınır)",
                 })),
             )
                 .into_response());
@@ -4007,6 +4069,43 @@ async fn set_killswitch(State(app): State<Arc<AppState>>, Json(req): Json<HaltSe
             event: "KILL_SWITCH".into(),
             data: serde_json::json!({"engaged": true, "reason": reason, "by": actor}).to_string(),
         });
+        // Faz 28 (P0-2): şalter devreye alınınca bekleyen borsa GİRİŞ (Add)
+        // emirleri de iptal edilir — "yeni emir yok" vaadi tahtadaki emirleri
+        // de kapsar. Reduce/TP/SL koruyucu emirler bilinçli olarak kalır.
+        {
+            // Send/kilit-notu: runtimes kilidi yalnız intent yazımı için tutulur;
+            // persist_event await'leri kilit BIRAKILDIKTAN sonra owned mesajlarla
+            // yapılır (fleet okumaları şalter devreye alımında bloklanmasın).
+            let ledger_msgs: Vec<(String, String)> = {
+                let mut rts = app.runtimes.lock().await;
+                // Muhafazakâr ve doğru uygulama: her bot için kendi Add linklerini
+                // kendi kuyruğuna Cancel intent olarak yaz; poll cascade'i
+                // borsadan iptal eder ve defteri uzlaştırır.
+                let mut msgs = Vec::new();
+                for (bot_id, rt) in rts.iter_mut() {
+                    let links: Vec<String> = rt
+                        .live_open_orders
+                        .iter()
+                        .filter(|o| o.kind == dca_kernel::OrderKind::Add)
+                        .map(|o| o.id.clone())
+                        .collect();
+                    if links.is_empty() {
+                        continue;
+                    }
+                    rt.pending_live_intents.push(crate::state::LiveIntent::Cancel {
+                        links: links.clone(),
+                        venue: rt.venue.clone(),
+                        category: if rt.cfg.kind.is_futures() { "linear".to_string() } else { "spot".to_string() },
+                        symbol: rt.cfg.symbol.clone(),
+                    });
+                    msgs.push((bot_id.clone(), format!("şalter devrede — {} bekleyen GİRİŞ emri iptal kuyruğuna alındı", links.len())));
+                }
+                msgs
+            };
+            for (bot_id, msg) in ledger_msgs {
+                crate::state::persist_event(&app, &bot_id, "WARN", "KILL_SWITCH", &msg).await;
+            }
+        }
     } else {
         *app.kill.lock().await = crate::state::HaltState::default();
         let msg = crate::state::halt_event_message("released", None, Some(&actor), now, false);

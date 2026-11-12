@@ -276,6 +276,20 @@ pub enum Action {
     /// anında qty GERÇEK dolum fiyatından çözülür (kernel); None = qty sabit.
     PlaceMarket { id: String, side: dca_math::Side, qty: Fraction, role: &'static str, quote_notional: Option<Fraction> },
     CancelResting { id: String },
+    /// Faz 28 (P1-3 — bağımsız denetim): kapanan deal defteri kaydı —
+    /// kalıcı `deals` tablosuna tek işlemde idempotent yazılır (decimal
+    /// string sözleşmesi). DCA/Hedge kapanışları bunu üretir.
+    DealClosed {
+        deal_no: usize,
+        opened_ts: i64,
+        closed_ts: i64,
+        gross_pnl: String,
+        fees: String,
+        funding: String,
+        net_pnl: String,
+        safety_triggered: usize,
+        reason: String,
+    },
     Log { level: &'static str, message: String },
 }
 

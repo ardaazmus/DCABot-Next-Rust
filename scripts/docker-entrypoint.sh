@@ -53,9 +53,39 @@ for i in $(seq 1 30); do
   sleep 1
 done
 
-# Handle graceful shutdown
-trap 'echo "[supervisor] Stopping processes..."; kill -TERM "$ENGINE_PID"; wait "$ENGINE_PID"; exit 0' TERM INT
+# Faz 28 (P1-6): readiness fail-closed — motor hazır değilse UI'ı
+# başlatmadan container başarısız olsun (restart policy yeniden dener).
+if ! curl -s -m 2 http://127.0.0.1:3002/api/health >/dev/null 2>&1; then
+  echo "[supervisor] FATAL: Rust engine 30s içinde hazır olmadı — container başarısız oluyor (restart policy yeniden deneyecek)." >&2
+  kill -TERM "$ENGINE_PID" 2>/dev/null || true
+  exit 1
+fi
 
-# Start Next.js standalone server
+# Faz 28 (P0-1): UI auth — DCA_UI_PASSWORD boşsa rastgele üret + log yaz.
+if [ -z "$DCA_UI_PASSWORD" ]; then
+  DCA_UI_PASSWORD=$(head -c 24 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 24)
+  export DCA_UI_PASSWORD
+  echo "[supervisor] DCA_UI_PASSWORD otomatik üretildi: $DCA_UI_PASSWORD  <-- kaydedin"
+fi
+export DCA_REQUIRE_AUTH="${DCA_REQUIRE_AUTH:-1}"
+
+# Handle graceful shutdown — TERM/INT sinyali HER İKİ child'a gider.
+UI_PID=""
+cleanup() {
+  echo "[supervisor] Stopping processes..."
+  kill -TERM "$ENGINE_PID" 2>/dev/null || true
+  [ -n "$UI_PID" ] && kill -TERM "$UI_PID" 2>/dev/null || true
+  wait "$ENGINE_PID" 2>/dev/null || true
+  [ -n "$UI_PID" ] && wait "$UI_PID" 2>/dev/null || true
+  exit 0
+}
+trap cleanup TERM INT
+
+# Start Next.js standalone server — exec DEĞİL: trap'in her iki süreci
+# kapatabilmesi için node arka planda, shell çocukları bekler.
 echo "[supervisor] Starting Next.js UI (port 3000)..."
-exec node /app/server.js
+node /app/server.js &
+UI_PID=$!
+wait -n "$ENGINE_PID" "$UI_PID"
+echo "[supervisor] Bir süreç sonlandı — container kapatılıyor."
+cleanup

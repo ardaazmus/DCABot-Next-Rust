@@ -77,6 +77,9 @@ pub struct DcaEngine {
     /// Faz 21 (N-1): serde(default) — eski snapshot uyumu.
     #[serde(default)]
     pub next_level_to_place: usize,
+    /// Faz 28 (P1-3): deal açılış zamanı — deals defteri için.
+    #[serde(default)]
+    pub deal_opened_ts: i64,
     /// Faz 17 (P0-6): Closing fazında beklenen bar sayısı — 3 barı aşarsa
     /// kapanış emri yeniden gönderilir (pozisyon korumasız kalmaz).
     /// Faz 21 (N-1): serde(default) — eski snapshot uyumu.
@@ -162,6 +165,7 @@ impl DcaEngine {
             funding: Fraction::zero(),
             funding_deal: Fraction::zero(),
             next_level_to_place: 0,
+            deal_opened_ts: 0,
             closing_bars_waited: 0,
             cooldown_remaining: 0,
             close_orders_out: 0,
@@ -330,6 +334,7 @@ impl DcaEngine {
         self.entry_trigger_met = true;
 
         self.deal_seq += 1;
+        self.deal_opened_ts = 0; // opened ts fill anında on_fill ile set edilir (Faz 28)
         let deal_id = format!("{}-deal-{}", self.bot_id, self.deal_seq);
         // Build the ladder with a provisional anchor = current close (final VWAP locks on fill)
         let anchor = ctx.close.clone();
@@ -905,6 +910,7 @@ impl DcaEngine {
             self.closed_qty_accum = self.closed_qty_accum.add(&fill.qty).unwrap_or_else(|_| self.closed_qty_accum.clone());
         }
         if before_qty.is_zero() && is_add && fill.role == "BASE" && self.phase == DcaPhase::BasePending {
+            self.deal_opened_ts = fill.ts;
             acts.extend(self.on_base_filled(&fill.price));
             return acts;
         }
@@ -991,6 +997,19 @@ impl DcaEngine {
                     self.wins,
                     self.losses
                 ),
+            });
+            // Faz 28 (P1-3): kalıcı deals defteri kaydı — /api/deals artık
+            // metin ayrıştırmak yerine gerçek satırları okuyabilir.
+            acts.push(Action::DealClosed {
+                deal_no: self.deal_seq as usize,
+                opened_ts: self.deal_opened_ts,
+                closed_ts: fill.ts,
+                gross_pnl: realized.to_half_even_display(8),
+                fees: self.deal_fees.to_half_even_display(8),
+                funding: self.funding_deal.to_half_even_display(8),
+                net_pnl: net.to_half_even_display(8),
+                safety_triggered: self.filled_safety,
+                reason: "TP/SL/Manual".into(),
             });
         }
         acts

@@ -33,17 +33,20 @@ ENV NODE_ENV=production
 RUN npm run build
 
 # --- Stage 3: Production Runner ---
-FROM debian:bookworm-slim AS runner
+# Faz 28 (P1-5): Debian apt-node 18 yerine node:22-bookworm-slim — runner
+# Node sürümü builder ile aynı major, güvenlik yamaları node imajından gelir.
+# (rusqlite "bundled" derlendiği için libsqlite3-0 gerekmez.)
+FROM node:22-bookworm-slim AS runner
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     libssl3 \
-    libsqlite3-0 \
-    nodejs \
-    npm \
     && rm -rf /var/lib/apt/lists/*
+
+# Faz 28 (P1-6): non-root — uygulama ayrıcalıksız kullanıcıyla koşar.
+RUN groupadd -r -g 10001 dca && useradd -r -m -u 10001 -g dca dca
 
 ENV NODE_ENV=production
 ENV DCA_LOCAL_RUN=0
@@ -51,7 +54,7 @@ ENV PORT=3000
 ENV HOSTNAME="0.0.0.0"
 
 # Directories for persistence
-RUN mkdir -p /app/data /app/logs
+RUN mkdir -p /app/data /app/logs && chown -R dca:dca /app
 
 # Copy Rust Engine
 COPY --from=rust-builder /build/mini-services/dca-core/target/release/dca_server /app/dca_server
@@ -65,6 +68,9 @@ COPY --from=node-builder /app/public /app/.next/standalone/public
 # Copy Supervisor Entrypoint
 COPY scripts/docker-entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
+
+# Faz 28 (P1-6): tüm koşum dosyaları dca sahipliğinde; şalter kapanır.
+USER dca
 
 EXPOSE 3000 3002
 

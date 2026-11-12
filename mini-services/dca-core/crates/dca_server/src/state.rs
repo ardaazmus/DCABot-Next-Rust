@@ -273,6 +273,9 @@ impl BotRuntime {
             "config": serde_json::to_value(&self.cfg).unwrap_or(serde_json::Value::Null),
             "cash": self.stepper.cash.to_string(),
             "cumulativeFees": self.stepper.cumulative_fees.to_string(),
+            // Faz 28 (P1-3): funding maliyeti snapshot'a çıkar — /api/summary
+            // totalFunding bunu toplar; UI totalEconomicPnL'e dahil eder.
+            "cumulativeFunding": self.stepper.cumulative_funding.to_string(),
             "marginMode": !self.stepper.cfg.is_spot,
             "leverage": self.stepper.cfg.leverage.to_string(),
             "imUsed": self.stepper.im_used.to_string(),

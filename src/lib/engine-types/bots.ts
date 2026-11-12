@@ -33,6 +33,8 @@ export interface Summary {
   /** Vault-wide open-position mark (engine /api/summary — absent on older snapshots). */
   totalUnrealizedPnl?: string;
   totalFees: string;
+  /** Faz 28 (P1-3): funding maliyeti toplamı (engine >= Faz 28). */
+  totalFunding?: string;
   activeBots: number;
   totalBots: number;
   activeDeals: number;
