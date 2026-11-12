@@ -804,11 +804,11 @@ bad = full_config(kind="DCA_LONG", symbol="BTCUSDT", stop_loss_pct=None,
                   entry_signal={"root": {"left": {"key": "Rsi", "timeframe": "H1", "period": 0},
                                          "op": "Lt", "right": {"kind": "number", "value": 30}}})
 s, j = req("POST", "/api/bots", {"name": "sig-bad", "kind": "DCA_LONG", "venue": "BYBIT", "mode": "PAPER",
-                                 "symbol": "BTCUSDT", "interval": "1h", "start_cash": "10000", "config": bad})
+                                 "symbol": "BTCUSDT", "interval": "1m", "start_cash": "10000", "config": bad})
 check("sig-invalid-422", s == 422, f"status={s} body={str(j)[:120]}")
 
 # signals/preview on live Bybit data -> met + leaves
-s, j = req("POST", "/api/signals/preview", {"symbol": "BTCUSDT", "interval": "1h", "node": SIG_TREE}, timeout=30.0)
+s, j = req("POST", "/api/signals/preview", {"symbol": "BTCUSDT", "interval": "1m", "node": SIG_TREE}, timeout=30.0)
 leaves = j.get("leaves") or []
 check("sig-preview-200", s == 200, f"status={s} body={str(j)[:120]}")
 check("sig-preview-met-bool", isinstance(j.get("met"), bool), f"met={j.get('met')}")
@@ -819,7 +819,7 @@ check("sig-preview-desc", all(str(l.get("desc", "")).strip() for l in leaves),
       f"descs={[l.get('desc') for l in leaves]}")
 
 # preview invalid -> 422
-s, j = req("POST", "/api/signals/preview", {"symbol": "BTCUSDT", "interval": "1h",
+s, j = req("POST", "/api/signals/preview", {"symbol": "BTCUSDT", "interval": "1m",
                                             "node": {"left": {"key": "Rsi", "timeframe": "H1", "period": -3},
                                                      "op": "Lt", "right": {"kind": "number", "value": 30}}}, timeout=30.0)
 check("sig-preview-invalid-422", s == 422, f"status={s} body={str(j)[:100]}")
@@ -827,7 +827,7 @@ check("sig-preview-invalid-422", s == 422, f"status={s} body={str(j)[:100]}")
 # backtest honors the signal tree: impossible condition -> zero deals
 bt_sig_block = full_config(kind="DCA_LONG", symbol="BTCUSDT", stop_loss_pct=None,
                            entry_signal={"root": SIG_TREE_IMPOSSIBLE})
-s, j = req("POST", "/api/backtest", {"kind": "DCA_LONG", "symbol": "BTCUSDT", "interval": "1h",
+s, j = req("POST", "/api/backtest", {"kind": "DCA_LONG", "symbol": "BTCUSDT", "interval": "1m",
                                      "bars": 300, "start_cash": "10000", "config": bt_sig_block}, timeout=90.0)
 bm = (j.get("metrics") or {}) if s == 200 else {}
 check("sig-backtest-blocked-200", s == 200, f"status={s} body={str(j)[:120]}")
@@ -841,7 +841,7 @@ SIG_TREE_OPEN = {"left": {"key": "Price", "timeframe": "H1", "output": "close"},
                  "right": {"kind": "number", "value": 0}}
 bt_sig_open = full_config(kind="DCA_LONG", symbol="BTCUSDT", stop_loss_pct=None,
                           entry_signal={"root": SIG_TREE_OPEN})
-s, j = req("POST", "/api/backtest", {"kind": "DCA_LONG", "symbol": "BTCUSDT", "interval": "1h",
+s, j = req("POST", "/api/backtest", {"kind": "DCA_LONG", "symbol": "BTCUSDT", "interval": "1m",
                                      "bars": 300, "start_cash": "10000", "config": bt_sig_open}, timeout=90.0)
 bm = (j.get("metrics") or {}) if s == 200 else {}
 check("sig-backtest-met-deals>0", s == 200 and int(str(bm.get("deals", "0"))) >= 1,
@@ -852,7 +852,7 @@ lower_tf = {"left": {"key": "Rsi", "timeframe": "M1", "period": 14}, "op": "Lt",
             "right": {"kind": "number", "value": 30}}
 bt_sig_lower = full_config(kind="DCA_LONG", symbol="BTCUSDT", stop_loss_pct=None,
                            entry_signal={"root": lower_tf})
-s, j = req("POST", "/api/backtest", {"kind": "DCA_LONG", "symbol": "BTCUSDT", "interval": "1h",
+s, j = req("POST", "/api/backtest", {"kind": "DCA_LONG", "symbol": "BTCUSDT", "interval": "1m",
                                      "bars": 120, "start_cash": "10000", "config": bt_sig_lower}, timeout=90.0)
 check("sig-backtest-lower-tf-422", s == 422, f"status={s} body={str(j)[:120]}")
 
@@ -863,7 +863,7 @@ sig_bot_cfg = full_config(kind="DCA_LONG", symbol="BTCUSDT", stop_loss_pct=None,
                           entry_signal={"root": {"left": {"key": "Rsi", "timeframe": "H1", "period": 14},
                                                  "op": "Lt", "right": {"kind": "number", "value": 5}}})
 s, j = req("POST", "/api/bots", {"name": "tvw-e2e", "kind": "DCA_LONG", "venue": "BYBIT", "mode": "PAPER",
-                                 "symbol": "BTCUSDT", "interval": "1h", "start_cash": "10000", "config": sig_bot_cfg})
+                                 "symbol": "BTCUSDT", "interval": "1m", "start_cash": "10000", "config": sig_bot_cfg})
 check("tvw-create-201", s == 201, f"status={s} body={str(j)[:120]}")
 tw_id = j.get("id") if s == 201 else None
 tw_secret = None
@@ -989,7 +989,7 @@ PINE_EMA = ('strategy("E2E Cross")\n'
             '    strategy.entry("L", strategy.long)\n'
             "if ta.crossunder(fast, slow)\n"
             "    strategy.close_all()\n")
-s, j = req("POST", "/api/pine/backtest", {"code": PINE_EMA, "symbol": "BTCUSDT", "interval": "1h", "bars": 300}, timeout=90.0)
+s, j = req("POST", "/api/pine/backtest", {"code": PINE_EMA, "symbol": "BTCUSDT", "interval": "1m", "bars": 300}, timeout=90.0)
 fr = (j.get("metrics") or {}).get("fill_realism") or {}
 try:
     check("pine-backtest-runs", s == 200 and j.get("ok") is True and (j.get("entries") or 0) >= 1
@@ -1002,11 +1002,11 @@ except Exception as e:
     check("pine-backtest-runs", False, f"parse error: {e}")
     check("pine-backtest-realism", False, f"parse error: {e}")
 # T19-5: pine/backtest — bozuk kod 422
-s, j = req("POST", "/api/pine/backtest", {"code": "x = ta.nope(close)", "symbol": "BTCUSDT", "interval": "1h"})
+s, j = req("POST", "/api/pine/backtest", {"code": "x = ta.nope(close)", "symbol": "BTCUSDT", "interval": "1m"})
 check("pine-backtest-bad-code-422", s == 422, f"status={s}")
 # T19-6: backtest — realismCompare var (gerçekçi config'te iyimser ikinci koşu)
 s, j = req("POST", "/api/backtest", {
-    "kind": "DCA_LONG", "symbol": "BTCUSDT", "interval": "1h", "bars": 300,
+    "kind": "DCA_LONG", "symbol": "BTCUSDT", "interval": "1m", "bars": 300,
     "config": {"kind": "DCA_LONG", "symbol": "BTCUSDT", "base_order_size": "500",
                "safety_order_size": "500", "sizing_mode": "QUOTE_NOTIONAL", "deviation_pct": "0.02",
                "step_scale": "1.3", "volume_scale": "1.2", "max_safety_orders": 4,
@@ -1032,7 +1032,7 @@ except Exception as e:
 # T19-7: bot oluşturma — pine + RSI_BELOW trigger kombinasyonu 422 (uyumsuzluk)
 s, j = req("POST", "/api/bots", {
     "name": "T19 uyumsuz", "venue": "BYBIT", "mode": "PAPER", "kind": "DCA_LONG",
-    "symbol": "BTCUSDT", "interval": "1h",
+    "symbol": "BTCUSDT", "interval": "1m",
     "config": {"kind": "DCA_LONG", "symbol": "BTCUSDT", "base_order_size": "50",
                "safety_order_size": "0", "sizing_mode": "QUOTE_NOTIONAL", "deviation_pct": "0.02",
                "step_scale": "1", "volume_scale": "1", "max_safety_orders": 2,
@@ -1049,7 +1049,7 @@ check("pine-bot-trigger-mismatch-422", s == 422 and "INSTANT" in str(j.get("erro
 # T19-8: bot oluşturma — bozuk pine 422
 s, j = req("POST", "/api/bots", {
     "name": "T19 bozuk pine", "venue": "BYBIT", "mode": "PAPER", "kind": "DCA_LONG",
-    "symbol": "BTCUSDT", "interval": "1h",
+    "symbol": "BTCUSDT", "interval": "1m",
     "config": {"kind": "DCA_LONG", "symbol": "BTCUSDT", "base_order_size": "50",
                "safety_order_size": "0", "sizing_mode": "QUOTE_NOTIONAL", "deviation_pct": "0.02",
                "step_scale": "1", "volume_scale": "1", "max_safety_orders": 2,
@@ -1082,7 +1082,7 @@ check("pine-validate-pyramiding-note", s == 200 and (j.get("decl") or {}).get("p
 # T20-4: pine/backtest — plot serileri + botStopsApplied döner
 s, j = req("POST", "/api/pine/backtest",
            {"code": 'strategy("PL")\nplot("Fiyat", close)\nif close <= 90\n    strategy.entry("L", strategy.long)\n',
-            "symbol": "BTCUSDT", "interval": "1h", "bars": 100}, timeout=90.0)
+            "symbol": "BTCUSDT", "interval": "1m", "bars": 100}, timeout=90.0)
 plots = j.get("pinePlots") or {}
 try:
     check("pine-backtest-plots-and-stops-flag", s == 200 and j.get("ok") is True
@@ -1094,14 +1094,14 @@ except Exception as e:
 # T20-5: pine/backtest — opsiyonel bot TP/SL devreye girer (botStopsApplied=true)
 s, j = req("POST", "/api/pine/backtest",
            {"code": 'strategy("ST")\nif close <= 90\n    strategy.entry("L", strategy.long)\n',
-            "symbol": "BTCUSDT", "interval": "1h", "bars": 100,
+            "symbol": "BTCUSDT", "interval": "1m", "bars": 100,
             "target_profit_pct": "0.02", "stop_loss_pct": "0.05"}, timeout=90.0)
 check("pine-backtest-bot-stops-applied", s == 200 and j.get("botStopsApplied") is True,
       f"status={s} stops={j.get('botStopsApplied')}")
 # T20-6: pine/backtest — 600 üstü periyot dürüst hata (kalıcı na yerine fail-closed)
 s, j = req("POST", "/api/pine/backtest",
            {"code": 'strategy("BIG")\ns = ta.sma(close, 700)\nif close > s\n    strategy.entry("L", strategy.long)\n',
-            "symbol": "BTCUSDT", "interval": "1h", "bars": 100}, timeout=90.0)
+            "symbol": "BTCUSDT", "interval": "1m", "bars": 100}, timeout=90.0)
 check("pine-backtest-period-over-ring-cap-422", s == 422 and "ring kapasitesi" in str(j.get("error", "")),
       f"status={s} err={str(j.get('error'))[:90]}")
 
@@ -1111,7 +1111,7 @@ section("T21 HEDGE PANEL VERİSİ + PINE PLOT GRAFİĞİ + KÜTÜPHANE")
 # T21-1: hedge_drawdown_trigger_pct doğrulama kapısı — "0" (0,100] dışı → 422
 s, j = req("POST", "/api/bots", {
     "name": "T21 dd-invalid", "kind": "HEDGE_PROTECTIVE", "venue": "PAPER", "mode": "PAPER",
-    "symbol": "BTCUSDT", "interval": "1h",
+    "symbol": "BTCUSDT", "interval": "1m",
     "config": full_config(kind="HEDGE_PROTECTIVE", symbol="BTCUSDT", target_profit_pct="100",
                           stop_loss_pct=None, hedge_drawdown_trigger_pct="0"),
 })
@@ -1122,7 +1122,7 @@ check("hedge-dd-trigger-zero-422", s == 422 and "tetikleyici" in str(j.get("erro
 # Dikkat: hedge bacağı kuruluştan itibaren Some — FILL'i beklemek için position_qty koşulu şart.
 s, j = req("POST", "/api/bots", {
     "name": "e2e-hedge-dual", "kind": "HEDGE_DUAL", "venue": "PAPER", "mode": "PAPER",
-    "symbol": "ETHUSDT", "interval": "1h",
+    "symbol": "ETHUSDT", "interval": "1m",
     "config": full_config(kind="HEDGE_DUAL", symbol="ETHUSDT", base_order_size="50",
                           safety_order_size="40", target_profit_pct="100", stop_loss_pct=None,
                           hedge_ratio="0.5", combined_target_profit="1000000",

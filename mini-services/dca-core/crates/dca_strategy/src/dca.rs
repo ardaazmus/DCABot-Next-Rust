@@ -1617,6 +1617,19 @@ mod m17_realized_ledger_tests {
     }
 
     #[test]
+    fn patch_rejects_non_positive_tp() {
+        // Faz 26 (BULGU-B regresyonu): create 422 verirken patch yolu
+        // "-0.02" TP'yi kabul edip compute_tp'ye ters-hedef yolluyordu
+        // (asla tetiklenmeyen TP → korumasız pozisyon).
+        let mut e = DcaEngine::new("ptp", BotConfig::default(), Instrument::default()).unwrap();
+        assert!(e.patch(Some("-0.02".into()), None, None).is_err(), "negatif TP reddedilmeli");
+        assert!(e.patch(Some("0".into()), None, None).is_err(), "sıfır TP reddedilmeli");
+        assert!(e.patch(Some("çöp".into()), None, None).is_err(), "parse edilemeyen TP reddedilmeli");
+        assert!(e.patch(Some("0.02".into()), None, None).is_ok(), "geçerli TP kabul edilmeli");
+        assert_eq!(e.cfg.target_profit_pct, "0.02");
+    }
+
+    #[test]
     fn resting_tp_limit_replaces_and_fills_realistically() {
         // Faz 19 (P1-4 kalıcı): TP artık dinlenen reduce-only LIMIT'tir.
         // 1) Deal açılır açılmaz mark TP'ye değse bile PİYASA emri AÇILMAZ;

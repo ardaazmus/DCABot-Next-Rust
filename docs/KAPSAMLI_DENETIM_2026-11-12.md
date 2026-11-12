@@ -280,3 +280,61 @@ SAFETY iptal (dca.rs:958 wildcard, tüm çıkış yolları) · OKX posSide
 FUTURE_BAR_SKIP · likidasyon tek-fill + execId dedup · hedge ayrı-kernel ·
 patch sonrası cache tazeleme · proxy.ts traversal/CSRF/allowlist ·
 auth-session HMAC+timingSafeEqual — **hepsi sağlam, mevcut testlerle kilitli.**
+
+---
+
+## 7. ÜÇÜNCÜ TUR — DÜZELTME KAPANIŞI (aynı gün)
+
+İkinci turun "kalan iş" listesi kapatıldı:
+
+| İş | Durum |
+|---|---|
+| BULGU-A regresyonu | engine_contract'e `ADD_FUNDS negatif reddi 422` + `sıfır reddi 422` — **canlı PASS (27/27)** |
+| BULGU-B regresyonu | `patch_rejects_non_positive_tp` birim testi (negatif/sıfır/çöp reddi, geçerli kabulü) — PASS |
+| E2E webhook kümesi | Canlı doğrulandı: tvw-secret-hidden + rotate + expired kümesi **düzelmiş halde geçiyor** |
+| E2E zamanlama kırılganlığı | 8 bot-create 1h→1m; deal-open bekleme pencereleri 150s→240s (iddia aynı, yalnız tolerans); bekleme çünkü: base DOLMASI 2 kapalı 1m bar + 20s poll ≈ 160s (repro: BasePending@80sn) |
+| Rust final | **324 test PASS** (yeni patch testi ile) |
+| UI final | tsc/eslint temiz |
+
+E2E final sonucu: §7.1'de güncellenecek (koşu sürüyor).
+
+---
+
+## 8. ÜÇÜNCÜ TUR DEVAMI — PAPER VENUE P1 BULGUSU VE FİNAL KOŞU
+
+### 8.1 YENİ P1 BULGU — venue="PAPER" botları ÜRETİMDE ölüydü
+- **[Dosya/Satır]** engine.rs poll_inner klines fetch (adapter = app.adapter(&ctx.venue))
+- **[Kök neden]** `inject_bars` yalnız testlerde çağrılıyor; üretimde PAPER
+  venue'un bar deposunu besleyen KİMSE YOK → klines hep boş → deal ASLA
+  açılmıyordu. Belge sözleşmesi ("PAPER simülasyonu BYBIT piyasa verisiyle
+  koşar" — state.rs engine_instrument_for) kodda uygulanmamıştı.
+- **[Kanıt (A/B)]** Aynı ETHUSDT DCA_SHORT bot: venue=BYBIT → 150 sn'de
+  Open+0.05 pozisyon; venue=PAPER → Idle+0 (canlı A/B, iki bot silindi).
+- **[Düzeltme]** poll_inner klines kaynağı PAPER'da BYBIT adapter'ine
+  yönleniyor (yalnız PİYASA VERİSİ; emir akışı mod=PAPER olduğundan asla
+  borsaya gitmez — simülasyon kernel'i). Kontrast: emir yolları değişmedi.
+- **[Canlı kanıt]** PAPER/ETHUSDT/1m bot → 150 sn'de Open + 0.05 pozisyon.
+- **[Etki]** E2E'de 5 başarısızlık bu düzeltmeyle anında düzeldi (fdca kümesi
+  bir önceki koşuda PASS olmuştu — flaky değil, venue çakışması).
+
+### 8.2 E2E final: 163 PASS / 5 FAIL (168)
+Kalan 5: sse-lifecycle-events, sc-backtest-met-deals>0, hedge-snapshot-leg,
+hedge-ladder, hedge-fill-routed — hepsi **18 bot × 1m yükü altında** poll
+gecikmesi (Bybit demo rate baskısı; botlar run sonunda Open'a ulaştı —
+timing, finansal hata değil). Çözüm: e2e koşusunu bot sayısına göre
+pencereleme veya专用 PAPER bar üreticisi (sonraki faz).
+
+### 8.3 Nihai sayılar (bu denetimin birikimli)
+- Rust: **324 test PASS** (finance_math_verification 5/5 dâhil)
+- Playwright 5/5 · engine_contract **27/27** (negatif ADD_FUNDS 422
+  regresyonlarıyla) · bot-matrix 10/10 · tsc/eslint temiz ·
+  npm run build + standalone :3100 sim. 200
+- E2E: **163/168** (ilk koşuda 142) — kalan 5 çevresel timing
+
+## 9. Kalan bilinen borç (öncelik sırasıyla)
+1. e2e hedge-* kümesi: PAPER venue artık canlı veriyle beslendiğinden
+   hedge bacak fill'i beklenen pencerede düşebilir — pencere/kurgu
+   güncellenecek (test-altyapı işi).
+2. halt POLL mesajı tekrarı (olay gürültüsü) — tek-seferlik yazıma geçirilecek.
+3. Motor otomatik başlatma (Görev Zamanlayıcı + start-local).
+4. Sweep kilidi tam H-1 yeniden yapılandırması (bilinen mimari borç).

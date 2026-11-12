@@ -1822,7 +1822,19 @@ async fn poll_inner(
         .adapter(&ctx.venue)
         .ok_or("no adapter")?;
     let iv = bybit_interval(&ctx.interval_str)?;
-    let bars: Vec<Kline> = adapter
+    // Faz 27 (P1 — KAPSAMLI_DENETİM): venue="PAPER" botları ölüydü. PAPER
+    // venue'unun kendi bar deposunu üretimde besleyen YOK (inject_bars
+    // yalnız test) → klines hep boş → hiç deal açılmıyordu. Belge sözleşmesi
+    // "PAPER simülasyonu BYBIT piyasa verisiyle koşar" (state.rs
+    // engine_instrument_for da PAPER→BYBIT çözüyor): PİYASA VERİSİ kaynağı
+    // PAPER'da BYBIT adapter'ine yönlenir; emir yerleştirme zaten
+    // mod=PAPER olduğu için asla borsaya gitmez (yalnız simülasyon kernel'i).
+    let market_adapter: &dyn dca_exchange::VenueAdapter = if ctx.venue == "PAPER" {
+        &app.bybit
+    } else {
+        adapter
+    };
+    let bars: Vec<Kline> = market_adapter
         .klines(category, &ctx.symbol, &iv, 60)
         .await
         .map_err(|e| e.to_string())?;

@@ -124,6 +124,12 @@ console.log("=== C) Yaşam döngüsü ===");
     check("resume", x.status === 200 || x.status === 204, `status=${x.status}`);
     x = await req(BASE_ENGINE, `/api/bots/${id}/actions`, "POST", { action: "CLOSE_ALL" }, true);
     check("CLOSE_ALL", x.status === 200 || x.status === 202 || x.status === 204, `status=${x.status}`);
+    // Faz 26 (BULGU-A regresyonu): negatif ADD_FUNDS — PAPER'da nakit düşürme
+    // deliğiydi; pozitiflik değişmezi 422 dönmeli.
+    x = await req(BASE_ENGINE, `/api/bots/${id}/actions`, "POST", { action: "ADD_FUNDS", amount: "-100" }, true);
+    check("ADD_FUNDS negatif reddi 422", x.status === 422, `status=${x.status} body=${x.text?.slice(0, 80)}`);
+    x = await req(BASE_ENGINE, `/api/bots/${id}/actions`, "POST", { action: "ADD_FUNDS", amount: "0" }, true);
+    check("ADD_FUNDS sıfır reddi 422", x.status === 422, `status=${x.status}`);
     x = await req(BASE_ENGINE, `/api/bots/${id}`, "DELETE", undefined, true);
     check("delete", x.status === 200 || x.status === 202 || x.status === 204, `status=${x.status}`);
     const after = await req(BASE_ENGINE, "/api/bots", "GET", undefined, true);
