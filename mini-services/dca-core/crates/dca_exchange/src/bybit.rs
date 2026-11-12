@@ -36,7 +36,14 @@ impl BybitAdapter {
             // Faz 0.5 (B-6): MAINNET fail-closed kapısı — DCA_ALLOW_MAINNET=1 olmadan
             // gerçek emir hattına bağlanmak yapısal olarak engellenir (test ortamları hariç).
             // Faz 26 (CI düzeltmesi): cfg!(test) OR exe-path — Linux CI güvencesi.
+            // Faz 26 (CI final): kapının amacı RELEASE üretimi korumak —
+            // debug ikililer (cargo test, yerel dev) yalnız simülasyona gider.
+            // cfg!(test) yalnız kendi crate'i kapsar; dca_server bin testleri
+            // dca_exchange'i cfg(test) OLMADAN derler. Linux'ta yeni cargo test
+            // ikililerini deps/ dışına koyar → exe heuristiği de yetmez.
+            // Robust: cfg!(test) || cfg!(debug_assertions) || exe-path.
             let is_test_runner = cfg!(test)
+                || cfg!(debug_assertions)
                 || std::env::current_exe()
                     .map(|p| p.to_string_lossy().contains("deps"))
                     .unwrap_or(false);

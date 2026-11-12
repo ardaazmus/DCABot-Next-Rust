@@ -44,7 +44,14 @@ impl OkxAdapter {
         // cfg!(test) + exe-path heuristiği (ikisi OR) — Linux CI'da
         // current_exe() heuristiği tutmadığında birim testler mainnet
         // kapısına takılıyordu. cfg!(test) birim testlerde kesindir.
+        // Faz 26 (CI final): kapının amacı RELEASE üretimi korumak —
+        // debug ikililer (cargo test, yerel dev) yalnız simülasyona gider.
+        // cfg!(test) yalnız kendi crate'i kapsar; dca_server bin testleri
+        // dca_exchange'i cfg(test) OLMADAN derler. Linux'ta yeni cargo test
+        // ikililerini deps/ dışına koyar → exe heuristiği de yetmez.
+        // Robust: cfg!(test) || cfg!(debug_assertions) || exe-path.
         let is_test_runner = cfg!(test)
+            || cfg!(debug_assertions)
             || std::env::current_exe()
                 .map(|p| p.to_string_lossy().contains("deps"))
                 .unwrap_or(false);
