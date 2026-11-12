@@ -35,9 +35,11 @@ impl BybitAdapter {
         } else {
             // Faz 0.5 (B-6): MAINNET fail-closed kapısı — DCA_ALLOW_MAINNET=1 olmadan
             // gerçek emir hattına bağlanmak yapısal olarak engellenir (test ortamları hariç).
-            let is_test_runner = std::env::current_exe()
-                .map(|p| p.to_string_lossy().contains("deps"))
-                .unwrap_or(false);
+            // Faz 26 (CI düzeltmesi): cfg!(test) OR exe-path — Linux CI güvencesi.
+            let is_test_runner = cfg!(test)
+                || std::env::current_exe()
+                    .map(|p| p.to_string_lossy().contains("deps"))
+                    .unwrap_or(false);
             if !is_test_runner && std::env::var("DCA_ALLOW_MAINNET").as_deref() != Ok("1") {
                 panic!("CRITICAL SAFETY VIOLATION: Attempted Bybit MAINNET connection without DCA_ALLOW_MAINNET=1! Set DCA_BYBIT_TESTNET=1 for paper/testnet or explicitly set DCA_ALLOW_MAINNET=1.");
             }

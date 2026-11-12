@@ -40,9 +40,14 @@ impl OkxAdapter {
             || std::env::var("DCA_OKX_TESTNET").as_deref() == Ok("1");
 
         // Faz 0.5 (B-6): MAINNET fail-closed kapısı — demo değilse ve DCA_ALLOW_MAINNET=1 yoksa engelle
-        let is_test_runner = std::env::current_exe()
-            .map(|p| p.to_string_lossy().contains("deps"))
-            .unwrap_or(false);
+        // Faz 26 (CI düzeltmesi): is_test_runner artık derleme-zamanı
+        // cfg!(test) + exe-path heuristiği (ikisi OR) — Linux CI'da
+        // current_exe() heuristiği tutmadığında birim testler mainnet
+        // kapısına takılıyordu. cfg!(test) birim testlerde kesindir.
+        let is_test_runner = cfg!(test)
+            || std::env::current_exe()
+                .map(|p| p.to_string_lossy().contains("deps"))
+                .unwrap_or(false);
         if !is_demo && !is_test_runner && std::env::var("DCA_ALLOW_MAINNET").as_deref() != Ok("1") {
             panic!("CRITICAL SAFETY VIOLATION: Attempted OKX MAINNET connection without DCA_ALLOW_MAINNET=1! Set DCA_OKX_DEMO=1 for demo or explicitly set DCA_ALLOW_MAINNET=1.");
         }
