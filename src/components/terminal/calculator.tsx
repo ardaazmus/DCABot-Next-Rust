@@ -92,7 +92,7 @@ function LiquidationBar({ anchor, liq, leverage }: { anchor: number; liq: number
   const max = Math.max(anchor, liq) * 1.15;
   const liqPct = (liq / max) * 100;
   const anchorPct = (anchor / max) * 100;
-  const bufferPct = Math.max(0, ((anchor - liq) / anchor) * 100);
+  const bufferPct = (Math.abs(anchor - liq) / anchor) * 100;
   return (
     <div className="rounded-lg border border-border bg-surface p-4">
       <div className="mb-2 flex items-center justify-between text-xs">

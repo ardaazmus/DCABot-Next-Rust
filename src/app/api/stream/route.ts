@@ -63,6 +63,7 @@ export async function GET(req: Request) {
     upstream = await fetch(target, {
       cache: "no-store",
       redirect: "error",
+      signal: req.signal,
       headers: {
         Accept: "text/event-stream",
         ...(key ? { Authorization: `Bearer ${key}` } : {}),

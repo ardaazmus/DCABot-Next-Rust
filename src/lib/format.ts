@@ -6,19 +6,51 @@
 
 export function fracToNum(s: string | number | null | undefined): number | null {
   if (s === null || s === undefined) return null;
-  if (typeof s === "number") return isFinite(s) ? s : null;
+  if (typeof s === "number") return isFinite(s) ? (s === 0 ? 0 : s) : null;
   const t = s.trim();
   if (t === "") return null;
   if (t.includes("/")) {
     const parts = t.split("/");
     if (parts.length !== 2) return null;
-    const n = Number(parts[0]);
-    const d = Number(parts[1]);
-    if (!isFinite(n) || !isFinite(d) || d === 0) return null;
-    return n / d;
+    const rawN = parts[0].trim();
+    const rawD = parts[1].trim();
+    if (rawN === "" || rawD === "") return null;
+    const n = Number(rawN);
+    const d = Number(rawD);
+    if (isFinite(n) && isFinite(d)) {
+      if (d === 0) return null;
+      const q = n / d;
+      return q === 0 ? 0 : q;
+    }
+    // 4096-bit BigInt rational fallback: dca_math::Fraction can emit >308-digit
+    // numerators/denominators whose ratio is well within IEEE-754 range even
+    // though Number(rawN) and Number(rawD) individually overflow to ±Infinity.
+    if (/^[+-]?\d+$/.test(rawN) && /^[+-]?\d+$/.test(rawD)) {
+      try {
+        const bn = BigInt(rawN);
+        const bd = BigInt(rawD);
+        if (bd === BigInt(0)) return null;
+        const zero = BigInt(0);
+        const neg = (bn < zero) !== (bd < zero);
+        const absN = bn < zero ? -bn : bn;
+        const absD = bd < zero ? -bd : bd;
+        const intPart = absN / absD;
+        const intNum = Number(intPart);
+        if (!isFinite(intNum)) return null;
+        const rem = absN % absD;
+        const scale = BigInt("1000000000000000"); // 10^15 (~53-bit mantissa precision)
+        const fracScaled = Number((rem * scale) / absD) / 1e15;
+        const res = intNum + fracScaled;
+        if (!isFinite(res)) return null;
+        return neg ? (res === 0 ? 0 : -res) : res;
+      } catch {
+        return null;
+      }
+    }
+    return null;
   }
   const v = Number(t);
-  return isFinite(v) ? v : null;
+  return isFinite(v) ? (v === 0 ? 0 : v) : null;
 }
 
 /**
@@ -54,10 +86,14 @@ export function fmtFrac(s: string | number | null | undefined, dec?: number): st
   return nf(d, d).format(v);
 }
 
-/** USD money display: "$1,234.56". */
+/** USD money display: "$1,234.56" or "-$1,234.56" (never "$-0.00"). */
 export function fmtUsd(s: string | number | null | undefined, dec = 2): string {
   const v = fracToNum(s);
   if (v === null) return "—";
+  if (v < 0) {
+    const mag = nf(dec, dec).format(Math.abs(v));
+    return Number(mag.replace(/,/g, "")) === 0 ? "$" + mag : "-$" + mag;
+  }
   return "$" + nf(dec, dec).format(v);
 }
 
@@ -66,7 +102,8 @@ export function fmtUsdSigned(s: string | number | null | undefined, dec = 2): st
   const v = fracToNum(s);
   if (v === null) return "—";
   if (v < 0) {
-    return "-$" + nf(dec, dec).format(Math.abs(v));
+    const mag = nf(dec, dec).format(Math.abs(v));
+    return Number(mag.replace(/,/g, "")) === 0 ? "+$" + mag : "-$" + mag;
   }
   return "+$" + nf(dec, dec).format(v);
 }
@@ -87,7 +124,7 @@ export function fmtPctNum(s: string | number | null | undefined, dec = 2): strin
 
 export function fmtNum(v: number | null | undefined, dec = 2): string {
   if (v === null || v === undefined || !isFinite(v)) return "—";
-  return nf(dec, dec).format(v);
+  return nf(dec, dec).format(v === 0 ? 0 : v);
 }
 
 /** Timestamp (ms) → "12 Oca 2026 14:03:22" style (tr-TR). */

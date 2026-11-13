@@ -257,7 +257,7 @@ export function DealProgressBar({
               <span className="flex items-center gap-1 text-emerald-400">
                 <Flag className="h-3 w-3" />
                 <span>TP: {fmtFrac(metrics.tp)}</span>
-                <span className="font-semibold">(+{metrics.distToTpPct.toFixed(2)}%)</span>
+                <span className="font-semibold">({isShort ? "-" : "+"}{metrics.distToTpPct.toFixed(2)}%)</span>
               </span>
             )}
           </div>
@@ -303,7 +303,7 @@ export function DealProgressBar({
           </div>
           {metrics.nextSo > 0 && !isBagHolding && (
             <span className="text-amber-300/90 font-medium">
-              Sonraki SO: {fmtFrac(metrics.nextSo)} (-%{metrics.nextSoDistPct?.toFixed(1)})
+              Sonraki SO: {fmtFrac(metrics.nextSo)} ({isShort ? "+" : "-"}%{metrics.nextSoDistPct?.toFixed(1)})
             </span>
           )}
         </div>
@@ -334,7 +334,13 @@ export function DealProgressBar({
           </div>
           <div className="num mt-1.5 text-xl font-black text-cyan-100">{fmtFrac(metrics.cur)}</div>
           <div className="mt-1 text-[10px] text-slate-400">
-            {metrics.isProfitable ? "Maliyetin üzerinde (Kârda)" : "Maliyetin altında (Çekilmede)"}
+            {metrics.isProfitable
+              ? isShort
+                ? "Maliyetin altında (Short kârda)"
+                : "Maliyetin üzerinde (Kârda)"
+              : isShort
+                ? "Maliyetin üzerinde (Short çekilmede)"
+                : "Maliyetin altında (Çekilmede)"}
           </div>
         </div>
 
@@ -357,7 +363,7 @@ export function DealProgressBar({
             </span>
             {metrics.distToTpPct != null && (
               <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[9px] font-bold text-emerald-400">
-                +%{metrics.distToTpPct.toFixed(2)} kaldı
+                {isShort ? "-" : "+"}%{metrics.distToTpPct.toFixed(2)} kaldı
               </span>
             )}
           </div>
@@ -396,7 +402,7 @@ export function DealProgressBar({
           <div className="mt-1 text-[10px] text-slate-400">
             {marginMode && metrics.liqDistFromCurPct != null ? (
               <span className={cn("font-bold", metrics.liqTier?.color)}>
-                Şimdiki Fiyata Mesafe: -%{metrics.liqDistFromCurPct.toFixed(1)}
+                Şimdiki Fiyata Mesafe: {isShort ? "+" : "-"}%{metrics.liqDistFromCurPct.toFixed(1)}
               </span>
             ) : (
               "Spot işlemde tasfiye riski bulunmaz"
@@ -445,13 +451,15 @@ export function DealProgressBar({
                 <span className="text-slate-400">Şimdiki Fiyata Oran:</span>
                 <span className="num font-black text-rose-400">
                   {marginMode && metrics.liqDistFromCurPct != null
-                    ? `-%${metrics.liqDistFromCurPct.toFixed(2)}`
+                    ? `${isShort ? "+" : "-"}%${metrics.liqDistFromCurPct.toFixed(2)}`
                     : "—"}
                 </span>
               </div>
               <div className="mt-0.5 text-[9px] text-slate-400 leading-snug">
                 {marginMode
-                  ? "Piyasa bu oranda düştüğünde marjin tükenir ve tasfiye olur"
+                  ? isShort
+                    ? "Piyasa bu oranda yükseldiğinde marjin tükenir ve tasfiye olur"
+                    : "Piyasa bu oranda düştüğünde marjin tükenir ve tasfiye olur"
                   : "Spot modunda likidasyon yoktur"}
               </div>
             </div>
@@ -506,16 +514,22 @@ export function DealProgressBar({
                       )}
                     >
                       {so.isFilled
-                        ? `Alındı (${so.distPct >= 0 ? `-%${so.distPct.toFixed(2)}` : `+${Math.abs(so.distPct).toFixed(2)}%`})`
-                        : `-%${Math.abs(so.distPct).toFixed(2)}`}
+                        ? `Doldu (${so.distPct >= 0 ? `${isShort ? "+" : "-"}%${so.distPct.toFixed(2)}` : `${isShort ? "-" : "+"}%${Math.abs(so.distPct).toFixed(2)}`})`
+                        : `${isShort ? "+" : "-"}%${Math.abs(so.distPct).toFixed(2)}`}
                     </span>
                   </div>
                   <div className="mt-0.5 text-[9px] text-slate-400 leading-snug">
                     {so.isFilled
-                      ? "Pozisyona dahil edildi, ortalamayı aşağı çekti"
+                      ? isShort
+                        ? "Pozisyona dahil edildi, Short ortalama girişini yukarı çekti"
+                        : "Pozisyona dahil edildi, ortalamayı aşağı çekti"
                       : so.isNext
-                        ? `Fiyat %${Math.abs(so.distPct).toFixed(2)} daha düşerse otomatik alım yapacak`
-                        : "Daha derin düşüşlerde devreye girecek kademe"}
+                        ? isShort
+                          ? `Fiyat %${Math.abs(so.distPct).toFixed(2)} daha yükselirse otomatik satış (SO) yapacak`
+                          : `Fiyat %${Math.abs(so.distPct).toFixed(2)} daha düşerse otomatik alım yapacak`
+                        : isShort
+                          ? "Daha sert yükselişlerde devreye girecek kademe"
+                          : "Daha derin düşüşlerde devreye girecek kademe"}
                   </div>
                 </div>
               </div>
@@ -541,11 +555,13 @@ export function DealProgressBar({
                 <div className="flex items-center justify-between">
                   <span className="text-slate-400">Şimdiki Fiyata Oran:</span>
                   <span className="num font-black text-amber-400">
-                    {metrics.nextSoDistPct != null ? `-%${metrics.nextSoDistPct.toFixed(2)}` : "—"}
+                    {metrics.nextSoDistPct != null ? `${isShort ? "+" : "-"}%${metrics.nextSoDistPct.toFixed(2)}` : "—"}
                   </span>
                 </div>
                 <div className="mt-0.5 text-[9px] text-slate-400 leading-snug">
-                  Fiyat bu oranda düştüğünde bir sonraki güvenlik emri tetiklenir
+                  {isShort
+                    ? "Fiyat bu oranda yükseldiğinde bir sonraki güvenlik emri tetiklenir"
+                    : "Fiyat bu oranda düştüğünde bir sonraki güvenlik emri tetiklenir"}
                 </div>
               </div>
             </div>
@@ -669,17 +685,24 @@ export function DealProgressBar({
           <div className="flex items-center gap-1.5 text-[11px] text-slate-400">
             <Info className="h-3.5 w-3.5 text-cyan-400 shrink-0" />
             <span>
-              {metrics.isProfitable
-                ? `Fiyat maliyetin %${Math.abs(metrics.devFromAvgPct).toFixed(2)} üzerinde ($${fmtFrac(metrics.cur)}). TP hedefine %${metrics.distToTpPct?.toFixed(2) ?? "0"} kaldı.${
-                    marginMode && metrics.liqDistFromCurPct != null ? ` Likidasyona %${metrics.liqDistFromCurPct.toFixed(1)} güvenli mesafe var.` : ""
-                  }`
-                : `Fiyat maliyetin %${Math.abs(metrics.devFromAvgPct).toFixed(2)} altında seyrediyor ($${fmtFrac(metrics.cur)}).${
-                    metrics.nextSo > 0 && !isBagHolding
-                      ? ` Sonraki kademe (SO${nextSafetyLevel ?? safetyTriggered + 1}) %${metrics.nextSoDistPct?.toFixed(2)} düşüş kaldığında ($${fmtFrac(metrics.nextSo)}) tetiklenecek.`
-                      : " Tüm güvenlik kademeleri devrede."
-                  }${
-                    marginMode && metrics.liqDistFromCurPct != null ? ` Likidasyon seviyesine (%${metrics.liqDistFromCurPct.toFixed(1)}) güvenli mesafe bulunmaktadır.` : ""
-                  }`}
+              {(() => {
+                const liqNote =
+                  marginMode && metrics.liqDistFromCurPct != null
+                    ? metrics.liqDistFromCurPct < 15
+                      ? ` DİKKAT: Likidasyon seviyesine yalnızca %${metrics.liqDistFromCurPct.toFixed(1)} kaldı (kritik bölge)!`
+                      : metrics.liqDistFromCurPct < 30
+                        ? ` Likidasyon seviyesine %${metrics.liqDistFromCurPct.toFixed(1)} mesafe var (dikkat bölgesi).`
+                        : ` Likidasyon seviyesine (%${metrics.liqDistFromCurPct.toFixed(1)}) güvenli mesafe bulunmaktadır.`
+                    : "";
+                if (metrics.isProfitable) {
+                  return `Fiyat maliyetin %${Math.abs(metrics.devFromAvgPct).toFixed(2)} ${isShort ? "altında" : "üzerinde"} ($${fmtFrac(metrics.cur)}). TP hedefine %${metrics.distToTpPct?.toFixed(2) ?? "0"} kaldı.${liqNote}`;
+                }
+                const soNote =
+                  metrics.nextSo > 0 && !isBagHolding
+                    ? ` Sonraki kademe (SO${nextSafetyLevel ?? safetyTriggered + 1}) %${metrics.nextSoDistPct?.toFixed(2)} ${isShort ? "yükseliş" : "düşüş"} kaldığında ($${fmtFrac(metrics.nextSo)}) tetiklenecek.`
+                    : " Tüm güvenlik kademeleri devrede.";
+                return `Fiyat maliyetin %${Math.abs(metrics.devFromAvgPct).toFixed(2)} ${isShort ? "üzerinde" : "altında"} seyrediyor ($${fmtFrac(metrics.cur)}).${soNote}${liqNote}`;
+              })()}
             </span>
           </div>
         </div>
