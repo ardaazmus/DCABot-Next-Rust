@@ -1077,14 +1077,14 @@ fn position_leg_mismatch(
     let fmt = |v: &Fraction| v.to_half_even_display(8);
     if Fraction::cmp(&kernel.qty, &engine.qty) != std::cmp::Ordering::Equal {
         return Some(format!(
-            "HALTED_RESTORE: {leg} bacak ADÇ kernel={} ↔ engine={} — manuel uzlaştırma gerekli (kernel RESET action ile açılır)",
+            "HALTED_RESTORE: {leg} bacak MİKTAR kernel={} ↔ engine={} — uzlaştırma gerekli (POST /actions {{\"action\":\"RESET_KERNEL\"}} ile açılır; PAPER'da pozisyon mirror'a hizalanır)",
             fmt(&kernel.qty),
             fmt(&engine.qty)
         ));
     }
     if kernel.direction != engine.direction {
         return Some(format!(
-            "HALTED_RESTORE: {leg} bacak YÖN kernel={} ↔ engine={} — manuel uzlaştırma gerekli",
+            "HALTED_RESTORE: {leg} bacak YÖN kernel={} ↔ engine={} — uzlaştırma gerekli (POST /actions {{\"action\":\"RESET_KERNEL\"}})",
             kernel.direction,
             engine.direction
         ));
@@ -1102,7 +1102,7 @@ fn position_leg_mismatch(
     };
     if !avg_ok {
         return Some(format!(
-            "HALTED_RESTORE: {leg} bacak ORTALAMA kernel={} ↔ engine={} (±1 tick tolerans) — manuel uzlaştırma gerekli",
+            "HALTED_RESTORE: {leg} bacak ORTALAMA kernel={} ↔ engine={} (±1 tick tolerans) — uzlaştırma gerekli (POST /actions {{\"action\":\"RESET_KERNEL\"}})",
             kernel.avg_price.as_ref().map(|v| fmt(v)).unwrap_or_else(|| "yok".into()),
             engine.avg_price.as_ref().map(|v| fmt(v)).unwrap_or_else(|| "yok".into())
         ));

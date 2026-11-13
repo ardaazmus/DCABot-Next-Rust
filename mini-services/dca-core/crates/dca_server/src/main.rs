@@ -2292,6 +2292,34 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
             // (gerçek veri bozulması) sonrası operatör buradan açar.
             // Faz 21 (N-8): HEDGE kernel'in halt'ı da açılır — eski kod yalnız
             // ana kernel'i açıyordu, hedge bacak kalıcı duruyor kalıyordu.
+            // Faz 28-D (günlük denetim 2026-11-13): HALTED_RESTORE pozisyon
+            // uyumsuzluğu varken yalnız halt açmak TEHLİKELİYDİ — kernel eski
+            // qty ile TP/SL hesaplar, hata derinleşirdi (t9: 0.01104 ↔
+            // 0.00542). PAPER'da motor mirror'ı fill defterinden türediğinden
+            // GERÇEK kabul edilir: kernel pozisyonu (adet/yön/ortalama)
+            // mirror'a hizalanır. LIVE'da hizalama YAPILMAZ — venue pozisyonu
+            // ile mutabakat operatörde (davranış değişmez).
+            let realigned = if rt.mode == "PAPER" {
+                match &mut rt.engine_kind {
+                    dca_strategy::EngineTag::Dca(e) => {
+                        rt.stepper.position = e.mirror.clone();
+                    }
+                    dca_strategy::EngineTag::Hedge(h) => {
+                        rt.stepper.position = h.main.mirror.clone();
+                        if let Some(hs) = rt.hedge_stepper.as_mut() {
+                            if let Some(leg) = &h.hedge {
+                                hs.position = leg.mirror.clone();
+                            }
+                        }
+                    }
+                    dca_strategy::EngineTag::Grid(g) => {
+                        rt.stepper.position = g.mirror.clone();
+                    }
+                }
+                true
+            } else {
+                false
+            };
             rt.stepper.halted = None;
             rt.stepper.prev_bar_ts = None;
             rt.stepper.bar_interval_ms = 0;
@@ -2301,7 +2329,12 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
                     hs.bar_interval_ms = 0;
                 }
             }
-            state::persist_event(&app, &id, "WARN", "RESET_KERNEL", "kernel halt temizlendi (hedge dâhil) — imleç sıfırlandı, bir sonraki kapalı bardan warmup ile devam").await;
+            let scope = if realigned {
+                "PAPER: pozisyonlar engine mirror'a hizalandı; "
+            } else {
+                "LIVE: hizalama yapılmadı — venue mutabakatı operatörde; "
+            };
+            state::persist_event(&app, &id, "WARN", "RESET_KERNEL", &format!("kernel halt temizlendi (hedge dâhil) — {scope}imleç sıfırlandı, bir sonraki kapalı bardan warmup ile devam")).await;
         }
         other => return Err(err422(format!("unknown action: {other}"))),
     }
