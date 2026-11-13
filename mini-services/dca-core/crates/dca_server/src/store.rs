@@ -193,6 +193,15 @@ impl Db {
             conn.execute("ALTER TABLE events ADD COLUMN trace_id TEXT", [])
                 .map_err(|e| e.to_string())?;
         }
+        // Faz 28 (P1-3) göçü: deals tablosu eski fazlardan kalansa net_pnl
+        // kolonu yoktur — CREATE TABLE IF NOT EXISTS mevcut tabloya dokunmaz.
+        // Eksik kolon DealClosed yazımını CRITICAL ile düşürürdü (günlük
+        // denetim 2026-11-13'te t2/t5'te canlı yakalandı).
+        let deal_cols = cols("deals")?;
+        if !deal_cols.iter().any(|c| c == "net_pnl") {
+            conn.execute("ALTER TABLE deals ADD COLUMN net_pnl TEXT", [])
+                .map_err(|e| e.to_string())?;
+        }
         Ok(())
     }
 }
