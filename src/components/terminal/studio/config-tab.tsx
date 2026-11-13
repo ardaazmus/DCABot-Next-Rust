@@ -44,6 +44,7 @@ export function ConfigTab({ botId, configHint }: { botId: string; configHint: Bo
 
   const deviationPct = (() => {
     if (meta?.deviation_pct) return (fracToNum(meta.deviation_pct) ?? 0) * 100;
+    if (bot?.config?.deviation_pct) return (fracToNum(bot.config.deviation_pct) ?? 0) * 100;
     if (configHint) return (fracToNum(configHint.deviation_pct) ?? 0) * 100;
     return null;
   })();
