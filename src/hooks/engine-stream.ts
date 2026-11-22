@@ -106,6 +106,7 @@ const DATA_EVENT_TYPES = new Set([
   "ORDER",
   "LOG",
   "FUNDING",
+  "RISK",
   "LIQUIDATION",
   "WEBHOOK_START",
   "KILL_SWITCH",
@@ -126,6 +127,7 @@ let refCount = 0;
 let evtId = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectAttempts = 0;
+let authBlocked = false;
 
 function pushEvent(type: string, payload: Record<string, unknown>) {
   evtId += 1;
@@ -137,8 +139,43 @@ function pushEvent(type: string, payload: Record<string, unknown>) {
   }));
 }
 
+function scheduleReconnect() {
+  if (refCount <= 0 || reconnectTimer || authBlocked) return;
+  const delay = Math.min(30_000, 500 * 2 ** Math.min(reconnectAttempts, 6));
+  reconnectAttempts += 1;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (refCount > 0) void reconnectAfterAuthCheck();
+  }, delay);
+}
+
+async function reconnectAfterAuthCheck() {
+  try {
+    const response = await fetch("/api/auth/check", { cache: "no-store" });
+    if (!response.ok) {
+      if (response.status === 401 || response.status === 403) {
+        authBlocked = true;
+      } else {
+        scheduleReconnect();
+      }
+      return;
+    }
+    const state = (await response.json()) as { authRequired?: boolean; authenticated?: boolean };
+    authBlocked = state.authRequired === true && state.authenticated !== true;
+    if (authBlocked) return;
+  } catch {
+    scheduleReconnect();
+    return;
+  }
+  if (refCount > 0) ensureStream();
+}
+
 function ensureStream() {
-  if (es) return;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (es || authBlocked || refCount <= 0) return;
   let source: EventSource;
   try {
     source = new EventSource(engineUrl("/api/stream"));
@@ -146,6 +183,7 @@ function ensureStream() {
   } catch {
     es = null;
     useEngineStream.setState({ connected: false });
+    scheduleReconnect();
     return;
   }
   const handle = (type: string) => (e: MessageEvent<string>) => {
@@ -190,13 +228,16 @@ function ensureStream() {
     if (es !== source || source.readyState !== EventSource.CLOSED || refCount <= 0 || reconnectTimer) return;
     source.close();
     es = null;
-    const delay = Math.min(30_000, 500 * 2 ** Math.min(reconnectAttempts, 6));
-    reconnectAttempts += 1;
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null;
-      if (refCount > 0) ensureStream();
-    }, delay);
+    void reconnectAfterAuthCheck();
   };
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("dcabot:auth-changed", () => {
+    authBlocked = false;
+    reconnectAttempts = 0;
+    ensureStream();
+  });
 }
 
 function teardownStreamIfIdle() {
@@ -206,6 +247,7 @@ function teardownStreamIfIdle() {
       reconnectTimer = null;
     }
     reconnectAttempts = 0;
+    authBlocked = false;
     if (es) {
       es.close();
       es = null;

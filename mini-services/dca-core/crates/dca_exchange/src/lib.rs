@@ -16,9 +16,16 @@ use dca_math::Instrument;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-fn normalize_venue_base_url(raw: &str, venue: &str, allowed_hosts: &[&str]) -> Result<(String, String), String> {
+fn normalize_venue_base_url(
+    raw: &str,
+    venue: &str,
+    allowed_hosts: &[&str],
+) -> Result<(String, String), String> {
     let url = reqwest::Url::parse(raw).map_err(|_| format!("{venue} base URL geçersiz"))?;
-    let host = url.host_str().ok_or_else(|| format!("{venue} base URL ana makine içermiyor"))?.to_ascii_lowercase();
+    let host = url
+        .host_str()
+        .ok_or_else(|| format!("{venue} base URL ana makine içermiyor"))?
+        .to_ascii_lowercase();
     if url.scheme() != "https"
         || url.port_or_known_default() != Some(443)
         || !url.username().is_empty()
@@ -27,7 +34,9 @@ fn normalize_venue_base_url(raw: &str, venue: &str, allowed_hosts: &[&str]) -> R
         || url.fragment().is_some()
         || url.path() != "/"
     {
-        return Err(format!("{venue} base URL yalnızca temiz HTTPS kök adresi olabilir"));
+        return Err(format!(
+            "{venue} base URL yalnızca temiz HTTPS kök adresi olabilir"
+        ));
     }
     if !allowed_hosts.iter().any(|allowed| host == *allowed) {
         return Err(format!("{venue} base URL izinli borsa alan adında değil"));
@@ -37,18 +46,41 @@ fn normalize_venue_base_url(raw: &str, venue: &str, allowed_hosts: &[&str]) -> R
 
 /// Resolve exchange endpoints to known HTTPS origins and require an explicit
 /// opt-in before a release binary can target a mainnet host.
-pub fn guarded_venue_base_url(raw: &str, venue: &str, allowed_hosts: &[&str], mainnet_hosts: &[&str], demo_or_testnet: bool) -> String {
-    let (url, host) = normalize_venue_base_url(raw, venue, allowed_hosts)
-        .unwrap_or_else(|error| panic!("unsafe exchange endpoint: {error}"));
-    let test_runner = cfg!(test)
-        || std::env::current_exe()
-            .map(|path| path.to_string_lossy().contains("deps"))
-            .unwrap_or(false);
+pub fn guarded_venue_base_url(
+    raw: &str,
+    venue: &str,
+    allowed_hosts: &[&str],
+    mainnet_hosts: &[&str],
+    demo_or_testnet: bool,
+) -> String {
+    try_guarded_venue_base_url(raw, venue, allowed_hosts, mainnet_hosts, demo_or_testnet)
+        .unwrap_or_else(|error| panic!("unsafe exchange endpoint: {error}"))
+}
+
+/// Fallible variant for endpoints whose configuration is loaded after the
+/// adapter starts (for example Binance Futures). Invalid configuration must
+/// fail the operation cleanly instead of panicking inside a background task.
+pub fn try_guarded_venue_base_url(
+    raw: &str,
+    venue: &str,
+    allowed_hosts: &[&str],
+    mainnet_hosts: &[&str],
+    demo_or_testnet: bool,
+) -> Result<String, String> {
+    let (url, host) = normalize_venue_base_url(raw, venue, allowed_hosts)?;
+    // `cfg!(test)` is a compile-time test harness signal. Executable path
+    // heuristics such as checking for "deps" are attacker-controlled and
+    // must never disable the explicit mainnet opt-in.
+    let test_runner = cfg!(test);
     let is_mainnet = mainnet_hosts.iter().any(|mainnet| host == *mainnet);
-    if is_mainnet && !demo_or_testnet && !test_runner && std::env::var("DCA_ALLOW_MAINNET").as_deref() != Ok("1") {
-        panic!("CRITICAL SAFETY VIOLATION: {venue} mainnet requires DCA_ALLOW_MAINNET=1; select demo/testnet for local use.");
+    if is_mainnet
+        && !demo_or_testnet
+        && !test_runner
+        && std::env::var("DCA_ALLOW_MAINNET").as_deref() != Ok("1")
+    {
+        return Err(format!("CRITICAL SAFETY VIOLATION: {venue} mainnet requires DCA_ALLOW_MAINNET=1; select demo/testnet for local use."));
     }
-    url
+    Ok(url)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,7 +196,9 @@ pub fn validate_key_permissions(p: &KeyPermissions) -> WithdrawalGate {
         );
     }
     if p.read_only {
-        return WithdrawalGate::HardFail("API key is read-only; trading permission required.".into());
+        return WithdrawalGate::HardFail(
+            "API key is read-only; trading permission required.".into(),
+        );
     }
     WithdrawalGate::Ok
 }
@@ -200,7 +234,10 @@ impl fmt::Debug for VenueCreds {
         f.debug_struct("VenueCreds")
             .field("key", &"[REDACTED]")
             .field("secret", &"[REDACTED]")
-            .field("passphrase", &self.passphrase.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "passphrase",
+                &self.passphrase.as_ref().map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }
@@ -218,7 +255,11 @@ impl Drop for VenueCreds {
 
 impl From<(String, String)> for VenueCreds {
     fn from((key, secret): (String, String)) -> Self {
-        Self { key, secret, passphrase: None }
+        Self {
+            key,
+            secret,
+            passphrase: None,
+        }
     }
 }
 
@@ -229,13 +270,32 @@ pub trait VenueAdapter: Send + Sync {
     async fn server_time_ms(&self) -> Result<i64, String>;
     /// P3-6 L2 derinlik anlık görüntüsü (REST; WS diff akışı yok — kapsam
     /// dışı, dürüst sınır). PAPER desteklemez.
-    async fn orderbook(&self, category: &str, symbol: &str, limit: usize) -> Result<OrderBook, String>;
-    async fn instruments(&self, category: &str, symbol: Option<&str>) -> Result<Vec<Instrument>, String>;
-    async fn klines(&self, category: &str, symbol: &str, interval: &str, limit: usize) -> Result<Vec<Kline>, String>;
+    async fn orderbook(
+        &self,
+        category: &str,
+        symbol: &str,
+        limit: usize,
+    ) -> Result<OrderBook, String>;
+    async fn instruments(
+        &self,
+        category: &str,
+        symbol: Option<&str>,
+    ) -> Result<Vec<Instrument>, String>;
+    async fn klines(
+        &self,
+        category: &str,
+        symbol: &str,
+        interval: &str,
+        limit: usize,
+    ) -> Result<Vec<Kline>, String>;
     async fn ticker(&self, category: &str, symbol: &str) -> Result<TickerSnapshot, String>;
     /// 24h istatistik listesi (tüm semboller). PAPER boş döner.
     async fn tickers_24h(&self, category: &str) -> Result<Vec<Ticker24h>, String>;
-    async fn funding_history(&self, symbol: &str, limit: usize) -> Result<Vec<(i64, String)>, String>;
+    async fn funding_history(
+        &self,
+        symbol: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, String)>, String>;
     /// Faz 22 (P1-23): HESAP-bazlı gerçek ücretler (VIP/komisyon kademesi) —
     /// (maker, taker). Desteklemeyen venue'lar None döner (enstrüman varsayılanı
     /// kalır). Bybit: /v5/account/fee-rate.
@@ -296,7 +356,11 @@ pub trait VenueAdapter: Send + Sync {
     ) -> Result<Option<VenueOrderState>, String> {
         Ok(None)
     }
-    async fn positions(&self, creds: &VenueCreds, symbol: &str) -> Result<Vec<PositionSnapshot>, String>;
+    async fn positions(
+        &self,
+        creds: &VenueCreds,
+        symbol: &str,
+    ) -> Result<Vec<PositionSnapshot>, String>;
     /// Push the bot's configured leverage to the venue (linear futures only).
     /// Default: no-op (paper venues keep leverage in simulation state).
     async fn set_leverage(
@@ -397,7 +461,8 @@ pub async fn sweep_missing_fills(
     tracked: &[TrackedOrder],
 ) -> Result<Vec<MissingFill>, String> {
     let open = adapter.open_orders(creds, category, symbol).await?;
-    let live_links: std::collections::HashSet<&str> = open.iter().map(|o| o.order_link_id.as_str()).collect();
+    let live_links: std::collections::HashSet<&str> =
+        open.iter().map(|o| o.order_link_id.as_str()).collect();
     let mut missing = Vec::new();
     for t in tracked {
         if live_links.contains(t.id.as_str()) {
@@ -407,8 +472,17 @@ pub async fn sweep_missing_fills(
         match adapter.query_order(creds, category, symbol, &t.id).await {
             Ok(Some(st)) => {
                 let status = st.status.as_str();
-                let is_terminal_filled = status == "Filled" || status == "PartiallyFilled";
-                if is_terminal_filled && !st.cum_exec_qty.is_zero() {
+                let has_execution = !st.cum_exec_qty.is_zero();
+                let terminal = matches!(
+                    status,
+                    "Filled"
+                        | "PartiallyFilled"
+                        | "Cancelled"
+                        | "Expired"
+                        | "Rejected"
+                        | "Deactivated"
+                );
+                if has_execution && terminal {
                     missing.push(MissingFill {
                         order_id: t.id.clone(),
                         price: st.price.unwrap_or_else(|| t.price.clone()),
@@ -452,11 +526,23 @@ mod live_sweep_tests {
         async fn instruments(&self, _c: &str, _s: Option<&str>) -> Result<Vec<Instrument>, String> {
             Ok(vec![])
         }
-        async fn klines(&self, _c: &str, _s: &str, _i: &str, _l: usize) -> Result<Vec<Kline>, String> {
+        async fn klines(
+            &self,
+            _c: &str,
+            _s: &str,
+            _i: &str,
+            _l: usize,
+        ) -> Result<Vec<Kline>, String> {
             Ok(vec![])
         }
         async fn ticker(&self, _c: &str, s: &str) -> Result<TickerSnapshot, String> {
-            Ok(TickerSnapshot { symbol: s.into(), last_price: Fraction::one(), mark_price: Fraction::one(), funding_rate: None, next_funding_ts: None })
+            Ok(TickerSnapshot {
+                symbol: s.into(),
+                last_price: Fraction::one(),
+                mark_price: Fraction::one(),
+                funding_rate: None,
+                next_funding_ts: None,
+            })
         }
         async fn funding_history(&self, _s: &str, _l: usize) -> Result<Vec<(i64, String)>, String> {
             Ok(vec![])
@@ -465,18 +551,42 @@ mod live_sweep_tests {
             Ok(vec![])
         }
         async fn key_permissions(&self, _c: &VenueCreds) -> Result<KeyPermissions, String> {
-            Ok(KeyPermissions { read_only: false, can_withdraw: false, spot_trade: true, contract_trade: true, ips: vec![], note: "stub".into() })
+            Ok(KeyPermissions {
+                read_only: false,
+                can_withdraw: false,
+                spot_trade: true,
+                contract_trade: true,
+                ips: vec![],
+                note: "stub".into(),
+            })
         }
         async fn wallet(&self, _c: &VenueCreds, c: &str) -> Result<WalletSnapshot, String> {
-            Ok(WalletSnapshot { coin: c.into(), wallet_balance: Fraction::zero(), available: Fraction::zero(), equity: Fraction::zero(), unrealized_pnl: Fraction::zero() })
+            Ok(WalletSnapshot {
+                coin: c.into(),
+                wallet_balance: Fraction::zero(),
+                available: Fraction::zero(),
+                equity: Fraction::zero(),
+                unrealized_pnl: Fraction::zero(),
+            })
         }
         async fn place_order(&self, _c: &VenueCreds, _r: &OrderRequest) -> Result<String, String> {
             Ok("stub-order".into())
         }
-        async fn cancel_order(&self, _c: &VenueCreds, _cat: &str, _sym: &str, _link: &str) -> Result<(), String> {
+        async fn cancel_order(
+            &self,
+            _c: &VenueCreds,
+            _cat: &str,
+            _sym: &str,
+            _link: &str,
+        ) -> Result<(), String> {
             Ok(())
         }
-        async fn open_orders(&self, _c: &VenueCreds, _cat: &str, _sym: &str) -> Result<Vec<VenueOrderState>, String> {
+        async fn open_orders(
+            &self,
+            _c: &VenueCreds,
+            _cat: &str,
+            _sym: &str,
+        ) -> Result<Vec<VenueOrderState>, String> {
             Ok(self
                 .open_link_ids
                 .iter()
@@ -502,11 +612,20 @@ mod live_sweep_tests {
         ) -> Result<Option<VenueOrderState>, String> {
             Ok(self.query_result.get(link).cloned())
         }
-        async fn positions(&self, _c: &VenueCreds, _sym: &str) -> Result<Vec<PositionSnapshot>, String> {
+        async fn positions(
+            &self,
+            _c: &VenueCreds,
+            _sym: &str,
+        ) -> Result<Vec<PositionSnapshot>, String> {
             Ok(vec![])
         }
         async fn orderbook(&self, _c: &str, s: &str, _l: usize) -> Result<OrderBook, String> {
-            Ok(OrderBook { symbol: s.into(), bids: vec![], asks: vec![], ts: 0 })
+            Ok(OrderBook {
+                symbol: s.into(),
+                bids: vec![],
+                asks: vec![],
+                ts: 0,
+            })
         }
     }
 
@@ -527,14 +646,35 @@ mod live_sweep_tests {
                 status: "Filled".into(),
             },
         );
-        let adapter = StubVenue { open_link_ids: vec!["still-open".into()], query_result };
+        let adapter = StubVenue {
+            open_link_ids: vec!["still-open".into()],
+            query_result,
+        };
         let tracked = vec![
-            TrackedOrder { id: "vanished".into(), side: dca_math::Side::Buy, price: Fraction::from_u64(100) },
-            TrackedOrder { id: "still-open".into(), side: dca_math::Side::Sell, price: Fraction::from_u64(110) },
+            TrackedOrder {
+                id: "vanished".into(),
+                side: dca_math::Side::Buy,
+                price: Fraction::from_u64(100),
+            },
+            TrackedOrder {
+                id: "still-open".into(),
+                side: dca_math::Side::Sell,
+                price: Fraction::from_u64(110),
+            },
         ];
-        let creds = VenueCreds { key: "k".into(), secret: "s".into(), passphrase: None };
-        let missing = sweep_missing_fills(&adapter, &creds, "spot", "TESTUSDT", &tracked).await.unwrap();
-        assert_eq!(missing.len(), 1, "sadece FILLED olan vanished order üretilir");
+        let creds = VenueCreds {
+            key: "k".into(),
+            secret: "s".into(),
+            passphrase: None,
+        };
+        let missing = sweep_missing_fills(&adapter, &creds, "spot", "TESTUSDT", &tracked)
+            .await
+            .unwrap();
+        assert_eq!(
+            missing.len(),
+            1,
+            "sadece FILLED olan vanished order üretilir"
+        );
         assert_eq!(missing[0].order_id, "vanished");
         assert_eq!(missing[0].price.to_string(), "100");
         assert_eq!(missing[0].side, dca_math::Side::Buy);
@@ -543,13 +683,30 @@ mod live_sweep_tests {
 
     #[tokio::test]
     async fn sweep_empty_when_all_orders_still_resting() {
-        let adapter = StubVenue { open_link_ids: vec!["a".into(), "b".into()], query_result: std::collections::HashMap::new() };
+        let adapter = StubVenue {
+            open_link_ids: vec!["a".into(), "b".into()],
+            query_result: std::collections::HashMap::new(),
+        };
         let tracked = vec![
-            TrackedOrder { id: "a".into(), side: dca_math::Side::Buy, price: Fraction::one() },
-            TrackedOrder { id: "b".into(), side: dca_math::Side::Sell, price: Fraction::one() },
+            TrackedOrder {
+                id: "a".into(),
+                side: dca_math::Side::Buy,
+                price: Fraction::one(),
+            },
+            TrackedOrder {
+                id: "b".into(),
+                side: dca_math::Side::Sell,
+                price: Fraction::one(),
+            },
         ];
-        let creds = VenueCreds { key: "k".into(), secret: "s".into(), passphrase: None };
-        let missing = sweep_missing_fills(&adapter, &creds, "spot", "TESTUSDT", &tracked).await.unwrap();
+        let creds = VenueCreds {
+            key: "k".into(),
+            secret: "s".into(),
+            passphrase: None,
+        };
+        let missing = sweep_missing_fills(&adapter, &creds, "spot", "TESTUSDT", &tracked)
+            .await
+            .unwrap();
         assert!(missing.is_empty());
     }
 
@@ -570,11 +727,66 @@ mod live_sweep_tests {
                 status: "Cancelled".into(),
             },
         );
-        let adapter = StubVenue { open_link_ids: vec![], query_result };
-        let tracked = vec![TrackedOrder { id: "cancelled".into(), side: dca_math::Side::Buy, price: Fraction::from_u64(100) }];
-        let creds = VenueCreds { key: "k".into(), secret: "s".into(), passphrase: None };
-        let missing = sweep_missing_fills(&adapter, &creds, "spot", "TESTUSDT", &tracked).await.unwrap();
-        assert!(missing.is_empty(), "iptal edilmiş emir fill üretmez (EX-03)");
+        let adapter = StubVenue {
+            open_link_ids: vec![],
+            query_result,
+        };
+        let tracked = vec![TrackedOrder {
+            id: "cancelled".into(),
+            side: dca_math::Side::Buy,
+            price: Fraction::from_u64(100),
+        }];
+        let creds = VenueCreds {
+            key: "k".into(),
+            secret: "s".into(),
+            passphrase: None,
+        };
+        let missing = sweep_missing_fills(&adapter, &creds, "spot", "TESTUSDT", &tracked)
+            .await
+            .unwrap();
+        assert!(
+            missing.is_empty(),
+            "iptal edilmiş emir fill üretmez (EX-03)"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_cancelled_partial_order_preserves_cumulative_execution() {
+        let mut query_result = std::collections::HashMap::new();
+        query_result.insert(
+            "cancelled-partial".into(),
+            VenueOrderState {
+                order_id: "vid-cancelled-partial".into(),
+                order_link_id: "cancelled-partial".into(),
+                symbol: "TESTUSDT".into(),
+                side: "Buy".into(),
+                price: Some(Fraction::from_u64(100)),
+                qty: Fraction::from_u64(2),
+                cum_exec_qty: Fraction::one(),
+                cum_exec_fee: None,
+                status: "Cancelled".into(),
+            },
+        );
+        let adapter = StubVenue {
+            open_link_ids: vec![],
+            query_result,
+        };
+        let tracked = vec![TrackedOrder {
+            id: "cancelled-partial".into(),
+            side: dca_math::Side::Buy,
+            price: Fraction::from_u64(100),
+        }];
+        let creds = VenueCreds {
+            key: "k".into(),
+            secret: "s".into(),
+            passphrase: None,
+        };
+        let missing = sweep_missing_fills(&adapter, &creds, "spot", "TESTUSDT", &tracked)
+            .await
+            .unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].executed_qty, Some(Fraction::one()));
+        assert_eq!(missing[0].order_id, "cancelled-partial");
     }
 }
 
@@ -586,12 +798,20 @@ mod endpoint_and_secret_tests {
     fn venue_endpoint_validation_rejects_custom_hosts_and_non_https_urls() {
         let allowed = ["api.bybit.com", "api-testnet.bybit.com"];
         assert_eq!(
-            normalize_venue_base_url("https://api-testnet.bybit.com/", "Bybit", &allowed).unwrap().0,
+            normalize_venue_base_url("https://api-testnet.bybit.com/", "Bybit", &allowed)
+                .unwrap()
+                .0,
             "https://api-testnet.bybit.com"
         );
-        assert!(normalize_venue_base_url("http://api-testnet.bybit.com", "Bybit", &allowed).is_err());
-        assert!(normalize_venue_base_url("https://api.bybit.com.evil.test", "Bybit", &allowed).is_err());
-        assert!(normalize_venue_base_url("https://user:pass@api.bybit.com", "Bybit", &allowed).is_err());
+        assert!(
+            normalize_venue_base_url("http://api-testnet.bybit.com", "Bybit", &allowed).is_err()
+        );
+        assert!(
+            normalize_venue_base_url("https://api.bybit.com.evil.test", "Bybit", &allowed).is_err()
+        );
+        assert!(
+            normalize_venue_base_url("https://user:pass@api.bybit.com", "Bybit", &allowed).is_err()
+        );
         assert!(normalize_venue_base_url("https://api.bybit.com/path", "Bybit", &allowed).is_err());
         assert!(normalize_venue_base_url("https://api.bybit.com:8443", "Bybit", &allowed).is_err());
     }

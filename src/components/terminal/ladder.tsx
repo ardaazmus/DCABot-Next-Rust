@@ -99,7 +99,7 @@ export function LadderTable({
                     /* UIX-31: SL tetiklenmeden dolmayacak seviye — beklenen durum,
                        alarm değil; kırmızı yerine nötr gri. */
                     <Badge variant="outline" className="border-border-strong bg-surface text-[10px] text-slate-400" title="SL bu fiyatın ötesinde — SL tetiklenmeden bu seviye dolmaz (beklenen davranış)">
-                      SL ALTINDA
+                      {dir === "short" ? "SL ÜSTÜNDE" : "SL ALTINDA"}
                     </Badge>
                   ) : unreachable ? (
                     <Badge variant="outline" className="border-rose-500/40 bg-rose-500/10 text-[10px] text-rose-400">

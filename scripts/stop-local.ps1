@@ -15,8 +15,19 @@ $records = Read-LocalProcessRecords -Path $processFile
 $stopped = 0
 foreach ($port in @(3002, 3000)) {
     $listeners = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue
+    $handledListenerIds = @{}
     foreach ($listener in $listeners) {
         $processId = [int]$listener.OwningProcess
+        if ($handledListenerIds.ContainsKey([string]$processId)) { continue }
+        $handledListenerIds[[string]$processId] = $true
+        $nextPair = Get-VerifiedLocalNextProcessPair -ListenerProcessId $processId -Records $records -ProjectRoot $projectRoot
+        if ($nextPair) {
+            Stop-Process -Id $nextPair.ChildId -Force -ErrorAction SilentlyContinue
+            Stop-Process -Id $nextPair.ParentId -Force -ErrorAction SilentlyContinue
+            Write-Output ("stopped verified Next.js parent/worker PIDs {0}/{1} on port {2}" -f $nextPair.ParentId, $nextPair.ChildId, $port)
+            $stopped++
+            continue
+        }
         $record = $records | Where-Object { [int]$_.Id -eq $processId } | Select-Object -First 1
         $processInfo = Get-CimInstance Win32_Process -Filter ("ProcessId={0}" -f $processId) -ErrorAction SilentlyContinue
         $process = Get-Process -Id $processId -ErrorAction SilentlyContinue

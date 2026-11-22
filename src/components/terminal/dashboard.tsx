@@ -780,7 +780,7 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
                           nextSafetyPrice={b.stats.next_safety_price}
                           nextSafetyLevel={b.stats.next_safety_level}
                           positionQty={b.stats.position_qty}
-                          isShort={b.kind === "DCA_SHORT"}
+                          isShort={b.stats.position_direction === -1 || (b.stats.position_direction == null && b.kind === "DCA_SHORT")}
                           symbol={b.symbol}
                           compact={true}
                         />

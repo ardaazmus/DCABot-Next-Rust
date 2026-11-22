@@ -167,7 +167,7 @@ export function EquityChart({
       ref={wrapRef}
       className="relative w-full select-none"
       tabIndex={0}
-      role="img"
+      role="group"
       aria-label={`${summary} Ok tuşlarıyla nokta gezin.`}
       onMouseMove={(e) => onMove(e.clientX)}
       onMouseLeave={() => setHoverIdx(null)}

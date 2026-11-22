@@ -308,7 +308,7 @@ export function ClosedDealsLedger({ selectedDate, onClearDate, className }: Clos
                   )}
                   title="Profit Factor: net kârlı işlemler toplamı / net zararlı işlemler toplamı (ücret ve funding sonrası)"
                 >
-                  {summary.profitFactor > 99 ? "∞" : summary.profitFactor.toFixed(2)}
+                  {summary.profitFactor >= 99.99 ? "∞" : summary.profitFactor.toFixed(2)}
                 </span>
               </span>
             )}
@@ -367,6 +367,7 @@ export function ClosedDealsLedger({ selectedDate, onClearDate, className }: Clos
             <tbody className="divide-y divide-border/40">
               {deals.map((deal) => {
                 const isWin = deal.netPnl > 0;
+                const isBreakEven = deal.netPnl === 0;
                 const isRiskExit = deal.reason === "SL" || deal.reason === "LIQUIDATION";
                 return (
                   <tr key={deal.id} className="transition-colors hover:bg-surface-2/60">
@@ -409,7 +410,7 @@ export function ClosedDealsLedger({ selectedDate, onClearDate, className }: Clos
                         ) : isRiskExit ? (
                           <XCircle className="h-3 w-3" />
                         ) : null}
-                        {EXIT_REASON_LABEL[deal.reason]}
+                        {EXIT_REASON_LABEL[deal.reason] ?? deal.reason}
                       </span>
                     </td>
 
@@ -430,13 +431,13 @@ export function ClosedDealsLedger({ selectedDate, onClearDate, className }: Clos
                       <div
                         className={cn(
                           "num text-sm font-bold",
-                          isWin ? "text-emerald-400" : "text-rose-400"
+                          isWin ? "text-emerald-400" : isBreakEven ? "text-slate-300" : "text-rose-400"
                         )}
                       >
                         {fmtUsdSigned(deal.netPnl)}
                       </div>
                       <div className="text-[10px] text-slate-500">
-                        {isWin ? "Başarılı" : "Zararlı"}
+                        {isWin ? "Kârlı" : isBreakEven ? "Başabaş" : "Zararlı"}
                       </div>
                     </td>
                   </tr>

@@ -711,7 +711,7 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
                 nextSafetyLevel={s.next_safety_level}
                 positionQty={s.position_qty}
                 ladder={bot.ladder}
-                isShort={bot.kind === "DCA_SHORT"}
+                isShort={bot.stats.position_direction === -1 || (bot.stats.position_direction == null && bot.kind === "DCA_SHORT")}
                 symbol={bot.symbol}
                 compact={false}
               />

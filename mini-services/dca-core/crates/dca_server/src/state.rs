@@ -1,7 +1,10 @@
 //! Shared application state: DB, vault, venue adapters, bot runtimes, SSE.
 
 use crate::store::{Db, Vault};
-use dca_exchange::{binance::BinanceAdapter, bybit::BybitAdapter, okx::OkxAdapter, paper::PaperVenue, VenueAdapter, VenueCreds};
+use dca_exchange::{
+    binance::BinanceAdapter, bybit::BybitAdapter, okx::OkxAdapter, paper::PaperVenue, VenueAdapter,
+    VenueCreds,
+};
 use dca_kernel::{SimulationStepper, StepperConfig};
 use dca_math::fraction::Fraction;
 use dca_math::Instrument;
@@ -75,10 +78,8 @@ pub struct BotRuntime {
     /// Faz 23: boş-geçmiş uyarısı yalnız bir kez (spam koruması).
     #[allow(dead_code)]
     pub funding_empty_warned: bool,
-    /// Faz 23 (derin inceleme): sweep dönen-pencere imleci — poll başına en
-    /// fazla SWEEP_MAX_ORDERS emir taranır; runtimes kilidi ağ çağrılarıyla
-    /// tutulduğundan (bilinen mimari borç, H-1 tam yeniden yapılandırma
-    /// sonraki faz) en kötü durumda kilitleme süresi sınırlıdır.
+    /// LIVE sweep dönen-pencere imleci — her poll en fazla 20 emri ağ kilidi
+    /// dışında tarar.
     pub sweep_cursor: usize,
     /// Faz 13B: hedge bacağı için AYRI kernel stepper (direction=-1) —
     /// EX-06'nın kalıcı çözümü: iki bacak artık tek kernel pozisyonunda
@@ -115,19 +116,31 @@ pub const GATE_KILL: &str = "KILL_SWITCH";
 pub const GATE_FREEZE: &str = "FREEZE";
 
 /// Halt olay mesajı (JSON) — `parse_halt_message` ile eşleşmeli.
-pub fn halt_event_message(action: &str, reason: Option<&str>, by: Option<&str>, at_ms: i64, auto: bool) -> String {
-    serde_json::json!({"action": action, "reason": reason, "by": by, "at_ms": at_ms, "auto": auto}).to_string()
+pub fn halt_event_message(
+    action: &str,
+    reason: Option<&str>,
+    by: Option<&str>,
+    at_ms: i64,
+    auto: bool,
+) -> String {
+    serde_json::json!({"action": action, "reason": reason, "by": by, "at_ms": at_ms, "auto": auto})
+        .to_string()
 }
 
 /// Halt mesajını çözer → (action, reason, by, at_ms, auto). Bozuk kayıt = None
 /// (fail-closed: bozuk olay şalteri açmaz, restart varsayılanı kapalıdır).
-pub fn parse_halt_message(msg: &str) -> Option<(String, Option<String>, Option<String>, i64, bool)> {
+pub fn parse_halt_message(
+    msg: &str,
+) -> Option<(String, Option<String>, Option<String>, i64, bool)> {
     let v: serde_json::Value = serde_json::from_str(msg).ok()?;
     let action = v.get("action")?.as_str()?.to_string();
     if action != "engaged" && action != "released" {
         return None;
     }
-    let reason = v.get("reason").and_then(|r| r.as_str()).map(|s| s.to_string());
+    let reason = v
+        .get("reason")
+        .and_then(|r| r.as_str())
+        .map(|s| s.to_string());
     let by = v.get("by").and_then(|r| r.as_str()).map(|s| s.to_string());
     let at_ms = v.get("at_ms").and_then(|n| n.as_i64()).unwrap_or(0);
     let auto = v.get("auto").and_then(|b| b.as_bool()).unwrap_or(false);
@@ -157,7 +170,12 @@ pub enum LiveIntent {
         is_close: bool,
         gate: GateCtx,
     },
-    Cancel { links: Vec<String>, venue: String, category: String, symbol: String },
+    Cancel {
+        links: Vec<String>,
+        venue: String,
+        category: String,
+        symbol: String,
+    },
 }
 
 impl LiveIntent {
@@ -185,15 +203,51 @@ pub struct GateCtx {
 
 /// Faz 13A-POLL: execute fazının ürettiği sonuç — apply fazı kilit altında tüketir.
 pub enum IntentOutcome {
-    Placed { id: String, side: dca_math::Side, kind: dca_kernel::OrderKind, price: Option<Fraction>, qty: Fraction, role: String },
+    Placed {
+        id: String,
+        side: dca_math::Side,
+        kind: dca_kernel::OrderKind,
+        price: Option<Fraction>,
+        qty: Fraction,
+        role: String,
+    },
     /// Faz 18 (P0-4): dolum kimliği borsa execId'sidir (`fill_key`) — yerel
     /// `now_ms` anahtarı retry/çift cascade turunda çift sayıma açıktı.
-    MarketFilled { id: String, side: dca_math::Side, kind: dca_kernel::OrderKind, role: String, qty_filled: Fraction, price: Fraction, fee: Option<Fraction>, fill_key: String },
-    MarketOpen { id: String, side: dca_math::Side, kind: dca_kernel::OrderKind, role: String, price: Fraction, qty: Fraction },
-    MarketQueryFailed { id: String, err: String },
-    GateBlocked { id: String, reason: String },
-    PlaceFailed { id: String, err: String, is_close: bool },
-    Cancelled { cancelled: Vec<String>, failed: Vec<String> },
+    MarketFilled {
+        id: String,
+        side: dca_math::Side,
+        kind: dca_kernel::OrderKind,
+        role: String,
+        qty_filled: Fraction,
+        price: Fraction,
+        fee: Option<Fraction>,
+        fill_key: String,
+    },
+    MarketOpen {
+        id: String,
+        side: dca_math::Side,
+        kind: dca_kernel::OrderKind,
+        role: String,
+        price: Fraction,
+        qty: Fraction,
+    },
+    MarketQueryFailed {
+        id: String,
+        err: String,
+    },
+    GateBlocked {
+        id: String,
+        reason: String,
+    },
+    PlaceFailed {
+        id: String,
+        err: String,
+        is_close: bool,
+    },
+    Cancelled {
+        cancelled: Vec<String>,
+        failed: Vec<String>,
+    },
 }
 
 /// One LIVE resting order awaiting venue fill reconciliation.
@@ -220,11 +274,22 @@ impl BotRuntime {
             Err(_) => serde_json::json!({}),
         };
         if let Some(obj) = snap.as_object_mut() {
-            obj.insert("realized_net".into(), serde_json::json!(self.stepper.realized_net.to_string()));
+            obj.insert(
+                "realized_net".into(),
+                serde_json::json!(self.stepper.realized_net.to_string()),
+            );
+            obj.insert(
+                "position_direction".into(),
+                serde_json::json!(self.stepper.position.direction),
+            );
         }
         let warnings = dca_strategy::compute_warnings(&self.cfg, &self.stepper.instrument);
         // Faz 13B: equity'ler makro öncesi hesaplanır (json! blok kısıtı).
-        let mark_now = self.stepper.last_close.as_deref().and_then(|x| dca_math::fraction::Fraction::from_any_str(x).ok());
+        let mark_now = self
+            .stepper
+            .last_close
+            .as_deref()
+            .and_then(|x| dca_math::fraction::Fraction::from_any_str(x).ok());
         let mut eq_comb = mark_now.as_ref().and_then(|m| self.stepper.equity(m).ok());
         let hedge_equity_now = self
             .hedge_stepper
@@ -235,7 +300,9 @@ impl BotRuntime {
             if let Ok(he) = hs.equity(m) {
                 // Arena 1.5 Düzeltmesi: hs'nin equity'si tam start_cash içerir.
                 // İki bacağın start_cash'i toplanmaz; hedge bacağının net PnL katkısı eklenir.
-                let hpnl = he.sub(&hs.start_cash).unwrap_or_else(|_| dca_math::fraction::Fraction::zero());
+                let hpnl = he
+                    .sub(&hs.start_cash)
+                    .unwrap_or_else(|_| dca_math::fraction::Fraction::zero());
                 eq_comb = eq_comb.and_then(|e| e.add(&hpnl).ok());
             }
         }
@@ -370,14 +437,33 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(db: Db, vault: Vault) -> (Arc<Self>, broadcast::Receiver<SseEvent>) {
-        let (paper_venue, _start_cash_unused) = (PaperVenue::new(Fraction::from_decimal_str("100000").unwrap()), ());
+        let (paper_venue, _start_cash_unused) = (
+            PaperVenue::new(Fraction::from_decimal_str("100000").unwrap()),
+            (),
+        );
         let (sse, rx) = broadcast::channel(2048);
+        // Unit tests use explicit test/demo adapters. Never infer a safety
+        // bypass from the test executable's filesystem path.
+        let test_adapters = cfg!(test);
         let state = Arc::new(Self {
             db,
             vault,
-            bybit: BybitAdapter::new(std::env::var("DCA_BYBIT_TESTNET").map(|v| v == "1").unwrap_or(false)),
-            binance: BinanceAdapter::new(),
-            okx: OkxAdapter::new(),
+            bybit: BybitAdapter::new(
+                test_adapters
+                    || std::env::var("DCA_BYBIT_TESTNET")
+                        .map(|v| v == "1")
+                        .unwrap_or(false),
+            ),
+            binance: if test_adapters {
+                BinanceAdapter::new_testnet()
+            } else {
+                BinanceAdapter::new()
+            },
+            okx: if test_adapters {
+                OkxAdapter::new_demo()
+            } else {
+                OkxAdapter::new()
+            },
             paper: paper_venue,
             runtimes: Mutex::new(HashMap::new()),
             ui_cache: Mutex::new(HashMap::new()),
@@ -410,7 +496,11 @@ impl AppState {
     }
 
     /// Faz 1.6 (B-8): kline önbelleği okuma (TTL kontrolü ile)
-    pub fn get_cached_klines(&self, key: &str, max_age_ms: i64) -> Option<Vec<dca_exchange::Kline>> {
+    pub fn get_cached_klines(
+        &self,
+        key: &str,
+        max_age_ms: i64,
+    ) -> Option<Vec<dca_exchange::Kline>> {
         let cache = self.kline_cache.lock().ok()?;
         if let Some((ts, klines)) = cache.get(key) {
             if now_ms() - *ts < max_age_ms {
@@ -479,7 +569,11 @@ impl AppState {
         let rows: Vec<(String, String, i64)> = (|| {
             let conn = app.db.conn.lock().ok()?;
             let mut stmt = conn
-                .prepare("SELECT gate, message, ts FROM events WHERE gate IN ('KILL_SWITCH','FREEZE') ORDER BY ts DESC LIMIT 20")
+                .prepare(
+                    "SELECT gate, message, ts FROM events WHERE id IN (\
+                       SELECT MAX(id) FROM events WHERE gate IN ('KILL_SWITCH','FREEZE') GROUP BY gate\
+                     ) ORDER BY id DESC",
+                )
                 .ok()?;
             let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).ok()?;
             Some(mapped.filter_map(|r| r.ok()).collect())
@@ -492,16 +586,26 @@ impl AppState {
                 kill_done = true;
                 if let Some((action, reason, by, at_ms, auto)) = parse_halt_message(&msg) {
                     if action == "engaged" {
-                        *app.kill.lock().await =
-                            HaltState { active: true, reason, by, at_ms: if at_ms > 0 { at_ms } else { ts }, auto };
+                        *app.kill.lock().await = HaltState {
+                            active: true,
+                            reason,
+                            by,
+                            at_ms: if at_ms > 0 { at_ms } else { ts },
+                            auto,
+                        };
                     }
                 }
             } else if gate == GATE_FREEZE && !freeze_done {
                 freeze_done = true;
                 if let Some((action, reason, by, at_ms, _)) = parse_halt_message(&msg) {
                     if action == "engaged" {
-                        *app.freeze.lock().await =
-                            HaltState { active: true, reason, by, at_ms: if at_ms > 0 { at_ms } else { ts }, auto: false };
+                        *app.freeze.lock().await = HaltState {
+                            active: true,
+                            reason,
+                            by,
+                            at_ms: if at_ms > 0 { at_ms } else { ts },
+                            auto: false,
+                        };
                     }
                 }
             }
@@ -513,7 +617,10 @@ impl AppState {
 }
 
 pub fn now_ms() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 pub async fn persist_event(app: &AppState, bot_id: &str, level: &str, gate: &str, message: &str) {
@@ -544,7 +651,8 @@ pub async fn persist_event_traced(
         }
         // M-9: her 64 yazimda bir global retention — son 200k olay dişinda
         // silinir (bot başına TICK spam'i tabloyu sonsuz büyütmesin).
-        static EVENT_WRITE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static EVENT_WRITE_COUNT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         if EVENT_WRITE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 64 == 0 {
             let _ = conn.execute(
                 "DELETE FROM events WHERE id < (SELECT MIN(id) FROM (SELECT id FROM events ORDER BY id DESC LIMIT 200000))",
@@ -556,14 +664,25 @@ pub async fn persist_event_traced(
 
 /// Faz 2.4 — tick iz çerçevesi: `tr-<bot8>-<ts>` üretir, haritaya koyar.
 pub fn new_tick_trace(bot_id: &str) -> String {
-    let short: String = bot_id.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect();
-    format!("tr-{}-{}", if short.is_empty() { "bot" } else { &short }, now_ms())
+    let short: String = bot_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    format!(
+        "tr-{}-{}",
+        if short.is_empty() { "bot" } else { &short },
+        now_ms()
+    )
 }
 
 #[allow(dead_code)]
 pub async fn persist_bot_stats(app: &AppState, bot_id: &str, stats_json: &str) {
     if let Ok(conn) = app.db.conn.lock() {
-        if let Err(e) = conn.execute("UPDATE bots SET stats=?1 WHERE id=?2", rusqlite::params![stats_json, bot_id]) {
+        if let Err(e) = conn.execute(
+            "UPDATE bots SET stats=?1 WHERE id=?2",
+            rusqlite::params![stats_json, bot_id],
+        ) {
             eprintln!("[db] stats yazımı başarısız (bot={bot_id}): {e}");
         }
     }
@@ -573,7 +692,12 @@ pub async fn persist_bot_stats(app: &AppState, bot_id: &str, stats_json: &str) {
 /// busy/lock durumunda status kaybı, restart'ta STOPPED bir botu eski
 /// RUNNING durumuyla diriltebilir — bu yüzden başarısızlık sessiz kalmaz.
 pub fn persist_status(app: &AppState, bot_id: &str, status: &str) {
-    let write = |c: &rusqlite::Connection| c.execute("UPDATE bots SET status=?1 WHERE id=?2", rusqlite::params![status, bot_id]);
+    let write = |c: &rusqlite::Connection| {
+        c.execute(
+            "UPDATE bots SET status=?1 WHERE id=?2",
+            rusqlite::params![status, bot_id],
+        )
+    };
     match app.db.conn.lock() {
         Ok(conn) => {
             if let Err(e) = write(&conn) {
@@ -697,7 +821,10 @@ pub fn save_runtime_state(app: &AppState, bot_id: &str, rt: &BotRuntime) {
     };
     match app.db.conn.lock() {
         Ok(conn) => {
-            if let Err(e) = conn.execute("UPDATE bots SET runtime_state=?1 WHERE id=?2", rusqlite::params![json, bot_id]) {
+            if let Err(e) = conn.execute(
+                "UPDATE bots SET runtime_state=?1 WHERE id=?2",
+                rusqlite::params![json, bot_id],
+            ) {
                 eprintln!("[db] runtime snapshot yazilamadi (bot={bot_id}): {e}");
             }
         }
@@ -708,14 +835,30 @@ pub fn save_runtime_state(app: &AppState, bot_id: &str, rt: &BotRuntime) {
 /// Faz 3 (C-4): restore icin snapshot JSON'unu okur (yoksa/bozuksa None).
 pub fn load_runtime_state_json(app: &AppState, bot_id: &str) -> Option<String> {
     let conn = app.db.conn.lock().ok()?;
-    conn.query_row("SELECT runtime_state FROM bots WHERE id=?1", [bot_id], |r| r.get::<_, Option<String>>(0)).ok().flatten()
+    conn.query_row(
+        "SELECT runtime_state FROM bots WHERE id=?1",
+        [bot_id],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
 }
 
 /// Faz 3 (H-3): LIVE emir takip kaydi — place aninda PENDING yazilir, fill
 /// uzlastirmasi state gunceller, terminal durumda satir duser. Restart sonrasi
 /// takip bu tablodan geri yuklenir (bellek-only donem kapandi).
 #[allow(clippy::too_many_arguments)]
-pub fn upsert_live_order(app: &AppState, bot: &str, order_id: &str, side: &str, kind: &str, price: &str, qty: &str, role: &str, state: &str) {
+pub fn upsert_live_order(
+    app: &AppState,
+    bot: &str,
+    order_id: &str,
+    side: &str,
+    kind: &str,
+    price: &str,
+    qty: &str,
+    role: &str,
+    state: &str,
+) {
     if let Ok(conn) = app.db.conn.lock() {
         let _ = conn.execute(
             "INSERT INTO live_orders(bot_id, order_id, side, kind, price, qty, role, state, updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(bot_id, order_id) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at, price=excluded.price, qty=excluded.qty, role=excluded.role",
@@ -737,32 +880,53 @@ pub async fn bump_venue_live_load(app: &AppState, venue: &str, cost: &Fraction, 
 /// Faz 3 (H-3): terminal emir takip kaydini duserur.
 pub fn remove_live_order(app: &AppState, bot: &str, order_id: &str) {
     if let Ok(conn) = app.db.conn.lock() {
-        let _ = conn.execute("DELETE FROM live_orders WHERE bot_id=?1 AND order_id=?2", rusqlite::params![bot, order_id]);
+        let _ = conn.execute(
+            "DELETE FROM live_orders WHERE bot_id=?1 AND order_id=?2",
+            rusqlite::params![bot, order_id],
+        );
     }
 }
 
 /// Faz 3 (H-3): restart'ta geri yuklenecek aktif (PENDING/PARTIAL) takip kayitlari.
 pub fn load_live_orders(app: &AppState, bot: &str) -> Vec<LiveTrackedOrder> {
-    let Ok(conn) = app.db.conn.lock() else { return Vec::new() };
+    let Ok(conn) = app.db.conn.lock() else {
+        return Vec::new();
+    };
     let Ok(mut stmt) = conn.prepare("SELECT order_id, side, kind, price, qty, role FROM live_orders WHERE bot_id=?1 AND state IN ('PENDING','PARTIAL') ORDER BY id") else { return Vec::new() };
     let Ok(rows) = stmt.query_map([bot], |r| {
         Ok((
-            r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?,
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
         ))
-    }) else { return Vec::new() };
-    rows.filter_map(|x| x.ok()).filter_map(|(id, side, kind, price, qty, role)| {
-        let side = if side == "Sell" { dca_math::Side::Sell } else { dca_math::Side::Buy };
-        let kind = if kind == "Reduce" { dca_kernel::OrderKind::Reduce } else { dca_kernel::OrderKind::Add };
-        Some(LiveTrackedOrder {
-            id,
-            side,
-            kind,
-            price: Fraction::from_any_str(&price).ok()?,
-            qty: Fraction::from_any_str(&qty).ok()?,
-            role,
+    }) else {
+        return Vec::new();
+    };
+    rows.filter_map(|x| x.ok())
+        .filter_map(|(id, side, kind, price, qty, role)| {
+            let side = if side == "Sell" {
+                dca_math::Side::Sell
+            } else {
+                dca_math::Side::Buy
+            };
+            let kind = if kind == "Reduce" {
+                dca_kernel::OrderKind::Reduce
+            } else {
+                dca_kernel::OrderKind::Add
+            };
+            Some(LiveTrackedOrder {
+                id,
+                side,
+                kind,
+                price: Fraction::from_any_str(&price).ok()?,
+                qty: Fraction::from_any_str(&qty).ok()?,
+                role,
+            })
         })
-    }).collect()
+        .collect()
 }
 
 /// Instantiate a BotRuntime from config + persist to DB.
@@ -787,7 +951,11 @@ pub async fn create_runtime(
     // (/v5/account/fee-rate) maker/taker burada override edilir.
     if mode == "LIVE" {
         if let (Some(creds), Some(adapter)) = (credentials.as_ref(), app.adapter(venue)) {
-            let category = if cfg.kind.is_futures() { "linear" } else { "spot" };
+            let category = if cfg.kind.is_futures() {
+                "linear"
+            } else {
+                "spot"
+            };
             match adapter.account_fee_rate(creds, category, &cfg.symbol).await {
                 Ok(Some((maker, taker))) if maker.is_positive() && taker.is_positive() => {
                     persist_event(
@@ -822,15 +990,23 @@ pub async fn create_runtime(
                 (Some(lo), Some(hi)) => {
                     let lo = Fraction::from_decimal_str(lo).map_err(|e| e.to_string())?;
                     let hi = Fraction::from_decimal_str(hi).map_err(|e| e.to_string())?;
-                    lo.add(&hi).map_err(|e| e.to_string())?.div(&Fraction::from_u64(2)).map_err(|e| e.to_string())?
+                    lo.add(&hi)
+                        .map_err(|e| e.to_string())?
+                        .div(&Fraction::from_u64(2))
+                        .map_err(|e| e.to_string())?
                 }
                 _ => Fraction::from_u64(1),
             };
-            EngineTag::Grid(dca_strategy::GridEngine::new(id, cfg.clone(), inst.clone(), &mark)?)
+            EngineTag::Grid(dca_strategy::GridEngine::new(
+                id,
+                cfg.clone(),
+                inst.clone(),
+                &mark,
+            )?)
         }
-        StrategyKind::HedgeProtective | StrategyKind::HedgeDual => {
-            EngineTag::Hedge(Box::new(dca_strategy::HedgeEngine::new(id, cfg.clone(), inst.clone())?))
-        }
+        StrategyKind::HedgeProtective | StrategyKind::HedgeDual => EngineTag::Hedge(Box::new(
+            dca_strategy::HedgeEngine::new(id, cfg.clone(), inst.clone())?,
+        )),
         _ => EngineTag::Dca(dca_strategy::DcaEngine::new(id, cfg.clone(), inst.clone())?),
     };
     let stepper = SimulationStepper::new(
@@ -856,7 +1032,10 @@ pub async fn create_runtime(
     // Faz 13B: hedge bacak stepper'ı — her iki hedge türü için baştan kurulur
     // (protective spawn sonrası devreye girer; dual ilk barda). Bacak defteri
     // bağımsızdır: aynı start_cash, yön -1 (sell-to-open).
-    let hedge_stepper = if matches!(kind, StrategyKind::HedgeProtective | StrategyKind::HedgeDual) {
+    let hedge_stepper = if matches!(
+        kind,
+        StrategyKind::HedgeProtective | StrategyKind::HedgeDual
+    ) {
         let mut hs = SimulationStepper::new(
             inst.clone(),
             start_cash.clone(),
@@ -864,7 +1043,8 @@ pub async fn create_runtime(
                 session_type: cfg.risk_policy.session_type.into(),
                 capital_shortfall_mode: dca_exchange_gate_mode(),
                 is_spot: !kind.is_futures(),
-                leverage: Fraction::from_decimal_str(&cfg.leverage).unwrap_or_else(|_| Fraction::one()),
+                leverage: Fraction::from_decimal_str(&cfg.leverage)
+                    .unwrap_or_else(|_| Fraction::one()),
                 policy: cfg.risk_policy.clone(),
                 ..Default::default()
             },
@@ -874,7 +1054,10 @@ pub async fn create_runtime(
     } else {
         None
     };
-    let is_grid_kind = matches!(kind, StrategyKind::SpotGrid | StrategyKind::FuturesGrid | StrategyKind::InfinityGrid);
+    let is_grid_kind = matches!(
+        kind,
+        StrategyKind::SpotGrid | StrategyKind::FuturesGrid | StrategyKind::InfinityGrid
+    );
     // TradingView webhook secret — stable per bot session (persisted bots get a
     // fresh secret on restore; the UI surfaces it in bot settings).
     // Task 20 L4 — webhook secret CSPRNG: DefaultHasher (SipHash sabit seed +
@@ -999,15 +1182,20 @@ pub async fn create_runtime(
                         EngineTag::Grid(_) => None,
                     };
                     if let Some(em) = engine_main {
-                        if let Some(detail) = position_leg_mismatch(&kernel_main, &em, &tick, "ana") {
+                        if let Some(detail) = position_leg_mismatch(&kernel_main, &em, &tick, "ana")
+                        {
                             restore_mismatch = Some(detail);
                         }
                     }
                     // Hedge bacağı: kernel hedge_stepper ↔ engine hedge leg mirror.
-                    if let (Some(hs), EngineTag::Hedge(h)) = (rt.hedge_stepper.as_ref(), &rt.engine_kind) {
+                    if let (Some(hs), EngineTag::Hedge(h)) =
+                        (rt.hedge_stepper.as_ref(), &rt.engine_kind)
+                    {
                         match &h.hedge {
                             Some(leg) => {
-                                if let Some(detail) = position_leg_mismatch(&hs.position, &leg.mirror, &tick, "hedge") {
+                                if let Some(detail) =
+                                    position_leg_mismatch(&hs.position, &leg.mirror, &tick, "hedge")
+                                {
                                     let combined = match restore_mismatch {
                                         Some(prev) => format!("{prev}; {detail}"),
                                         None => detail,
@@ -1110,8 +1298,16 @@ fn position_leg_mismatch(
 /// Faz 4 (H-6): botun VENUE'undan enstrüman çözümü — OKX/BINANCE botu artık
 /// Bybit mikro-yapısıyla değil kendi borsasının tick/step/fee'siyle çalışır.
 /// PAPER simülasyonu BYBIT piyasa verisiyle koştuğundan PAPER → BYBIT çözülür.
-pub(crate) async fn engine_instrument_for(cfg: &BotConfig, venue: &str, app: &Arc<AppState>) -> Instrument {
-    let category = if cfg.kind.is_futures() { "linear" } else { "spot" };
+pub(crate) async fn engine_instrument_for(
+    cfg: &BotConfig,
+    venue: &str,
+    app: &Arc<AppState>,
+) -> Instrument {
+    let category = if cfg.kind.is_futures() {
+        "linear"
+    } else {
+        "spot"
+    };
     let venue = if venue == "PAPER" { "BYBIT" } else { venue };
     let cache_key = format!("{venue}:{category}:{}", cfg.symbol);
     {
@@ -1151,7 +1347,11 @@ pub const INSTRUMENTS_CACHE_TTL_MS: i64 = 60_000;
 
 /// create_bot ack-flow için enstrüman çözümü (cache'li — create_runtime'da
 /// ikinci çağrı bedava). Task 16: grid fee-breaker ön-denetimi bunu kullanır.
-pub(crate) async fn resolve_instrument(cfg: &BotConfig, venue: &str, app: &Arc<AppState>) -> Instrument {
+pub(crate) async fn resolve_instrument(
+    cfg: &BotConfig,
+    venue: &str,
+    app: &Arc<AppState>,
+) -> Instrument {
     engine_instrument_for(cfg, venue, app).await
 }
 
@@ -1199,22 +1399,45 @@ mod tests {
         let (app, _rx) = AppState::new(db, vault);
         // Pre-seed the instrument cache so the test is deterministic offline.
         let inst = Instrument::default();
-        app.instruments_cache.lock().await.insert("spot:BTCUSDT".into(), (now_ms(), vec![inst]));
+        app.instruments_cache
+            .lock()
+            .await
+            .insert("spot:BTCUSDT".into(), (now_ms(), vec![inst]));
 
         let mut cfg = BotConfig::default();
         cfg.kind = StrategyKind::HedgeDual;
         cfg.symbol = "BTCUSDT".into();
-        create_runtime(&app, "b-hd-test", "HD Test", "PAPER", "PAPER", "RUNNING", cfg, "1h", Fraction::from_u64(100_000), None)
-            .await
-            .expect("hedge runtime");
+        create_runtime(
+            &app,
+            "b-hd-test",
+            "HD Test",
+            "PAPER",
+            "PAPER",
+            "RUNNING",
+            cfg,
+            "1h",
+            Fraction::from_u64(100_000),
+            None,
+        )
+        .await
+        .expect("hedge runtime");
 
         let rts = app.runtimes.lock().await;
         let rt = rts.get("b-hd-test").expect("runtime registered");
         let v = rt.snapshot_json();
         let phase = v["stats"]["phase"].as_str().expect("phase string");
-        assert!(phase.contains("MainOnly"), "hedge snapshot phase must expose the hedge lifecycle, got: {phase}");
-        assert!(matches!(rt.engine_kind, dca_strategy::EngineTag::Hedge(_)), "HEDGE_DUAL must not fall back to a DCA engine");
-        assert!(v["config"].is_object(), "snapshot must carry the bot config for the UI");
+        assert!(
+            phase.contains("MainOnly"),
+            "hedge snapshot phase must expose the hedge lifecycle, got: {phase}"
+        );
+        assert!(
+            matches!(rt.engine_kind, dca_strategy::EngineTag::Hedge(_)),
+            "HEDGE_DUAL must not fall back to a DCA engine"
+        );
+        assert!(
+            v["config"].is_object(),
+            "snapshot must carry the bot config for the UI"
+        );
         assert_eq!(v["config"]["kind"].as_str(), Some("HEDGE_DUAL"));
         drop(rts);
         let _ = std::fs::remove_dir_all(&dir);

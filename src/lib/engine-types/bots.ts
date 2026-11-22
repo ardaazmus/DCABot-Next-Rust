@@ -48,6 +48,8 @@ export interface BotStats {
   phase: string;
   deal_id: string | null;
   position_qty: string;
+  /** Signed position direction from the kernel: 1=long, -1=short. */
+  position_direction?: 1 | -1;
   avg_price: string;
   next_safety_price: string | null;
   next_safety_level: number | null;

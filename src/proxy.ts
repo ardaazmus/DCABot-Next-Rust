@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import crypto from "node:crypto";
 import { isAuthRequired, verifySessionToken, SESSION_COOKIE_NAME } from "@/lib/auth-session";
 
 /**
@@ -60,8 +61,30 @@ function originAllowed(req: NextRequest): boolean {
 
 export function proxy(req: NextRequest) {
   const { pathname, search } = req.nextUrl;
+  const nonce = crypto.randomBytes(16).toString("base64");
+  const isDevelopment = process.env.NODE_ENV !== "production";
+  const csp = [
+    "default-src 'self'",
+    `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'${isDevelopment ? " 'unsafe-eval'" : ""}`,
+    // React charts and sliders set element styles dynamically; keep inline
+    // styles enabled while executable scripts require a per-request nonce.
+    "style-src 'self' 'unsafe-inline'",
+    "font-src 'self' data:",
+    "img-src 'self' data: blob:",
+    `connect-src 'self'${isDevelopment ? " ws: wss:" : ""}`,
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+  ].join("; ");
+  const headers = new Headers(req.headers);
+  headers.set("x-nonce", nonce);
+  headers.set("Content-Security-Policy", csp);
+
   if (!pathname.startsWith("/api/engine/")) {
-    return NextResponse.next();
+    const response = NextResponse.next({ request: { headers } });
+    response.headers.set("Content-Security-Policy", csp);
+    return response;
   }
   // Faz 22 (N-12): CSRF/origin kapısı — cross-origin yazma denemeleri 403.
   if (!originAllowed(req)) {
@@ -95,14 +118,18 @@ export function proxy(req: NextRequest) {
   if (target.protocol !== "http:" || !ALLOWED_HOSTS.has(target.hostname)) {
     return new NextResponse("engine endpoint not allowed", { status: 403 });
   }
-  const headers = new Headers(req.headers);
   headers.delete("host");
   headers.delete("content-length");
   const key = engineKey();
   if (key) headers.set("Authorization", `Bearer ${key}`);
-  return NextResponse.rewrite(target, { request: { headers } });
+  const response = NextResponse.rewrite(target, { request: { headers } });
+  response.headers.set("Content-Security-Policy", csp);
+  return response;
 }
 
 export const config = {
-  matcher: ["/api/engine/:path*"],
+  matcher: [
+    "/((?!api|_next/static|_next/image|favicon.ico).*)",
+    "/api/engine/:path*",
+  ],
 };

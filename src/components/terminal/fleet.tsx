@@ -101,7 +101,7 @@ function hasLiquidationRisk(bot: BotRow): boolean {
   const current = fracToNum(bot.markPrice) ?? 0;
   let criticalPriceDistance = false;
   if (liq > 0 && current > 0) {
-    const isShort = bot.kind === "DCA_SHORT";
+    const isShort = bot.stats.position_direction === -1 || (bot.stats.position_direction == null && bot.kind === "DCA_SHORT");
     const distancePct = Math.max(0, isShort ? ((liq - current) / current) * 100 : ((current - liq) / current) * 100);
     criticalPriceDistance = distancePct < CRITICAL_LIQUIDATION_DISTANCE_PCT;
   }
@@ -313,6 +313,13 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
   // bot başlat/duraklat. Seçim kart/tablo ortak id kümesi olarak tutulur.
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [closeAllDialogId, setCloseAllDialogId] = useState<string | null>(null);
+  const [confirmation, setConfirmation] = useState<{
+    title: string;
+    description: string;
+    confirmLabel: string;
+    tone: "danger" | "normal";
+    onConfirm: () => void | Promise<void>;
+  } | null>(null);
   const [hedgeOnly, setHedgeOnly] = useState(false);
   /* Faz 25 (UIX-25): filo arama + durum filtresi + kart sıralaması.
      Varsayılan sıra = K/Z büyüklüğü (kayıp/kâr en büyük en üstte) —
@@ -454,8 +461,12 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
   /* Faz 24 (UI/UX Pro Max raporu §3.2.3): PANIC — açık pozisyonu marketten
      kapat (CLOSE_ALL) ve botu durdur (STOP). İki aşamalı onaylı. */
   const panicClose = (b: BotRow) => {
-    if (!window.confirm(`PANIC: ${b.name} — açık pozisyon marketten kapatılacak ve bot durdurulacak. Emin misiniz?`)) return;
-    void (async () => {
+    setConfirmation({
+      title: `${b.name} için PANIC işlemi başlatılsın mı?`,
+      description: "Açık pozisyon marketten kapatılacak ve bot durdurulacak. Emir gönderildikten sonra fiyat kayması oluşabilir.",
+      confirmLabel: "Marketten Kapat ve Durdur",
+      tone: "danger",
+      onConfirm: async () => {
       try {
         await apiBotAction(b.id, "CLOSE_ALL");
         await apiPatchBot(b.id, { status: "STOPPED" });
@@ -464,7 +475,8 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
       } catch (e) {
         toast({ title: "PANIC başarısız", description: String(e) });
       }
-    })();
+      },
+    });
   };
 
   /* Faz 24 (UI/UX Pro Max raporu §3.2.1): toplu eylem — seçili botlara
@@ -472,8 +484,12 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
   const bulkAction = (action: string, label: string) => {
     const ids = Array.from(selected);
     if (ids.length === 0) return;
-    if (!window.confirm(`${label}: ${ids.length} bot uygulanacak. Emin misiniz?`)) return;
-    void (async () => {
+    setConfirmation({
+      title: `${label} onayı`,
+      description: `Bu işlem ${ids.length} seçili bota uygulanacak.`,
+      confirmLabel: label,
+      tone: "normal",
+      onConfirm: async () => {
       let ok = 0;
       for (const bid of ids) {
         try {
@@ -486,7 +502,8 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
       setSelected(new Set());
       refetch();
       toast({ title: label, description: `${ok}/${ids.length} bot uygulandı.` });
-    })();
+      },
+    });
   };
 
   /* P2-2 Freeze: RUNNING → FROZEN (yeni emir yok, açıklar korunur), geri dönüş RUNNING. */
@@ -517,34 +534,50 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
 
   const handleBulkPauseAll = async () => {
     if (runningBots.length === 0) return;
-    if (!window.confirm(`Çalışan ${runningBots.length} botun tümü duraklatılacak. Emin misiniz?`)) return;
-    let ok = 0;
-    for (const b of runningBots) {
-      try {
-        await apiPatchBot(b.id, { status: "PAUSED" });
-        ok++;
-      } catch {
-        /* devam et */
-      }
-    }
-    refetch();
-    toast({ title: "Toplu Duraklatma", description: `${ok}/${runningBots.length} bot duraklatıldı.` });
+    const targets = [...runningBots];
+    setConfirmation({
+      title: "Çalışan botlar duraklatılsın mı?",
+      description: `${targets.length} bot duraklatılacak. Açık pozisyonlar korunur; yeni emir üretilmez.`,
+      confirmLabel: "Tümünü Duraklat",
+      tone: "danger",
+      onConfirm: async () => {
+        let ok = 0;
+        for (const b of targets) {
+          try {
+            await apiPatchBot(b.id, { status: "PAUSED" });
+            ok++;
+          } catch {
+            /* devam et */
+          }
+        }
+        refetch();
+        toast({ title: "Toplu Duraklatma", description: `${ok}/${targets.length} bot duraklatıldı.` });
+      },
+    });
   };
 
   const handleBulkResumeAll = async () => {
     if (pausedBots.length === 0) return;
-    if (!window.confirm(`Duraklatılmış ${pausedBots.length} botun tümü başlatılacak. Emin misiniz?`)) return;
-    let ok = 0;
-    for (const b of pausedBots) {
-      try {
-        await apiPatchBot(b.id, { status: "RUNNING" });
-        ok++;
-      } catch {
-        /* devam et */
-      }
-    }
-    refetch();
-    toast({ title: "Toplu Başlatma", description: `${ok}/${pausedBots.length} bot başlatıldı.` });
+    const targets = [...pausedBots];
+    setConfirmation({
+      title: "Duraklatılmış botlar başlatılsın mı?",
+      description: `${targets.length} bot yeniden RUNNING durumuna alınacak. Giriş kapıları emir açmayı engelleyebilir.`,
+      confirmLabel: "Tümünü Başlat",
+      tone: "normal",
+      onConfirm: async () => {
+        let ok = 0;
+        for (const b of targets) {
+          try {
+            await apiPatchBot(b.id, { status: "RUNNING" });
+            ok++;
+          } catch {
+            /* devam et */
+          }
+        }
+        refetch();
+        toast({ title: "Toplu Başlatma", description: `${ok}/${targets.length} bot başlatıldı.` });
+      },
+    });
   };
 
   return (
@@ -909,7 +942,7 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
                     nextSafetyPrice={b.stats.next_safety_price}
                     nextSafetyLevel={b.stats.next_safety_level}
                     positionQty={b.stats.position_qty}
-                    isShort={b.kind === "DCA_SHORT"}
+                    isShort={b.stats.position_direction === -1 || (b.stats.position_direction == null && b.kind === "DCA_SHORT")}
                     symbol={b.symbol}
                     compact={true}
                   />
@@ -1151,6 +1184,30 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
       </Panel>
 
       <FleetTape />
+
+      <AlertDialog open={confirmation !== null} onOpenChange={(open) => { if (!open) setConfirmation(null); }}>
+        <AlertDialogContent className="border-border-strong bg-[#151a24]">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-slate-100">{confirmation?.title}</AlertDialogTitle>
+            <AlertDialogDescription className="text-slate-400">{confirmation?.description}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="border-border-strong bg-transparent text-slate-300 hover:bg-secondary hover:text-slate-100">
+              Vazgeç
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className={confirmation?.tone === "danger" ? "bg-rose-500 text-white hover:bg-rose-600" : "bg-emerald-600 text-white hover:bg-emerald-500"}
+              onClick={() => {
+                const action = confirmation?.onConfirm;
+                setConfirmation(null);
+                if (action) void action();
+              }}
+            >
+              {confirmation?.confirmLabel ?? "Onayla"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <p className="flex items-center gap-1.5 text-[11px] text-slate-400">
         <ScrollText className="h-3.5 w-3.5" aria-hidden />

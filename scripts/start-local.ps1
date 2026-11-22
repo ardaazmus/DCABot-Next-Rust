@@ -25,8 +25,8 @@ function New-LocalSecret([int]$ByteCount = 48) {
 
 if (-not (Test-Path -LiteralPath $keysFile)) {
     New-Item -ItemType Directory -Force -Path $runtimeDirectory | Out-Null
-    $api  = ('k-' + [System.Guid]::NewGuid().ToString('N') + [System.Guid]::NewGuid().ToString('N'))
-    $vault = ('v-' + [System.Guid]::NewGuid().ToString('N') + [System.Guid]::NewGuid().ToString('N'))
+    $api  = 'k-' + (New-LocalSecret)
+    $vault = 'v-' + (New-LocalSecret)
     $session = New-LocalSecret
     # BOM'suz yazim: PowerShell 5.1'in `Set-Content -Encoding UTF8`'i BOM ekler,
     # BOM ise ilk satirin regex eslesmesini bozar. Anahtarlar ASCII'dir.
@@ -38,23 +38,24 @@ if (-not (Test-Path -LiteralPath $keysFile)) {
     Write-Output "Generated local auth keys: $keysFile"
 }
 $keyLines = [System.IO.File]::ReadAllLines($keysFile)
-if (-not ($keyLines | Where-Object { $_ -cmatch '^DCA_SESSION_SECRET=.{32,}$' })) {
-    $keyLines += "DCA_SESSION_SECRET=$(New-LocalSecret)"
+$keyValues = @{}
+foreach ($keyLine in $keyLines) {
+    $line = $keyLine.TrimStart([char]0xFEFF)
+    # Use -cmatch because PS 5.1 applies culture-sensitive ranges to -match.
+    if ($line -cmatch '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') { $keyValues[$Matches[1]] = $Matches[2] }
+}
+if (-not $keyValues['DCA_SESSION_SECRET'] -or [System.Text.Encoding]::UTF8.GetByteCount([string]$keyValues['DCA_SESSION_SECRET']) -lt 32) {
+    $keyLines = @($keyLines | Where-Object { $_ -notmatch '^\s*DCA_SESSION_SECRET=' })
+    $session = New-LocalSecret
+    $keyLines += "DCA_SESSION_SECRET=$session"
     [System.IO.File]::WriteAllLines($keysFile, $keyLines)
+    $keyValues['DCA_SESSION_SECRET'] = $session
 }
-Get-Content -LiteralPath $keysFile | ForEach-Object {
-    $line = $_.TrimStart([char]0xFEFF)
-    # -cmatch: PS 5.1 -match'i IgnoreCase + kültür-duyarlıdır; Türkçe kültürde
-    # [A-Za-z] sınıf aralıkları yanlış eşleşir (canlı teşhis: match=False,
-    # cmatch=True). Anahtar adları ASCII olduğundan cmatch güvenlidir.
-    if ($line -cmatch '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {
-        Set-Item -Path ('env:' + $Matches[1]) -Value $Matches[2]
-    }
-}
-if (-not $env:DCA_API_KEY -or -not $env:DCA_VAULT_KEY) {
+if (-not $keyValues['DCA_API_KEY'] -or -not $keyValues['DCA_VAULT_KEY']) {
     throw "local-keys.env okunamadi veya eksik alan var: $keysFile"
 }
-$env:ENGINE_API_KEY = $env:DCA_API_KEY
+Protect-LocalRuntimeDirectory -Path $runtimeDirectory
+Protect-LocalSecretFile -Path $keysFile
 
 foreach ($port in @(3000, 3002)) {
     $listener = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue
@@ -112,10 +113,22 @@ function Wait-LocalHttp([string]$Url, [int]$TimeoutSeconds) {
 }
 
 try {
+    # The engine receives only its API and vault secrets.
+    $env:DCA_API_KEY = $keyValues['DCA_API_KEY']
+    $env:DCA_VAULT_KEY = $keyValues['DCA_VAULT_KEY']
+    Remove-Item Env:DCA_SESSION_SECRET -ErrorAction SilentlyContinue
+    Remove-Item Env:ENGINE_API_KEY -ErrorAction SilentlyContinue
     $coreProcess = Start-Process -FilePath $coreBinary -WorkingDirectory $runtimeDirectory -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $runtimeDirectory 'core.stdout.log') -RedirectStandardError (Join-Path $runtimeDirectory 'core.stderr.log')
     Wait-LocalHttp 'http://127.0.0.1:3002/api/health' 20
+    # The UI receives only its proxy key and session signer.
+    Remove-Item Env:DCA_API_KEY -ErrorAction SilentlyContinue
+    Remove-Item Env:DCA_VAULT_KEY -ErrorAction SilentlyContinue
+    $env:ENGINE_API_KEY = $keyValues['DCA_API_KEY']
+    $env:DCA_SESSION_SECRET = $keyValues['DCA_SESSION_SECRET']
     $nodeBinary = (Get-Command node -ErrorAction Stop).Source
     $uiProcess = Start-Process -FilePath $nodeBinary -ArgumentList @('node_modules/next/dist/bin/next', 'dev', '--hostname', '127.0.0.1', '--port', '3000', '--webpack') -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $runtimeDirectory 'ui.stdout.log') -RedirectStandardError (Join-Path $runtimeDirectory 'ui.stderr.log')
+    Remove-Item Env:ENGINE_API_KEY -ErrorAction SilentlyContinue
+    Remove-Item Env:DCA_SESSION_SECRET -ErrorAction SilentlyContinue
     $localRecords = @(
         @{ Id = $coreProcess.Id; Name = $coreProcess.ProcessName; Started = $coreProcess.StartTime.ToUniversalTime().Ticks }
         @{ Id = $uiProcess.Id; Name = $uiProcess.ProcessName; Started = $uiProcess.StartTime.ToUniversalTime().Ticks }

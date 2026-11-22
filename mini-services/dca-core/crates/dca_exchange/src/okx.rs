@@ -16,7 +16,10 @@
 //! Swap emir adedi kontrattır: contracts = floor(base_qty / ctVal, lotSz adımı)
 //! (exact stringaritmetik — float YOK).
 
-use super::{KeyPermissions, Kline, OrderBook, OrderBookLevel, OrderRequest, PositionSnapshot, Ticker24h, TickerSnapshot, VenueAdapter, VenueCreds, VenueOrderState, WalletSnapshot};
+use super::{
+    KeyPermissions, Kline, OrderBook, OrderBookLevel, OrderRequest, PositionSnapshot, Ticker24h,
+    TickerSnapshot, VenueAdapter, VenueCreds, VenueOrderState, WalletSnapshot,
+};
 use dca_math::fraction::Fraction;
 use dca_math::Instrument;
 use hmac::{Hmac, Mac};
@@ -38,15 +41,31 @@ impl OkxAdapter {
     pub fn new() -> Self {
         let is_demo = std::env::var("DCA_OKX_DEMO").as_deref() == Ok("1")
             || std::env::var("DCA_OKX_TESTNET").as_deref() == Ok("1");
+        Self::with_demo(is_demo)
+    }
+
+    /// Explicit demo-mode adapter for server test fixtures.
+    pub fn new_demo() -> Self {
+        Self::with_demo(true)
+    }
+
+    fn with_demo(is_demo: bool) -> Self {
         let raw_base_url = std::env::var("OKX_BASE_URL")
             .or_else(|_| std::env::var("DCA_OKX_BASE_URL"))
             .unwrap_or_else(|_| MAINNET.into());
-        let base_url = super::guarded_venue_base_url(&raw_base_url, "OKX", &["www.okx.com"], &["www.okx.com"], is_demo);
+        let base_url = super::guarded_venue_base_url(
+            &raw_base_url,
+            "OKX",
+            &["www.okx.com"],
+            &["www.okx.com"],
+            is_demo,
+        );
         Self {
             base_url,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
                 .build()
                 .expect("reqwest"),
             is_demo,
@@ -59,7 +78,12 @@ impl OkxAdapter {
         } else {
             format!("{}{}?{}", self.base_url, path, query)
         };
-        let resp = self.http.get(&url).send().await.map_err(|e| format!("okx GET {path} failed: {e}"))?;
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("okx GET {path} failed: {e}"))?;
         let v: Value = resp.json().await.map_err(|e| e.to_string())?;
         check_code(v, path)
     }
@@ -68,12 +92,25 @@ impl OkxAdapter {
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
     }
 
-    async fn private(&self, creds: &VenueCreds, method: &str, path: &str, query: &str, body: &str) -> Result<Value, String> {
+    async fn private(
+        &self,
+        creds: &VenueCreds,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &str,
+    ) -> Result<Value, String> {
         let pass = creds.passphrase.as_deref().unwrap_or("").trim();
         if pass.is_empty() {
-            return Err("okx: passphrase eksik — vault anahtarını passphrase ile yeniden ekleyin".into());
+            return Err(
+                "okx: passphrase eksik — vault anahtarını passphrase ile yeniden ekleyin".into(),
+            );
         }
-        let request_path = if query.is_empty() { path.to_string() } else { format!("{path}?{query}") };
+        let request_path = if query.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}?{query}")
+        };
         let ts = Self::timestamp();
         let prehash = format!("{ts}{method}{request_path}{body}");
         let sign = sign_base64(&creds.secret, &prehash);
@@ -99,11 +136,21 @@ impl OkxAdapter {
         check_code(v, path)
     }
 
-    async fn private_get(&self, creds: &VenueCreds, path: &str, query: &str) -> Result<Value, String> {
+    async fn private_get(
+        &self,
+        creds: &VenueCreds,
+        path: &str,
+        query: &str,
+    ) -> Result<Value, String> {
         self.private(creds, "GET", path, query, "").await
     }
 
-    async fn private_post(&self, creds: &VenueCreds, path: &str, body: &str) -> Result<Value, String> {
+    async fn private_post(
+        &self,
+        creds: &VenueCreds,
+        path: &str,
+        body: &str,
+    ) -> Result<Value, String> {
         self.private(creds, "POST", path, "", body).await
     }
 
@@ -129,7 +176,10 @@ fn check_code(v: Value, path: &str) -> Result<Value, String> {
     let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("-1");
     if code != "0" {
         let msg = v.get("msg").and_then(|x| x.as_str()).unwrap_or("unknown");
-        return Err(format!("okx {path} code={code}: {}", msg.chars().take(160).collect::<String>()));
+        return Err(format!(
+            "okx {path} code={code}: {}",
+            msg.chars().take(160).collect::<String>()
+        ));
     }
     Ok(v.get("data").cloned().unwrap_or(Value::Null))
 }
@@ -153,8 +203,16 @@ fn base64_encode(bytes: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(T[((n >> 18) & 63) as usize] as char);
         out.push(T[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -267,7 +325,11 @@ fn format_scaled(m: i128, scale: u32) -> String {
         let (i, f) = d.split_at(d.len() - scale as usize);
         format!("{i}.{f}")
     };
-    if neg { format!("-{s}") } else { s }
+    if neg {
+        format!("-{s}")
+    } else {
+        s
+    }
 }
 
 fn first_data(v: &Value) -> Option<&Value> {
@@ -278,7 +340,8 @@ fn normalize_contract_qty(qty: &Fraction, ct_val: &Fraction) -> Result<Fraction,
     if !ct_val.is_positive() {
         return Err("okx: ctVal must be positive to normalize contract quantity".into());
     }
-    qty.mul(ct_val).map_err(|e| format!("okx contract quantity conversion failed: {e}"))
+    qty.mul(ct_val)
+        .map_err(|e| format!("okx contract quantity conversion failed: {e}"))
 }
 
 fn normalize_okx_fee(raw: Option<&str>) -> Option<Fraction> {
@@ -330,18 +393,28 @@ impl VenueAdapter for OkxAdapter {
         let v = self.public_get("/api/v5/public/time", "").await?;
         first_data(&v)
             .and_then(|d| d.get("ts"))
-            .and_then(|t| t.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| t.as_i64()))
+            .and_then(|t| {
+                t.as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .or_else(|| t.as_i64())
+            })
             .filter(|t| *t > 0)
             .ok_or_else(|| "no time".into())
     }
 
-    async fn instruments(&self, category: &str, symbol: Option<&str>) -> Result<Vec<Instrument>, String> {
+    async fn instruments(
+        &self,
+        category: &str,
+        symbol: Option<&str>,
+    ) -> Result<Vec<Instrument>, String> {
         let inst_type = if category == "linear" { "SWAP" } else { "SPOT" };
         let mut query = format!("instType={inst_type}");
         if let Some(s) = symbol {
             query.push_str(&format!("&instId={}", okx_inst_id(s, category)?));
         }
-        let v = self.public_get("/api/v5/public/instruments", &query).await?;
+        let v = self
+            .public_get("/api/v5/public/instruments", &query)
+            .await?;
         let mut out = Vec::new();
         if let Some(list) = v.as_array() {
             for item in list {
@@ -359,7 +432,11 @@ impl VenueAdapter for OkxAdapter {
                 } else {
                     "1"
                 };
-                let (maker, taker) = if is_swap { ("0.0002", "0.0005") } else { ("0.0008", "0.001") };
+                let (maker, taker) = if is_swap {
+                    ("0.0002", "0.0005")
+                } else {
+                    ("0.0008", "0.001")
+                };
                 let our_symbol = if is_swap {
                     inst_id.trim_end_matches("-SWAP").replace('-', "")
                 } else {
@@ -367,15 +444,24 @@ impl VenueAdapter for OkxAdapter {
                 };
                 out.push(Instrument {
                     symbol: our_symbol,
-                    base: item.get("baseCcy").and_then(|x| x.as_str()).unwrap_or("").into(),
-                    quote: item.get("quoteCcy").and_then(|x| x.as_str()).unwrap_or("USDT").into(),
+                    base: item
+                        .get("baseCcy")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .into(),
+                    quote: item
+                        .get("quoteCcy")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("USDT")
+                        .into(),
                     tick_size: Fraction::from_decimal_str(&tick).map_err(|e| e.to_string())?,
                     step_size: Fraction::from_decimal_str(&step).map_err(|e| e.to_string())?,
                     min_qty: Fraction::from_decimal_str(&min_qty).map_err(|e| e.to_string())?,
                     min_notional: Fraction::from_decimal_str("1").unwrap(),
                     maker_fee_rate: Fraction::from_decimal_str(maker).unwrap(),
                     taker_fee_rate: Fraction::from_decimal_str(taker).unwrap(),
-                    max_leverage: Fraction::from_any_str(max_lev).unwrap_or_else(|_| Fraction::from_u64(1)),
+                    max_leverage: Fraction::from_any_str(max_lev)
+                        .unwrap_or_else(|_| Fraction::from_u64(1)),
                 });
                 // ctVal swap emir boyutunda kullanılır (place_order anlık okur).
                 let _ = ct_val;
@@ -387,7 +473,13 @@ impl VenueAdapter for OkxAdapter {
         Ok(out)
     }
 
-    async fn klines(&self, category: &str, symbol: &str, interval: &str, limit: usize) -> Result<Vec<Kline>, String> {
+    async fn klines(
+        &self,
+        category: &str,
+        symbol: &str,
+        interval: &str,
+        limit: usize,
+    ) -> Result<Vec<Kline>, String> {
         let inst_id = okx_inst_id(symbol, category)?;
         let bar = okx_bar(interval)?;
         // history-candles sayfa başına ≤100 — after imleciyle geriye sar.
@@ -403,7 +495,9 @@ impl VenueAdapter for OkxAdapter {
             if let Some(a) = &after {
                 query.push_str(&format!("&after={a}"));
             }
-            let v = self.public_get("/api/v5/market/history-candles", &query).await?;
+            let v = self
+                .public_get("/api/v5/market/history-candles", &query)
+                .await?;
             let rows = v.as_array().cloned().unwrap_or_default();
             if rows.is_empty() {
                 break;
@@ -415,12 +509,19 @@ impl VenueAdapter for OkxAdapter {
                 };
                 let s = |i: usize| arr[i].as_str().unwrap_or("0").to_string();
                 out.push(Kline {
-                    t: arr[0].as_str().and_then(|x| x.parse::<i64>().ok()).unwrap_or(0),
+                    t: arr[0]
+                        .as_str()
+                        .and_then(|x| x.parse::<i64>().ok())
+                        .unwrap_or(0),
                     o: s(1),
                     h: s(2),
                     l: s(3),
                     c: s(4),
-                    v: arr.get(5).and_then(|x| x.as_str()).unwrap_or("0").to_string(),
+                    v: arr
+                        .get(5)
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("0")
+                        .to_string(),
                 });
             }
             if rows.len() < need {
@@ -443,11 +544,19 @@ impl VenueAdapter for OkxAdapter {
 
     async fn ticker(&self, category: &str, symbol: &str) -> Result<TickerSnapshot, String> {
         let inst_id = okx_inst_id(symbol, category)?;
-        let v = self.public_get("/api/v5/market/ticker", &format!("instId={inst_id}")).await?;
+        let v = self
+            .public_get("/api/v5/market/ticker", &format!("instId={inst_id}"))
+            .await?;
         let d = first_data(&v).ok_or("no ticker")?;
         let last = d.get("last").and_then(|x| x.as_str()).unwrap_or("0");
-        let funding = d.get("fundingRate").and_then(|x| x.as_str()).and_then(|s| Fraction::from_decimal_str(s).ok());
-        let next_ts = d.get("nextFundingTime").and_then(|x| x.as_str()).and_then(|s| s.parse::<i64>().ok());
+        let funding = d
+            .get("fundingRate")
+            .and_then(|x| x.as_str())
+            .and_then(|s| Fraction::from_decimal_str(s).ok());
+        let next_ts = d
+            .get("nextFundingTime")
+            .and_then(|x| x.as_str())
+            .and_then(|s| s.parse::<i64>().ok());
         Ok(TickerSnapshot {
             symbol: symbol.into(),
             last_price: Fraction::from_any_str(last).unwrap_or_else(|_| Fraction::zero()),
@@ -459,7 +568,9 @@ impl VenueAdapter for OkxAdapter {
 
     async fn tickers_24h(&self, category: &str) -> Result<Vec<Ticker24h>, String> {
         let inst_type = if category == "linear" { "SWAP" } else { "SPOT" };
-        let v = self.public_get("/api/v5/market/tickers", &format!("instType={inst_type}")).await?;
+        let v = self
+            .public_get("/api/v5/market/tickers", &format!("instType={inst_type}"))
+            .await?;
         let mut out = Vec::new();
         if let Some(list) = v.as_array() {
             for item in list {
@@ -467,9 +578,21 @@ impl VenueAdapter for OkxAdapter {
                 if inst_id.is_empty() {
                     continue;
                 }
-                let s = |k: &str| item.get(k).and_then(|x| x.as_str()).unwrap_or("0").to_string();
-                let (last, open) = (s("last").parse::<f64>().unwrap_or(0.0), s("open24h").parse::<f64>().unwrap_or(0.0));
-                let pct = if open > 0.0 { (last - open) / open * 100.0 } else { 0.0 };
+                let s = |k: &str| {
+                    item.get(k)
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("0")
+                        .to_string()
+                };
+                let (last, open) = (
+                    s("last").parse::<f64>().unwrap_or(0.0),
+                    s("open24h").parse::<f64>().unwrap_or(0.0),
+                );
+                let pct = if open > 0.0 {
+                    (last - open) / open * 100.0
+                } else {
+                    0.0
+                };
                 let our = if category == "linear" {
                     inst_id.trim_end_matches("-SWAP").replace('-', "")
                 } else {
@@ -489,14 +612,31 @@ impl VenueAdapter for OkxAdapter {
         Ok(out)
     }
 
-    async fn funding_history(&self, symbol: &str, limit: usize) -> Result<Vec<(i64, String)>, String> {
+    async fn funding_history(
+        &self,
+        symbol: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, String)>, String> {
         let inst_id = okx_inst_id(symbol, "linear")?;
-        let v = self.public_get("/api/v5/public/funding-rate-history", &format!("instId={inst_id}&limit={}", limit.min(100))).await?;
+        let v = self
+            .public_get(
+                "/api/v5/public/funding-rate-history",
+                &format!("instId={inst_id}&limit={}", limit.min(100)),
+            )
+            .await?;
         let mut out = Vec::new();
         if let Some(list) = v.as_array() {
             for item in list {
-                let ts = item.get("fundingTime").and_then(|x| x.as_str()).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-                let rate = item.get("fundingRate").and_then(|x| x.as_str()).unwrap_or("0").to_string();
+                let ts = item
+                    .get("fundingTime")
+                    .and_then(|x| x.as_str())
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0);
+                let rate = item
+                    .get("fundingRate")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("0")
+                    .to_string();
                 out.push((ts, rate));
             }
         }
@@ -504,47 +644,78 @@ impl VenueAdapter for OkxAdapter {
         Ok(out)
     }
 
-    async fn orderbook(&self, category: &str, symbol: &str, limit: usize) -> Result<OrderBook, String> {
+    async fn orderbook(
+        &self,
+        category: &str,
+        symbol: &str,
+        limit: usize,
+    ) -> Result<OrderBook, String> {
         let inst_id = okx_inst_id(symbol, category)?;
         let sz = limit.clamp(1, 400);
-        let v = self.public_get("/api/v5/market/books", &format!("instId={inst_id}&sz={sz}")).await?;
+        let v = self
+            .public_get("/api/v5/market/books", &format!("instId={inst_id}&sz={sz}"))
+            .await?;
         let d = first_data(&v).ok_or("no book")?;
         let side = |k: &str| -> Vec<OrderBookLevel> {
-            d.get(k).and_then(|x| x.as_array()).map(|a| {
-                a.iter().filter_map(|e| {
-                    Some(OrderBookLevel {
-                        price: e.get(0)?.as_str()?.into(),
-                        qty: e.get(1)?.as_str()?.into(),
-                    })
-                }).collect()
-            }).unwrap_or_default()
+            d.get(k)
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|e| {
+                            Some(OrderBookLevel {
+                                price: e.get(0)?.as_str()?.into(),
+                                qty: e.get(1)?.as_str()?.into(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
         };
         Ok(OrderBook {
             symbol: symbol.into(),
             bids: side("bids"),
             asks: side("asks"),
-            ts: d.get("ts").and_then(|x| x.as_str()).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0),
+            ts: d
+                .get("ts")
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0),
         })
     }
 
     /// OKX /api/v5/account/config exposes the current key's comma-separated
     /// permissions. Missing or malformed permission data must fail closed.
     async fn key_permissions(&self, creds: &VenueCreds) -> Result<KeyPermissions, String> {
-        let v = self.private_get(creds, "/api/v5/account/config", "").await?;
+        let v = self
+            .private_get(creds, "/api/v5/account/config", "")
+            .await?;
         parse_key_permissions(&v)
     }
 
     async fn wallet(&self, creds: &VenueCreds, coin: &str) -> Result<WalletSnapshot, String> {
-        let v = self.private_get(creds, "/api/v5/account/balance", &format!("ccy={coin}")).await?;
+        let v = self
+            .private_get(creds, "/api/v5/account/balance", &format!("ccy={coin}"))
+            .await?;
         let d = first_data(&v).ok_or("no account")?;
-        let det = d.get("details").and_then(|x| x.as_array()).and_then(|a| a.first()).ok_or("no ccy")?;
+        let det = d
+            .get("details")
+            .and_then(|x| x.as_array())
+            .and_then(|a| a.first())
+            .ok_or("no ccy")?;
         let s = |k: &str| det.get(k).and_then(|x| x.as_str()).unwrap_or("0");
         Ok(WalletSnapshot {
-            coin: det.get("ccy").and_then(|x| x.as_str()).unwrap_or(coin).to_string(),
+            coin: det
+                .get("ccy")
+                .and_then(|x| x.as_str())
+                .unwrap_or(coin)
+                .to_string(),
             wallet_balance: Fraction::from_any_str(s("eq")).unwrap_or_else(|_| Fraction::zero()),
             available: Fraction::from_any_str(s("availBal")).unwrap_or_else(|_| Fraction::zero()),
             equity: Fraction::from_any_str(s("eq")).unwrap_or_else(|_| Fraction::zero()),
-            unrealized_pnl: Fraction::from_any_str(det.get("upl").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()),
+            unrealized_pnl: Fraction::from_any_str(
+                det.get("upl").and_then(|x| x.as_str()).unwrap_or("0"),
+            )
+            .unwrap_or_else(|_| Fraction::zero()),
         })
     }
 
@@ -554,7 +725,12 @@ impl VenueAdapter for OkxAdapter {
         // tgtCcy=base_ccy ile sz cinsinden (base coin) açıkça belirtilir.
         // EX-07: OKX long_short_mode gerektirir — posSide eklenir (long→long, short→short).
         let sz = if req.category == "linear" {
-            let spec = self.public_get("/api/v5/public/instruments", &format!("instType=SWAP&instId={inst_id}")).await?;
+            let spec = self
+                .public_get(
+                    "/api/v5/public/instruments",
+                    &format!("instType=SWAP&instId={inst_id}"),
+                )
+                .await?;
             let row = first_data(&spec).ok_or("swap spec yok")?;
             let (_, lot_sz, _, ct_val) = self.inst_spec(row).ok_or("swap spec eksik")?;
             let ct = ct_val.ok_or("ctVal yok")?;
@@ -567,7 +743,8 @@ impl VenueAdapter for OkxAdapter {
             // Spot: miktar base cinsindendir (EX-02 düzeltmesi).
             req.qty.to_half_even_display(8)
         };
-        let pos_side = resolve_okx_pos_side(&req.category, req.position_idx, req.side, req.reduce_only);
+        let pos_side =
+            resolve_okx_pos_side(&req.category, req.position_idx, req.side, req.reduce_only);
         let mut body = serde_json::json!({
             "instId": inst_id,
             "tdMode": if req.category == "linear" { "isolated" } else { "cash" },
@@ -583,29 +760,54 @@ impl VenueAdapter for OkxAdapter {
             body["tgtCcy"] = Value::String("base_ccy".into());
         }
         if !req.is_market {
-            body["px"] = Value::String(req.price.as_ref().map(|p| p.to_half_even_display(8)).unwrap_or_default());
+            body["px"] = Value::String(
+                req.price
+                    .as_ref()
+                    .map(|p| p.to_half_even_display(8))
+                    .unwrap_or_default(),
+            );
         }
         if req.reduce_only {
             body["reduceOnly"] = Value::Bool(true);
         }
         let body_str = serde_json::to_string(&body).map_err(|e| e.to_string())?;
-        let v = self.private_post(creds, "/api/v5/trade/order", &body_str).await?;
+        let v = self
+            .private_post(creds, "/api/v5/trade/order", &body_str)
+            .await?;
         let d = first_data(&v).ok_or("no order data")?;
         let scode = d.get("sCode").and_then(|x| x.as_str()).unwrap_or("-1");
         if scode != "0" {
             let msg = d.get("sMsg").and_then(|x| x.as_str()).unwrap_or("unknown");
-            return Err(format!("okx order sCode={scode}: {}", msg.chars().take(160).collect::<String>()));
+            return Err(format!(
+                "okx order sCode={scode}: {}",
+                msg.chars().take(160).collect::<String>()
+            ));
         }
-        d.get("ordId").and_then(|x| x.as_str()).map(String::from).ok_or_else(|| "no ordId".into())
+        d.get("ordId")
+            .and_then(|x| x.as_str())
+            .map(String::from)
+            .ok_or_else(|| "no ordId".into())
     }
 
-    async fn cancel_order(&self, creds: &VenueCreds, category: &str, symbol: &str, order_link_id: &str) -> Result<(), String> {
+    async fn cancel_order(
+        &self,
+        creds: &VenueCreds,
+        category: &str,
+        symbol: &str,
+        order_link_id: &str,
+    ) -> Result<(), String> {
         let inst_id = okx_inst_id(symbol, category)?;
-        let body = serde_json::json!({"instId": inst_id, "clOrdId": encode_okx_client_id(order_link_id)?});
+        let body =
+            serde_json::json!({"instId": inst_id, "clOrdId": encode_okx_client_id(order_link_id)?});
         let body_str = serde_json::to_string(&body).map_err(|e| e.to_string())?;
-        let v = self.private_post(creds, "/api/v5/trade/cancel-order", &body_str).await?;
+        let v = self
+            .private_post(creds, "/api/v5/trade/cancel-order", &body_str)
+            .await?;
         let d = first_data(&v);
-        let scode = d.and_then(|x| x.get("sCode")).and_then(|x| x.as_str()).unwrap_or("-1");
+        let scode = d
+            .and_then(|x| x.get("sCode"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("-1");
         if scode == "0" {
             return Ok(());
         }
@@ -617,10 +819,21 @@ impl VenueAdapter for OkxAdapter {
         Err(format!("okx cancel sCode={scode}"))
     }
 
-    async fn open_orders(&self, creds: &VenueCreds, category: &str, symbol: &str) -> Result<Vec<VenueOrderState>, String> {
+    async fn open_orders(
+        &self,
+        creds: &VenueCreds,
+        category: &str,
+        symbol: &str,
+    ) -> Result<Vec<VenueOrderState>, String> {
         let inst_id = okx_inst_id(symbol, category)?;
         let inst_type = if category == "linear" { "SWAP" } else { "SPOT" };
-        let v = self.private_get(creds, "/api/v5/trade/orders-pending", &format!("instType={inst_type}&instId={inst_id}")).await?;
+        let v = self
+            .private_get(
+                creds,
+                "/api/v5/trade/orders-pending",
+                &format!("instType={inst_type}&instId={inst_id}"),
+            )
+            .await?;
         // Faz 4 (M-2): swap emirlerinde sz/accFillSz KONTRAT cinsindendir —
         // ctVal ile coin cinsine normalize edilir (ctVal okunamazsa ham bırakılır).
         let ct = if category == "linear" {
@@ -632,13 +845,21 @@ impl VenueAdapter for OkxAdapter {
             return Err("okx: ctVal must be positive for linear order normalization".into());
         }
         let norm = |x: Fraction| -> Result<Fraction, String> {
-            if category == "linear" { normalize_contract_qty(&x, &ct) } else { Ok(x) }
+            if category == "linear" {
+                normalize_contract_qty(&x, &ct)
+            } else {
+                Ok(x)
+            }
         };
         let mut out = Vec::new();
         if let Some(list) = v.as_array() {
             for item in list {
                 out.push(VenueOrderState {
-                    order_id: item.get("ordId").and_then(|x| x.as_str()).unwrap_or("").into(),
+                    order_id: item
+                        .get("ordId")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .into(),
                     order_link_id: item
                         .get("clOrdId")
                         .and_then(|x| x.as_str())
@@ -650,41 +871,79 @@ impl VenueAdapter for OkxAdapter {
                         "sell" => "Sell".into(),
                         other => other.into(),
                     },
-                    price: item.get("px").and_then(|x| x.as_str()).and_then(|s| Fraction::from_decimal_str(s).ok()),
-                    qty: norm(Fraction::from_any_str(item.get("sz").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()))?,
-                    cum_exec_qty: norm(Fraction::from_any_str(item.get("accFillSz").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()))?,
-                    cum_exec_fee: normalize_okx_fee(item.get("accFillFee").and_then(|x| x.as_str())),
-                    status: map_okx_state(item.get("state").and_then(|x| x.as_str()).unwrap_or("")).into(),
+                    price: item
+                        .get("px")
+                        .and_then(|x| x.as_str())
+                        .and_then(|s| Fraction::from_decimal_str(s).ok()),
+                    qty: norm(
+                        Fraction::from_any_str(
+                            item.get("sz").and_then(|x| x.as_str()).unwrap_or("0"),
+                        )
+                        .unwrap_or_else(|_| Fraction::zero()),
+                    )?,
+                    cum_exec_qty: norm(
+                        Fraction::from_any_str(
+                            item.get("accFillSz")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("0"),
+                        )
+                        .unwrap_or_else(|_| Fraction::zero()),
+                    )?,
+                    cum_exec_fee: normalize_okx_fee(
+                        item.get("accFillFee").and_then(|x| x.as_str()),
+                    ),
+                    status: map_okx_state(item.get("state").and_then(|x| x.as_str()).unwrap_or(""))
+                        .into(),
                 });
             }
         }
         Ok(out)
     }
 
-    async fn query_order(&self, creds: &VenueCreds, category: &str, symbol: &str, order_link_id: &str) -> Result<Option<VenueOrderState>, String> {
+    async fn query_order(
+        &self,
+        creds: &VenueCreds,
+        category: &str,
+        symbol: &str,
+        order_link_id: &str,
+    ) -> Result<Option<VenueOrderState>, String> {
         let inst_id = okx_inst_id(symbol, category)?;
         let venue_id = encode_okx_client_id(order_link_id)?;
-        let v = self.private_get(creds, "/api/v5/trade/order", &format!("instId={inst_id}&clOrdId={venue_id}")).await?;
+        let v = self
+            .private_get(
+                creds,
+                "/api/v5/trade/order",
+                &format!("instId={inst_id}&clOrdId={venue_id}"),
+            )
+            .await?;
         let d = match first_data(&v) {
             Some(d) => d,
             None => return Ok(None),
         };
         let state = d.get("state").and_then(|x| x.as_str()).unwrap_or("");
-        // canceled / filled artık book'ta yok — None dürüst "bulunamadı"yla
-        // aynı sözleşme (sweep sentezi için kaybolmuş sayılır).
-        if state == "canceled" || state == "mmp_canceled" {
-            return Ok(None);
-        }
-        let avg = d.get("avgPx").and_then(|x| x.as_str()).and_then(|s| Fraction::from_decimal_str(s).ok());
-        let price = avg.or_else(|| d.get("px").and_then(|x| x.as_str()).and_then(|s| Fraction::from_decimal_str(s).ok()));
+        let avg = d
+            .get("avgPx")
+            .and_then(|x| x.as_str())
+            .and_then(|s| Fraction::from_decimal_str(s).ok());
+        let price = avg.or_else(|| {
+            d.get("px")
+                .and_then(|x| x.as_str())
+                .and_then(|s| Fraction::from_decimal_str(s).ok())
+        });
         // EX-08: swap (linear) kategorisinde accFillSz kontrat adedindedir;
         // ctVal ile coin cinsine dönüştürülür.
-        let raw_qty = Fraction::from_any_str(d.get("sz").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero());
-        let raw_fill = Fraction::from_any_str(d.get("accFillSz").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero());
+        let raw_qty = Fraction::from_any_str(d.get("sz").and_then(|x| x.as_str()).unwrap_or("0"))
+            .unwrap_or_else(|_| Fraction::zero());
+        let raw_fill =
+            Fraction::from_any_str(d.get("accFillSz").and_then(|x| x.as_str()).unwrap_or("0"))
+                .unwrap_or_else(|_| Fraction::zero());
         let (qty, cum_exec_qty) = if category == "linear" {
             // ctVal okunamıyorsa raw değer kullanılır (fail-safe:Contract boyutu bilinmiyor).
             let ct = self.instrument_ct_val(&inst_id).await?;
-            (normalize_contract_qty(&raw_qty, &ct)?, normalize_contract_qty(&raw_fill, &ct)?)
+            (
+                normalize_contract_qty(&raw_qty, &ct)?,
+                normalize_contract_qty(&raw_fill, &ct)?,
+            )
         } else {
             (raw_qty, raw_fill)
         };
@@ -709,15 +968,35 @@ impl VenueAdapter for OkxAdapter {
         }))
     }
 
-    async fn positions(&self, creds: &VenueCreds, symbol: &str) -> Result<Vec<PositionSnapshot>, String> {
+    async fn positions(
+        &self,
+        creds: &VenueCreds,
+        symbol: &str,
+    ) -> Result<Vec<PositionSnapshot>, String> {
         // Spot'ta pozisyon kavramı yok — boş (Binance ile aynı sözleşme).
         let inst_id = match okx_inst_id(symbol, "linear") {
             Ok(i) => i,
             Err(_) => return Ok(Vec::new()),
         };
-        let v = self.private_get(creds, "/api/v5/account/positions", &format!("instId={inst_id}")).await?;
+        let v = self
+            .private_get(
+                creds,
+                "/api/v5/account/positions",
+                &format!("instId={inst_id}"),
+            )
+            .await?;
         let mut out = Vec::new();
         if let Some(list) = v.as_array() {
+            let has_open_position = list.iter().any(|item| {
+                item.get("pos")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|pos| !pos.is_empty() && pos != "0")
+            });
+            let ct_val = if has_open_position {
+                Some(self.instrument_ct_val(&inst_id).await?)
+            } else {
+                None
+            };
             for item in list {
                 let pos = item.get("pos").and_then(|x| x.as_str()).unwrap_or("0");
                 if pos == "0" || pos.is_empty() {
@@ -732,24 +1011,40 @@ impl VenueAdapter for OkxAdapter {
                     "long" => "Buy",
                     "short" => "Sell",
                     _ => {
-                        if pos.trim_start_matches('-').is_empty() || pos.starts_with('-') { "Sell" } else { "Buy" }
+                        if pos.trim_start_matches('-').is_empty() || pos.starts_with('-') {
+                            "Sell"
+                        } else {
+                            "Buy"
+                        }
                     }
                 };
-                let f = |k: &str| Fraction::from_any_str(item.get(k).and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero());
+                let f = |k: &str| {
+                    Fraction::from_any_str(item.get(k).and_then(|x| x.as_str()).unwrap_or("0"))
+                        .unwrap_or_else(|_| Fraction::zero())
+                };
                 out.push(PositionSnapshot {
                     symbol: symbol.into(),
                     side: side.into(),
                     position_idx: None,
                     size: {
                         let raw = f("pos");
-                        let absolute = if raw.is_negative() { raw.neg().unwrap_or_else(|_| Fraction::zero()) } else { raw };
-                        let ct = self.instrument_ct_val(&inst_id).await?;
-                        normalize_contract_qty(&absolute, &ct)?
+                        let absolute = if raw.is_negative() {
+                            raw.neg().unwrap_or_else(|_| Fraction::zero())
+                        } else {
+                            raw
+                        };
+                        let ct = ct_val
+                            .as_ref()
+                            .ok_or("okx ctVal missing for open position")?;
+                        normalize_contract_qty(&absolute, ct)?
                     },
                     avg_price: f("avgPx"),
                     mark_price: f("markPx"),
                     unrealized_pnl: f("upl"),
-                    liq_price: item.get("liqPx").and_then(|x| x.as_str()).and_then(|s| Fraction::from_decimal_str(s).ok()),
+                    liq_price: item
+                        .get("liqPx")
+                        .and_then(|x| x.as_str())
+                        .and_then(|s| Fraction::from_decimal_str(s).ok()),
                     leverage: f("lever"),
                 });
             }
@@ -760,17 +1055,33 @@ impl VenueAdapter for OkxAdapter {
     /// Salt-okunur posMode sorgusu (Faz 1.3 multi-status): anahtar varsa
     /// `long_short_mode` assertion'ı raporlanır; anahtar yoksa çağrılmaz.
     async fn pos_mode(&self, creds: &VenueCreds) -> Result<Option<String>, String> {
-        let pm = self.private_get(creds, "/api/v5/account/get-position-mode", "").await?;
-        Ok(first_data(&pm).and_then(|d| d.get("posMode")).and_then(|x| x.as_str()).map(|s| s.to_string()))
+        let pm = self
+            .private_get(creds, "/api/v5/account/get-position-mode", "")
+            .await?;
+        Ok(first_data(&pm)
+            .and_then(|d| d.get("posMode"))
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()))
     }
     /// v3 posMode tuzağı pre-flight assertion: net_mode hesapta vadeli
     /// kaldıraç senkronu fail-closed reddedilir (Türkçe operasyonel mesaj).
-    async fn set_leverage(&self, creds: &VenueCreds, category: &str, symbol: &str, leverage: &Fraction) -> Result<(), String> {
+    async fn set_leverage(
+        &self,
+        creds: &VenueCreds,
+        category: &str,
+        symbol: &str,
+        leverage: &Fraction,
+    ) -> Result<(), String> {
         if category != "linear" {
             return Ok(());
         }
-        let pm = self.private_get(creds, "/api/v5/account/get-position-mode", "").await?;
-        let mode = first_data(&pm).and_then(|d| d.get("posMode")).and_then(|x| x.as_str()).unwrap_or("");
+        let pm = self
+            .private_get(creds, "/api/v5/account/get-position-mode", "")
+            .await?;
+        let mode = first_data(&pm)
+            .and_then(|d| d.get("posMode"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
         if mode != REQUIRED_POS_MODE {
             return Err(format!(
                 "okx posMode tuzağı: hesap '{mode}' modunda — vadeli için long_short_mode gerekli (net_mode DCA_SHORT'u reddeder veya spot satışa çevirir). OKX web/API üzerinden pozisyon modunu değiştirin, sonra tekrar deneyin."
@@ -783,7 +1094,8 @@ impl VenueAdapter for OkxAdapter {
             "mgnMode": "isolated",
         });
         let body_str = serde_json::to_string(&body).map_err(|e| e.to_string())?;
-        self.private_post(creds, "/api/v5/account/set-leverage", &body_str).await?;
+        self.private_post(creds, "/api/v5/account/set-leverage", &body_str)
+            .await?;
         Ok(())
     }
 }
@@ -791,7 +1103,12 @@ impl VenueAdapter for OkxAdapter {
 /// OKX v5 Linear vadeli emirlerinde posSide eşleme kuralı (P0 Düzeltmesi).
 /// Long pozisyon (1) için hem alış hem kapanış satışı "long" gönderilmelidir.
 /// Short pozisyon (2) için hem satış hem kapanış alışı "short" gönderilmelidir.
-pub fn resolve_okx_pos_side(category: &str, position_idx: i32, side: dca_math::Side, reduce_only: bool) -> Option<&'static str> {
+pub fn resolve_okx_pos_side(
+    category: &str,
+    position_idx: i32,
+    side: dca_math::Side,
+    reduce_only: bool,
+) -> Option<&'static str> {
     if category != "linear" {
         return None;
     }
@@ -815,10 +1132,19 @@ pub fn resolve_okx_pos_side(category: &str, position_idx: i32, side: dca_math::S
 }
 impl OkxAdapter {
     async fn instrument_ct_val(&self, inst_id: &str) -> Result<Fraction, String> {
-        let v = self.public_get("/api/v5/public/instruments", &format!("instType=SWAP&instId={inst_id}")).await?;
+        let v = self
+            .public_get(
+                "/api/v5/public/instruments",
+                &format!("instType=SWAP&instId={inst_id}"),
+            )
+            .await?;
         let row = first_data(&v).ok_or("okx instrument spec yok")?;
-        let ct_str = row.get("ctVal").and_then(|x| x.as_str()).ok_or("okx ctVal alanı yok")?;
-        let ct_val = Fraction::from_decimal_str(ct_str).map_err(|e| format!("okx ctVal parse: {e}"))?;
+        let ct_str = row
+            .get("ctVal")
+            .and_then(|x| x.as_str())
+            .ok_or("okx ctVal alanı yok")?;
+        let ct_val =
+            Fraction::from_decimal_str(ct_str).map_err(|e| format!("okx ctVal parse: {e}"))?;
         if !ct_val.is_positive() {
             return Err("okx ctVal must be positive".into());
         }
@@ -838,16 +1164,31 @@ fn encode_okx_client_id(internal: &str) -> Result<String, String> {
     if body.len() < 8 || !body.as_bytes()[..8].iter().all(u8::is_ascii_hexdigit) {
         return Err("OKX clOrdId: bot ID must contain eight hex characters".into());
     }
-    if body.bytes().any(|c| {
-        !(c.is_ascii_alphanumeric() || c == b'-' || c == b'_') || c == b'y' || c == b'z'
-    }) {
+    if body
+        .bytes()
+        .any(|c| !(c.is_ascii_alphanumeric() || c == b'-' || c == b'_') || c == b'y' || c == b'z')
+    {
         return Err("OKX clOrdId: unsupported character in engine order ID".into());
     }
     let compact = body
         .replace("-GRID_CLOSE-", "zXz")
         .replace('-', "z")
         .replace('_', "y");
-    let venue_id = format!("D{compact}");
+    let mut venue_id = format!("D{compact}");
+    if venue_id.len() > 32 {
+        let (prefix, sequence) = body
+            .rsplit_once('-')
+            .ok_or_else(|| "OKX clOrdId exceeds the 32-character venue limit".to_string())?;
+        let sequence = sequence
+            .parse::<u64>()
+            .map_err(|_| "OKX clOrdId exceeds the 32-character venue limit".to_string())?;
+        let compact_sequence = format!("{prefix}-Z{}", encode_base36(sequence));
+        let shortened = compact_sequence
+            .replace("-GRID_CLOSE-", "zXz")
+            .replace('-', "z")
+            .replace('_', "y");
+        venue_id = format!("D{shortened}");
+    }
     if venue_id.len() > 32 {
         return Err("OKX clOrdId exceeds the 32-character venue limit".into());
     }
@@ -863,8 +1204,47 @@ fn decode_okx_client_id(venue_id: &str) -> String {
     if body.len() < 8 || !body.as_bytes()[..8].iter().all(u8::is_ascii_hexdigit) {
         return venue_id.into();
     }
-    let internal_body = body.replace("zXz", "-GRID_CLOSE-").replace('z', "-").replace('y', "_");
+    let decoded = if let Some((prefix, sequence)) = body.rsplit_once("zZ") {
+        match decode_base36(sequence) {
+            Some(value) => format!("{prefix}z{value}"),
+            None => body.to_string(),
+        }
+    } else {
+        body.to_string()
+    };
+    let internal_body = decoded
+        .replace("zXz", "-GRID_CLOSE-")
+        .replace('z', "-")
+        .replace('y', "_");
     format!("b-{internal_body}")
+}
+
+fn encode_base36(mut value: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if value == 0 {
+        return "0".into();
+    }
+    let mut out = Vec::new();
+    while value > 0 {
+        out.push(DIGITS[(value % 36) as usize]);
+        value /= 36;
+    }
+    out.reverse();
+    String::from_utf8(out).expect("base36 digits are ASCII")
+}
+
+fn decode_base36(value: &str) -> Option<u64> {
+    if value.is_empty() {
+        return None;
+    }
+    value.bytes().try_fold(0u64, |acc, digit| {
+        let n = match digit {
+            b'0'..=b'9' => (digit - b'0') as u64,
+            b'a'..=b'z' => (digit - b'a' + 10) as u64,
+            _ => return None,
+        };
+        acc.checked_mul(36)?.checked_add(n)
+    })
 }
 
 fn map_okx_state(s: &str) -> &'static str {
@@ -895,7 +1275,10 @@ mod okx_tests {
         assert_eq!(okx_inst_id("BTCUSDT", "spot").unwrap(), "BTC-USDT");
         assert_eq!(okx_inst_id("BTCUSDT", "linear").unwrap(), "BTC-USDT-SWAP");
         assert_eq!(okx_inst_id("ETHUSDC", "spot").unwrap(), "ETH-USDC");
-        assert!(okx_inst_id("XYZ", "spot").is_err(), "quote'suz sembol reddedilir");
+        assert!(
+            okx_inst_id("XYZ", "spot").is_err(),
+            "quote'suz sembol reddedilir"
+        );
     }
 
     #[test]
@@ -923,13 +1306,24 @@ mod okx_tests {
         .unwrap();
         let a = OkxAdapter::new();
         let (tick, lot, min, ct) = a.inst_spec(&v).unwrap();
-        assert_eq!((tick.as_str(), lot.as_str(), min.as_str()), ("0.1", "1", "1"));
+        assert_eq!(
+            (tick.as_str(), lot.as_str(), min.as_str()),
+            ("0.1", "1", "1")
+        );
         assert_eq!(ct.as_deref(), Some("0.01"));
     }
 
     #[test]
     fn swap_contracts_convert_to_coin_and_okx_fee_sign_is_reversed() {
-        assert_eq!(normalize_contract_qty(&Fraction::from_u64(10_000), &Fraction::from_decimal_str("0.01").unwrap()).unwrap().to_string(), "100");
+        assert_eq!(
+            normalize_contract_qty(
+                &Fraction::from_u64(10_000),
+                &Fraction::from_decimal_str("0.01").unwrap()
+            )
+            .unwrap()
+            .to_string(),
+            "100"
+        );
         assert_eq!(normalize_okx_fee(Some("-0.25")).unwrap().to_string(), "1/4");
         assert_eq!(normalize_okx_fee(Some("0.1")).unwrap().to_string(), "-1/10");
         assert!(normalize_contract_qty(&Fraction::one(), &Fraction::zero()).is_err());
@@ -949,7 +1343,16 @@ mod okx_tests {
             assert_eq!(decode_okx_client_id(&venue), internal);
         }
         assert_eq!(decode_okx_client_id("OTHER1234zXz"), "OTHER1234zXz");
-        assert!(encode_okx_client_id("b-0123abcd-1-GRID_CLOSE-4294967296").unwrap().len() <= 32);
+        assert!(
+            encode_okx_client_id("b-0123abcd-1-GRID_CLOSE-4294967296")
+                .unwrap()
+                .len()
+                <= 32
+        );
+        let max_seq = "b-0123abcd-1-GRID_CLOSE-18446744073709551615";
+        let encoded = encode_okx_client_id(max_seq).unwrap();
+        assert!(encoded.len() <= 32);
+        assert_eq!(decode_okx_client_id(&encoded), max_seq);
         assert!(encode_okx_client_id("b-0123abcd-1-z_ROLE-0").is_err());
     }
 
@@ -964,23 +1367,50 @@ mod okx_tests {
     #[test]
     fn test_okx_pos_side_resolution() {
         // Spot için posSide olmamalı
-        assert_eq!(resolve_okx_pos_side("spot", 1, dca_math::Side::Buy, false), None);
+        assert_eq!(
+            resolve_okx_pos_side("spot", 1, dca_math::Side::Buy, false),
+            None
+        );
 
         // Linear Long bacağı (idx 1): hem açılış (Buy) hem kapanış (Sell) posSide="long"
-        assert_eq!(resolve_okx_pos_side("linear", 1, dca_math::Side::Buy, false), Some("long"));
-        assert_eq!(resolve_okx_pos_side("linear", 1, dca_math::Side::Sell, true), Some("long"));
+        assert_eq!(
+            resolve_okx_pos_side("linear", 1, dca_math::Side::Buy, false),
+            Some("long")
+        );
+        assert_eq!(
+            resolve_okx_pos_side("linear", 1, dca_math::Side::Sell, true),
+            Some("long")
+        );
 
         // Linear Short bacağı (idx 2): hem açılış (Sell) hem kapanış (Buy) posSide="short"
-        assert_eq!(resolve_okx_pos_side("linear", 2, dca_math::Side::Sell, false), Some("short"));
-        assert_eq!(resolve_okx_pos_side("linear", 2, dca_math::Side::Buy, true), Some("short"));
+        assert_eq!(
+            resolve_okx_pos_side("linear", 2, dca_math::Side::Sell, false),
+            Some("short")
+        );
+        assert_eq!(
+            resolve_okx_pos_side("linear", 2, dca_math::Side::Buy, true),
+            Some("short")
+        );
 
         // Net / One-Way mod (idx 0):
         // Kapanışta: Long kapatan Sell -> "long", Short kapatan Buy -> "short"
-        assert_eq!(resolve_okx_pos_side("linear", 0, dca_math::Side::Sell, true), Some("long"));
-        assert_eq!(resolve_okx_pos_side("linear", 0, dca_math::Side::Buy, true), Some("short"));
+        assert_eq!(
+            resolve_okx_pos_side("linear", 0, dca_math::Side::Sell, true),
+            Some("long")
+        );
+        assert_eq!(
+            resolve_okx_pos_side("linear", 0, dca_math::Side::Buy, true),
+            Some("short")
+        );
         // Açılışta: Buy -> "long", Sell -> "short"
-        assert_eq!(resolve_okx_pos_side("linear", 0, dca_math::Side::Buy, false), Some("long"));
-        assert_eq!(resolve_okx_pos_side("linear", 0, dca_math::Side::Sell, false), Some("short"));
+        assert_eq!(
+            resolve_okx_pos_side("linear", 0, dca_math::Side::Buy, false),
+            Some("long")
+        );
+        assert_eq!(
+            resolve_okx_pos_side("linear", 0, dca_math::Side::Sell, false),
+            Some("short")
+        );
     }
 }
 
@@ -992,7 +1422,8 @@ mod permission_tests {
     fn account_config_permissions_are_parsed_from_the_unwrapped_data_array() {
         let parsed = parse_key_permissions(&serde_json::json!([
             {"perm": "read_only,trade", "ip": "192.0.2.1, 2001:db8::1"}
-        ])).unwrap();
+        ]))
+        .unwrap();
         assert!(!parsed.read_only);
         assert!(!parsed.can_withdraw);
         assert!(parsed.spot_trade && parsed.contract_trade);
@@ -1004,7 +1435,8 @@ mod permission_tests {
         assert!(parse_key_permissions(&serde_json::json!([])).is_err());
         assert!(parse_key_permissions(&serde_json::json!([{"perm": ""}])).is_err());
         assert!(parse_key_permissions(&serde_json::json!([{"perm": true}])).is_err());
-        let parsed = parse_key_permissions(&serde_json::json!([{"perm": "read_only,withdraw"}])).unwrap();
+        let parsed =
+            parse_key_permissions(&serde_json::json!([{"perm": "read_only,withdraw"}])).unwrap();
         assert!(parsed.read_only && parsed.can_withdraw);
         assert!(!parsed.spot_trade && !parsed.contract_trade);
     }

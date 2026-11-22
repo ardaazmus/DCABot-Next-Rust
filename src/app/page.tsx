@@ -98,8 +98,9 @@ function DataFreshness({ lastUpdatedAt, offline }: { lastUpdatedAt: number | nul
 export default function Page({ searchParams }: { searchParams: PageSearchParams }) {
   const query = use(searchParams);
   const requestedView = Array.isArray(query.view) ? query.view[0] : query.view;
-  const initialView: View = isView(requestedView) ? requestedView : "dashboard";
+  const parsedView: View = isView(requestedView) ? requestedView : "dashboard";
   const initialBotId = typeof query.botId === "string" ? query.botId : null;
+  const initialView: View = parsedView === "studio" && !initialBotId ? "fleet" : parsedView;
   const [view, setView] = useState<View>(initialView);
   const [botId, setBotId] = useState<string | null>(initialBotId);
   const [authLocked, setAuthLocked] = useState(false);
@@ -129,10 +130,12 @@ export default function Page({ searchParams }: { searchParams: PageSearchParams 
 
     const onPopState = () => {
       const p = new URLSearchParams(window.location.search);
-      const pv = (p.get("view") as View) || "dashboard";
+      const requested = p.get("view");
+      const parsed = isView(requested) ? requested : "dashboard";
       const pb = p.get("botId");
-      setView(pv);
-      setBotId(pv === "studio" ? pb : null);
+      const nextView = parsed === "studio" && !pb ? "fleet" : parsed;
+      setView(nextView);
+      setBotId(nextView === "studio" ? pb : null);
     };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);

@@ -62,3 +62,55 @@ function Write-LocalProcessRecords {
     $payload = ConvertTo-Json -InputObject ([object[]]$normalized.ToArray()) -Depth 3
     [System.IO.File]::WriteAllText($Path, $payload + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
 }
+
+function Protect-LocalRuntimeDirectory {
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    $principal = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $rule = '{0}:(OI)(CI)F' -f $principal
+    & icacls.exe $Path '/inheritance:r' '/grant:r' $rule | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not restrict .local-runtime directory permissions.' }
+}
+
+function Protect-LocalSecretFile {
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    $principal = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $rule = '{0}:F' -f $principal
+    & icacls.exe $Path '/inheritance:r' '/grant:r' $rule | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not restrict local secret file permissions.' }
+}
+
+function Get-VerifiedLocalNextProcessPair {
+    param(
+        [Parameter(Mandatory = $true)][int] $ListenerProcessId,
+        [Parameter(Mandatory = $false)][object[]] $Records = @(),
+        [Parameter(Mandatory = $true)][string] $ProjectRoot
+    )
+
+    $childInfo = Get-CimInstance Win32_Process -Filter ("ProcessId={0}" -f $ListenerProcessId) -ErrorAction SilentlyContinue
+    $childProcess = Get-Process -Id $ListenerProcessId -ErrorAction SilentlyContinue
+    if (-not $childInfo -or -not $childProcess -or $childInfo.Name -ne 'node.exe') { return $null }
+    $serverEntry = (Join-Path $ProjectRoot 'node_modules/next/dist/server/lib/start-server.js').Replace('/', '\')
+    $childCommandLine = ([string]$childInfo.CommandLine).Replace('/', '\')
+    if ($childCommandLine.IndexOf($serverEntry, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $null }
+
+    $parentId = [int]$childInfo.ParentProcessId
+    $record = $Records | Where-Object { [int]$_.Id -eq $parentId -and $_.Name -eq 'node' } | Select-Object -First 1
+    $parentInfo = Get-CimInstance Win32_Process -Filter ("ProcessId={0}" -f $parentId) -ErrorAction SilentlyContinue
+    $parentProcess = Get-Process -Id $parentId -ErrorAction SilentlyContinue
+    if (-not $record -or -not $parentInfo -or -not $parentProcess -or $parentInfo.Name -ne 'node.exe') { return $null }
+    try {
+        if ([long]$record.Started -ne [long]$parentProcess.StartTime.ToUniversalTime().Ticks) { return $null }
+    } catch {
+        return $null
+    }
+
+    $parentCommandLine = ([string]$parentInfo.CommandLine).Replace('/', '\')
+    if ($parentCommandLine.IndexOf('node_modules\next\dist\bin\next dev ', [System.StringComparison]::OrdinalIgnoreCase) -lt 0 -or
+        $parentCommandLine.IndexOf('--hostname 127.0.0.1', [System.StringComparison]::OrdinalIgnoreCase) -lt 0 -or
+        $parentCommandLine.IndexOf('--port 3000', [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+        return $null
+    }
+    return [pscustomobject]@{ ParentId = $parentId; ChildId = $ListenerProcessId }
+}

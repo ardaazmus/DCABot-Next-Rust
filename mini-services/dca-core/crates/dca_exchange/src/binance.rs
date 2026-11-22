@@ -1,6 +1,9 @@
 //! Binance spot adapter (secondary venue) — exchangeInfo, klines, signed trade.
 
-use super::{VenueCreds, KeyPermissions, Kline, OrderBook, OrderBookLevel, OrderRequest, PositionSnapshot, Ticker24h, TickerSnapshot, VenueAdapter, VenueOrderState, WalletSnapshot};
+use super::{
+    KeyPermissions, Kline, OrderBook, OrderBookLevel, OrderRequest, PositionSnapshot, Ticker24h,
+    TickerSnapshot, VenueAdapter, VenueCreds, VenueOrderState, WalletSnapshot,
+};
 use dca_math::fraction::Fraction;
 use dca_math::Instrument;
 use hmac::{Hmac, Mac};
@@ -25,7 +28,11 @@ fn parse_account_restrictions(v: &Value) -> Result<KeyPermissions, String> {
     let can_read = required_bool("enableReading")?;
     let ip_restrict = required_bool("ipRestrict")?;
     let read_only = can_read && !spot_trade && !contract_trade;
-    let ips = if ip_restrict { vec!["IP_RESTRICTED".into()] } else { vec![] };
+    let ips = if ip_restrict {
+        vec!["IP_RESTRICTED".into()]
+    } else {
+        vec![]
+    };
     Ok(KeyPermissions {
         read_only,
         can_withdraw,
@@ -43,15 +50,26 @@ pub struct BinanceAdapter {
 
 impl BinanceAdapter {
     pub fn new() -> Self {
-        let raw_base = if let Ok(u) = std::env::var("BINANCE_SPOT_BASE").or_else(|_| std::env::var("DCA_BINANCE_BASE_URL")) {
+        let raw_base = if let Ok(u) =
+            std::env::var("BINANCE_SPOT_BASE").or_else(|_| std::env::var("DCA_BINANCE_BASE_URL"))
+        {
             u
         } else if std::env::var("DCA_BINANCE_TESTNET").as_deref() == Ok("1") {
             TESTNET.to_string()
         } else {
             MAINNET.to_string()
         };
+        Self::with_spot_base(&raw_base)
+    }
+
+    /// Explicit safe constructor for tests that create the full server state.
+    pub fn new_testnet() -> Self {
+        Self::with_spot_base(TESTNET)
+    }
+
+    fn with_spot_base(raw_base: &str) -> Self {
         let base = super::guarded_venue_base_url(
-            &raw_base,
+            raw_base,
             "Binance Spot",
             &["api.binance.com", "testnet.binance.vision"],
             &["api.binance.com"],
@@ -62,19 +80,32 @@ impl BinanceAdapter {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
                 .build()
                 .expect("reqwest"),
         }
     }
 
     fn signed_query(&self, params: &str, secret: &str) -> String {
-        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
         sign_query(params, secret, ts)
     }
 
     async fn public_get(&self, path: &str, query: &str) -> Result<Value, String> {
-        let url = if query.is_empty() { format!("{}{}", self.base_url, path) } else { format!("{}{}?{}", self.base_url, path, query) };
-        let resp = self.http.get(&url).send().await.map_err(|e| e.to_string())?;
+        let url = if query.is_empty() {
+            format!("{}{}", self.base_url, path)
+        } else {
+            format!("{}{}?{}", self.base_url, path, query)
+        };
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
         resp.json().await.map_err(|e| e.to_string())
     }
 }
@@ -105,10 +136,16 @@ impl VenueAdapter for BinanceAdapter {
 
     async fn server_time_ms(&self) -> Result<i64, String> {
         let v = self.public_get("/api/v3/time", "").await?;
-        v.get("serverTime").and_then(|x| x.as_i64()).ok_or_else(|| "no time".into())
+        v.get("serverTime")
+            .and_then(|x| x.as_i64())
+            .ok_or_else(|| "no time".into())
     }
 
-    async fn instruments(&self, _category: &str, symbol: Option<&str>) -> Result<Vec<Instrument>, String> {
+    async fn instruments(
+        &self,
+        _category: &str,
+        symbol: Option<&str>,
+    ) -> Result<Vec<Instrument>, String> {
         // Faz 1.1: sembol verilmişse sunucu-taraflı filtrele — tam liste MB'lerce
         // (yavaş hatlarda 15sn istemci zaman aşımını aşırır); şekil aynı döner.
         let query = symbol.map(|s| format!("symbol={s}")).unwrap_or_default();
@@ -126,35 +163,78 @@ impl VenueAdapter for BinanceAdapter {
                     continue;
                 }
                 let (tick, step, min_qty, min_notional) = (
-                    item.get("filters").and_then(|f| f.as_array()).and_then(|f| {
-                        f.iter()
-                            .find(|x| x.get("filterType").and_then(|t| t.as_str()) == Some("PRICE_FILTER"))
-                            .and_then(|x| x.get("tickSize").and_then(|t| t.as_str()).map(String::from))
-                    }).unwrap_or_else(|| "0.01".into()),
-                    item.get("filters").and_then(|f| f.as_array()).and_then(|f| {
-                        f.iter()
-                            .find(|x| x.get("filterType").and_then(|t| t.as_str()) == Some("LOT_SIZE"))
-                            .and_then(|x| x.get("stepSize").and_then(|t| t.as_str()).map(String::from))
-                    }).unwrap_or_else(|| "0.00001".into()),
-                    item.get("filters").and_then(|f| f.as_array()).and_then(|f| {
-                        f.iter()
-                            .find(|x| x.get("filterType").and_then(|t| t.as_str()) == Some("LOT_SIZE"))
-                            .and_then(|x| x.get("minQty").and_then(|t| t.as_str()).map(String::from))
-                    }).unwrap_or_else(|| "0.00001".into()),
-                    item.get("filters").and_then(|f| f.as_array()).and_then(|f| {
-                        f.iter()
-                            .find(|x| x.get("filterType").and_then(|t| t.as_str()) == Some("NOTIONAL"))
-                            .and_then(|x| x.get("minNotional").and_then(|t| t.as_str()).map(String::from))
-                    }).unwrap_or_else(|| "5".into()),
+                    item.get("filters")
+                        .and_then(|f| f.as_array())
+                        .and_then(|f| {
+                            f.iter()
+                                .find(|x| {
+                                    x.get("filterType").and_then(|t| t.as_str())
+                                        == Some("PRICE_FILTER")
+                                })
+                                .and_then(|x| {
+                                    x.get("tickSize").and_then(|t| t.as_str()).map(String::from)
+                                })
+                        })
+                        .unwrap_or_else(|| "0.01".into()),
+                    item.get("filters")
+                        .and_then(|f| f.as_array())
+                        .and_then(|f| {
+                            f.iter()
+                                .find(|x| {
+                                    x.get("filterType").and_then(|t| t.as_str()) == Some("LOT_SIZE")
+                                })
+                                .and_then(|x| {
+                                    x.get("stepSize").and_then(|t| t.as_str()).map(String::from)
+                                })
+                        })
+                        .unwrap_or_else(|| "0.00001".into()),
+                    item.get("filters")
+                        .and_then(|f| f.as_array())
+                        .and_then(|f| {
+                            f.iter()
+                                .find(|x| {
+                                    x.get("filterType").and_then(|t| t.as_str()) == Some("LOT_SIZE")
+                                })
+                                .and_then(|x| {
+                                    x.get("minQty").and_then(|t| t.as_str()).map(String::from)
+                                })
+                        })
+                        .unwrap_or_else(|| "0.00001".into()),
+                    item.get("filters")
+                        .and_then(|f| f.as_array())
+                        .and_then(|f| {
+                            f.iter()
+                                .find(|x| {
+                                    x.get("filterType").and_then(|t| t.as_str()) == Some("NOTIONAL")
+                                })
+                                .and_then(|x| {
+                                    x.get("minNotional")
+                                        .and_then(|t| t.as_str())
+                                        .map(String::from)
+                                })
+                        })
+                        .unwrap_or_else(|| "5".into()),
                 );
                 out.push(Instrument {
                     symbol: sym.to_string(),
-                    base: item.get("baseAsset").and_then(|x| x.as_str()).unwrap_or("").into(),
-                    quote: item.get("quoteAsset").and_then(|x| x.as_str()).unwrap_or("USDT").into(),
-                    tick_size: Fraction::from_decimal_str(&tick).unwrap_or_else(|_| Fraction::from_decimal_str("0.01").unwrap()),
-                    step_size: Fraction::from_decimal_str(&step).unwrap_or_else(|_| Fraction::from_decimal_str("0.00001").unwrap()),
-                    min_qty: Fraction::from_decimal_str(&min_qty).unwrap_or_else(|_| Fraction::from_decimal_str("0.00001").unwrap()),
-                    min_notional: Fraction::from_decimal_str(&min_notional).unwrap_or_else(|_| Fraction::from_u64(5)),
+                    base: item
+                        .get("baseAsset")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .into(),
+                    quote: item
+                        .get("quoteAsset")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("USDT")
+                        .into(),
+                    tick_size: Fraction::from_decimal_str(&tick)
+                        .unwrap_or_else(|_| Fraction::from_decimal_str("0.01").unwrap()),
+                    step_size: Fraction::from_decimal_str(&step)
+                        .unwrap_or_else(|_| Fraction::from_decimal_str("0.00001").unwrap()),
+                    min_qty: Fraction::from_decimal_str(&min_qty)
+                        .unwrap_or_else(|_| Fraction::from_decimal_str("0.00001").unwrap()),
+                    min_notional: Fraction::from_decimal_str(&min_notional)
+                        .unwrap_or_else(|_| Fraction::from_u64(5)),
                     maker_fee_rate: Fraction::from_decimal_str("0.001").unwrap(),
                     taker_fee_rate: Fraction::from_decimal_str("0.001").unwrap(),
                     max_leverage: Fraction::one(),
@@ -167,7 +247,13 @@ impl VenueAdapter for BinanceAdapter {
         Ok(out)
     }
 
-    async fn klines(&self, _category: &str, symbol: &str, interval: &str, limit: usize) -> Result<Vec<Kline>, String> {
+    async fn klines(
+        &self,
+        _category: &str,
+        symbol: &str,
+        interval: &str,
+        limit: usize,
+    ) -> Result<Vec<Kline>, String> {
         let iv = match interval {
             "1" | "3" | "5" | "15" | "30" => format!("{}m", interval),
             "60" => "1h".into(),
@@ -199,7 +285,9 @@ impl VenueAdapter for BinanceAdapter {
     }
 
     async fn ticker(&self, _category: &str, symbol: &str) -> Result<TickerSnapshot, String> {
-        let v = self.public_get("/api/v3/ticker/price", &format!("symbol={symbol}")).await?;
+        let v = self
+            .public_get("/api/v3/ticker/price", &format!("symbol={symbol}"))
+            .await?;
         let p = v.get("price").and_then(|x| x.as_str()).unwrap_or("0");
         Ok(TickerSnapshot {
             symbol: symbol.into(),
@@ -220,7 +308,12 @@ impl VenueAdapter for BinanceAdapter {
         Ok(arr
             .iter()
             .map(|item| {
-                let s = |k: &str| item.get(k).and_then(|x| x.as_str()).unwrap_or("0").to_string();
+                let s = |k: &str| {
+                    item.get(k)
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("0")
+                        .to_string()
+                };
                 Ticker24h {
                     symbol: s("symbol"),
                     last: s("lastPrice"),
@@ -234,7 +327,11 @@ impl VenueAdapter for BinanceAdapter {
             .collect())
     }
 
-    async fn funding_history(&self, _symbol: &str, _limit: usize) -> Result<Vec<(i64, String)>, String> {
+    async fn funding_history(
+        &self,
+        _symbol: &str,
+        _limit: usize,
+    ) -> Result<Vec<(i64, String)>, String> {
         Ok(Vec::new()) // spot venue: no funding
     }
 
@@ -249,13 +346,24 @@ impl VenueAdapter for BinanceAdapter {
             .header("X-MBX-APIKEY", &creds.key)
             .send()
             .await
-            .map_err(|e| format!("binance permission check network failure: {}", e.without_url()))?;
+            .map_err(|e| {
+                format!(
+                    "binance permission check network failure: {}",
+                    e.without_url()
+                )
+            })?;
 
         if !resp.status().is_success() {
-            return Err(format!("binance permission check failed ({})", resp.status()));
+            return Err(format!(
+                "binance permission check failed ({})",
+                resp.status()
+            ));
         }
 
-        let v: Value = resp.json().await.map_err(|e| format!("binance response parse error: {e}"))?;
+        let v: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("binance response parse error: {e}"))?;
         parse_account_restrictions(&v)
     }
 
@@ -270,16 +378,28 @@ impl VenueAdapter for BinanceAdapter {
             .await
             .map_err(|e| e.to_string())?;
         let v: Value = resp.json().await.map_err(|e| e.to_string())?;
-        let balances = v.get("balances").and_then(|x| x.as_array()).ok_or("no balances")?;
+        let balances = v
+            .get("balances")
+            .and_then(|x| x.as_array())
+            .ok_or("no balances")?;
         let target = balances
             .iter()
             .find(|c| c.get("asset").and_then(|x| x.as_str()) == Some(coin))
             .ok_or("coin not found")?;
         Ok(WalletSnapshot {
             coin: coin.into(),
-            wallet_balance: Fraction::from_any_str(target.get("free").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()),
-            available: Fraction::from_any_str(target.get("free").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()),
-            equity: Fraction::from_any_str(target.get("free").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()),
+            wallet_balance: Fraction::from_any_str(
+                target.get("free").and_then(|x| x.as_str()).unwrap_or("0"),
+            )
+            .unwrap_or_else(|_| Fraction::zero()),
+            available: Fraction::from_any_str(
+                target.get("free").and_then(|x| x.as_str()).unwrap_or("0"),
+            )
+            .unwrap_or_else(|_| Fraction::zero()),
+            equity: Fraction::from_any_str(
+                target.get("free").and_then(|x| x.as_str()).unwrap_or("0"),
+            )
+            .unwrap_or_else(|_| Fraction::zero()),
             unrealized_pnl: Fraction::zero(),
         })
     }
@@ -288,13 +408,22 @@ impl VenueAdapter for BinanceAdapter {
         let mut params = format!(
             "symbol={}&side={}&type={}&quantity={}&newOrderRespType=RESULT&newClientOrderId={}",
             req.symbol,
-            match req.side { dca_math::Side::Buy => "BUY", dca_math::Side::Sell => "SELL" },
+            match req.side {
+                dca_math::Side::Buy => "BUY",
+                dca_math::Side::Sell => "SELL",
+            },
             if req.is_market { "MARKET" } else { "LIMIT" },
             req.qty.to_half_even_display(8),
             req.order_link_id
         );
         if !req.is_market {
-            params.push_str(&format!("&price={}&timeInForce=GTC", req.price.as_ref().map(|p| p.to_half_even_display(8)).unwrap_or_default()));
+            params.push_str(&format!(
+                "&price={}&timeInForce=GTC",
+                req.price
+                    .as_ref()
+                    .map(|p| p.to_half_even_display(8))
+                    .unwrap_or_default()
+            ));
         }
         let q = self.signed_query(&params, &creds.secret);
         let url = format!("{}/api/v3/order?{}", self.base_url, q);
@@ -306,7 +435,10 @@ impl VenueAdapter for BinanceAdapter {
             .await
             .map_err(|e| e.to_string())?;
         let v: Value = resp.json().await.map_err(|e| e.to_string())?;
-        v.get("orderId").and_then(|x| x.as_i64()).map(|i| i.to_string()).ok_or_else(|| format!("binance order failed: {v}"))
+        v.get("orderId")
+            .and_then(|x| x.as_i64())
+            .map(|i| i.to_string())
+            .ok_or_else(|| format!("binance order failed: {v}"))
     }
 
     async fn cancel_order(
@@ -343,9 +475,16 @@ impl VenueAdapter for BinanceAdapter {
     /// stub'tı: gate kalkarsa sweep TÜM takip edilen emirleri "doldu" sayardı
     /// (kritik phantom-fill). Şimdi gerçek defter görünürlüğü var; kategori
     /// spot değilse dürüst hata (futures kanalı ayrı implementasyondur).
-    async fn open_orders(&self, creds: &VenueCreds, category: &str, symbol: &str) -> Result<Vec<VenueOrderState>, String> {
+    async fn open_orders(
+        &self,
+        creds: &VenueCreds,
+        category: &str,
+        symbol: &str,
+    ) -> Result<Vec<VenueOrderState>, String> {
         if category != "spot" {
-            return Err(format!("binance open_orders: kategori '{category}' desteklenmiyor (LIVE spot kanalı)"));
+            return Err(format!(
+                "binance open_orders: kategori '{category}' desteklenmiyor (LIVE spot kanalı)"
+            ));
         }
         let params = format!("symbol={symbol}");
         let q = self.signed_query(&params, &creds.secret);
@@ -362,15 +501,44 @@ impl VenueAdapter for BinanceAdapter {
         if let Some(list) = v.as_array() {
             for item in list {
                 out.push(VenueOrderState {
-                    order_id: item.get("orderId").and_then(|x| x.as_i64()).map(|i| i.to_string()).unwrap_or_default(),
-                    order_link_id: item.get("clientOrderId").and_then(|x| x.as_str()).unwrap_or("").into(),
-                    symbol: item.get("symbol").and_then(|x| x.as_str()).unwrap_or("").into(),
-                    side: item.get("side").and_then(|x| x.as_str()).unwrap_or("").into(),
-                    price: item.get("price").and_then(|x| x.as_str()).and_then(|s| Fraction::from_decimal_str(s).ok()),
-                    qty: Fraction::from_any_str(item.get("origQty").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()),
-                    cum_exec_qty: Fraction::from_any_str(item.get("executedQty").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()),
+                    order_id: item
+                        .get("orderId")
+                        .and_then(|x| x.as_i64())
+                        .map(|i| i.to_string())
+                        .unwrap_or_default(),
+                    order_link_id: item
+                        .get("clientOrderId")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .into(),
+                    symbol: item
+                        .get("symbol")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .into(),
+                    side: item
+                        .get("side")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .into(),
+                    price: item
+                        .get("price")
+                        .and_then(|x| x.as_str())
+                        .and_then(|s| Fraction::from_decimal_str(s).ok()),
+                    qty: Fraction::from_any_str(
+                        item.get("origQty").and_then(|x| x.as_str()).unwrap_or("0"),
+                    )
+                    .unwrap_or_else(|_| Fraction::zero()),
+                    cum_exec_qty: Fraction::from_any_str(
+                        item.get("executedQty")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("0"),
+                    )
+                    .unwrap_or_else(|_| Fraction::zero()),
                     cum_exec_fee: None,
-                    status: item.get("status").and_then(|x| x.as_str()).unwrap_or("").into(),
+                    status: normalize_binance_order_status(
+                        item.get("status").and_then(|x| x.as_str()).unwrap_or(""),
+                    ),
                 });
             }
         }
@@ -386,7 +554,9 @@ impl VenueAdapter for BinanceAdapter {
         order_link_id: &str,
     ) -> Result<Option<VenueOrderState>, String> {
         if category != "spot" {
-            return Err(format!("binance query_order: kategori '{category}' desteklenmiyor (LIVE spot kanalı)"));
+            return Err(format!(
+                "binance query_order: kategori '{category}' desteklenmiyor (LIVE spot kanalı)"
+            ));
         }
         let params = format!("symbol={symbol}&origClientOrderId={order_link_id}");
         let q = self.signed_query(&params, &creds.secret);
@@ -406,30 +576,57 @@ impl VenueAdapter for BinanceAdapter {
         if v.get("orderId").is_none() {
             return Err(format!("binance query_order failed: {v}"));
         }
-        let executed = Fraction::from_any_str(v.get("executedQty").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero());
-        let quote = v.get("cummulativeQuoteQty").and_then(|x| x.as_str()).and_then(|s| Fraction::from_any_str(s).ok());
+        let executed =
+            Fraction::from_any_str(v.get("executedQty").and_then(|x| x.as_str()).unwrap_or("0"))
+                .unwrap_or_else(|_| Fraction::zero());
+        let quote = v
+            .get("cummulativeQuoteQty")
+            .and_then(|x| x.as_str())
+            .and_then(|s| Fraction::from_any_str(s).ok());
         // ortalama dolum fiyatı: quote/executed (yoksa limit price)
         let avg = if !executed.is_zero() {
             quote.and_then(|q| q.div(&executed).ok())
         } else {
             None
         };
-        let price = avg
-            .or_else(|| v.get("price").and_then(|x| x.as_str()).and_then(|s| Fraction::from_decimal_str(s).ok()));
+        let price = avg.or_else(|| {
+            v.get("price")
+                .and_then(|x| x.as_str())
+                .and_then(|s| Fraction::from_decimal_str(s).ok())
+        });
         Ok(Some(VenueOrderState {
-            order_id: v.get("orderId").and_then(|x| x.as_i64()).map(|i| i.to_string()).unwrap_or_default(),
-            order_link_id: v.get("clientOrderId").and_then(|x| x.as_str()).unwrap_or("").into(),
-            symbol: v.get("symbol").and_then(|x| x.as_str()).unwrap_or("").into(),
+            order_id: v
+                .get("orderId")
+                .and_then(|x| x.as_i64())
+                .map(|i| i.to_string())
+                .unwrap_or_default(),
+            order_link_id: v
+                .get("clientOrderId")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .into(),
+            symbol: v
+                .get("symbol")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .into(),
             side: v.get("side").and_then(|x| x.as_str()).unwrap_or("").into(),
             price,
-            qty: Fraction::from_any_str(v.get("origQty").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()),
+            qty: Fraction::from_any_str(v.get("origQty").and_then(|x| x.as_str()).unwrap_or("0"))
+                .unwrap_or_else(|_| Fraction::zero()),
             cum_exec_qty: executed,
             cum_exec_fee: None,
-            status: normalize_binance_order_status(v.get("status").and_then(|x| x.as_str()).unwrap_or("")),
+            status: normalize_binance_order_status(
+                v.get("status").and_then(|x| x.as_str()).unwrap_or(""),
+            ),
         }))
     }
 
-    async fn positions(&self, _creds: &VenueCreds, _symbol: &str) -> Result<Vec<PositionSnapshot>, String> {
+    async fn positions(
+        &self,
+        _creds: &VenueCreds,
+        _symbol: &str,
+    ) -> Result<Vec<PositionSnapshot>, String> {
         Ok(Vec::new()) // spot: no positions
     }
 
@@ -437,14 +634,27 @@ impl VenueAdapter for BinanceAdapter {
     /// Adaptor spot-kanallidir; futures icin ayri `fapi` tabani kullanilir
     /// (ayni API anahtari spot+futures'ta gecerlidir). Anahtar yoksa hata
     /// dondurur — handler ABSTAIN uretir.
-    async fn mmr_brackets(&self, symbol: &str, creds: Option<&VenueCreds>) -> Result<Vec<dca_math::MmrBracket>, String> {
+    async fn mmr_brackets(
+        &self,
+        symbol: &str,
+        creds: Option<&VenueCreds>,
+    ) -> Result<Vec<dca_math::MmrBracket>, String> {
         let c = creds.ok_or("BINANCE anahtari yok (abstain)")?;
         let q = self.signed_query(&format!("symbol={symbol}"), &c.secret);
-        let url = format!("{}/fapi/v1/leverageBracket?{}", futures_base(), q);
-        let resp = self.http.get(&url).header("X-MBX-APIKEY", &c.key).send().await.map_err(|e| e.to_string())?;
+        let url = format!("{}/fapi/v1/leverageBracket?{}", futures_base()?, q);
+        let resp = self
+            .http
+            .get(&url)
+            .header("X-MBX-APIKEY", &c.key)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
         let v: Value = resp.json().await.map_err(|e| e.to_string())?;
         if v.get("code").and_then(|x| x.as_i64()).is_some() {
-            let msg = v.get("msg").and_then(|x| x.as_str()).unwrap_or("bilinmiyor");
+            let msg = v
+                .get("msg")
+                .and_then(|x| x.as_str())
+                .unwrap_or("bilinmiyor");
             return Err(format!("binance leverageBracket reddi: {msg}"));
         }
         parse_binance_brackets(&v, symbol)
@@ -452,21 +662,41 @@ impl VenueAdapter for BinanceAdapter {
 
     /// P3-6 L2 derinlik (Binance spot /api/v3/depth, halka açık).
     /// Adaptör spot-kanallıdır; linear istenirse dürüst 422.
-    async fn orderbook(&self, category: &str, symbol: &str, limit: usize) -> Result<OrderBook, String> {
+    async fn orderbook(
+        &self,
+        category: &str,
+        symbol: &str,
+        limit: usize,
+    ) -> Result<OrderBook, String> {
         if category != "spot" {
-            return Err(format!("binance orderbook: '{category}' desteklenmiyor (spot kanalı)"));
+            return Err(format!(
+                "binance orderbook: '{category}' desteklenmiyor (spot kanalı)"
+            ));
         }
-        let lim = match limit { 0..=5 => 5, 6..=10 => 10, 11..=20 => 20, 21..=50 => 50, _ => 100 };
-        let v = self.public_get("/api/v3/depth", &format!("symbol={symbol}&limit={lim}")).await?;
+        let lim = match limit {
+            0..=5 => 5,
+            6..=10 => 10,
+            11..=20 => 20,
+            21..=50 => 50,
+            _ => 100,
+        };
+        let v = self
+            .public_get("/api/v3/depth", &format!("symbol={symbol}&limit={lim}"))
+            .await?;
         let side = |k: &str| -> Vec<OrderBookLevel> {
-            v.get(k).and_then(|x| x.as_array()).map(|a| {
-                a.iter().filter_map(|e| {
-                    Some(OrderBookLevel {
-                        price: e.get(0)?.as_str()?.into(),
-                        qty: e.get(1)?.as_str()?.into(),
-                    })
-                }).collect()
-            }).unwrap_or_default()
+            v.get(k)
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|e| {
+                            Some(OrderBookLevel {
+                                price: e.get(0)?.as_str()?.into(),
+                                qty: e.get(1)?.as_str()?.into(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
         };
         Ok(OrderBook {
             symbol: symbol.into(),
@@ -494,13 +724,14 @@ fn normalize_binance_order_status(status: &str) -> String {
 }
 
 /// Faz 2.7 — futures tabanı (spot tabanından ayrı; testnet bayrağı paralel).
-fn futures_base() -> String {
+fn futures_base() -> Result<String, String> {
     let raw = if std::env::var("DCA_BINANCE_TESTNET").as_deref() == Ok("1") {
-        std::env::var("BINANCE_FUTURES_TESTNET_BASE").unwrap_or_else(|_| "https://testnet.binancefuture.com".into())
+        std::env::var("BINANCE_FUTURES_TESTNET_BASE")
+            .unwrap_or_else(|_| "https://testnet.binancefuture.com".into())
     } else {
         std::env::var("BINANCE_FUTURES_BASE").unwrap_or_else(|_| "https://fapi.binance.com".into())
     };
-    super::guarded_venue_base_url(
+    super::try_guarded_venue_base_url(
         &raw,
         "Binance Futures",
         &["fapi.binance.com", "testnet.binancefuture.com"],
@@ -513,23 +744,33 @@ fn futures_base() -> String {
 /// normalize eder. Girdi: `[{symbol, brackets:[{bracket, notionalFloor,
 /// notionalCap, maintMarginRatio, cum}]}]` (sayılar JSON number gelir).
 /// maxLeverage (initialLeverage) tasinmaz — M07 tuketmiyor (notlu).
-pub fn parse_binance_brackets(v: &Value, symbol: &str) -> Result<Vec<dca_math::MmrBracket>, String> {
+pub fn parse_binance_brackets(
+    v: &Value,
+    symbol: &str,
+) -> Result<Vec<dca_math::MmrBracket>, String> {
     let arr = v.as_array().ok_or("binance leverageBracket: dizi yok")?;
     let entry = arr
         .iter()
         .find(|e| e.get("symbol").and_then(|x| x.as_str()) == Some(symbol))
         .ok_or(format!("binance leverageBracket: {symbol} yok"))?;
-    let list = entry.get("brackets").and_then(|x| x.as_array()).ok_or("brackets yok")?;
+    let list = entry
+        .get("brackets")
+        .and_then(|x| x.as_array())
+        .ok_or("brackets yok")?;
     if list.is_empty() {
         return Err("binance leverageBracket: bos kademe".into());
     }
     let num = |it: &Value, k: &str| -> Result<dca_math::fraction::Fraction, String> {
         let s = it.get(k).map(|x| x.to_string()).ok_or(format!("{k} yok"))?;
-        dca_math::fraction::Fraction::from_any_str(&s).map_err(|e| format!("{k} cozulmedi ({s}): {e}"))
+        dca_math::fraction::Fraction::from_any_str(&s)
+            .map_err(|e| format!("{k} cozulmedi ({s}): {e}"))
     };
     let mut rows: Vec<(i64, dca_math::MmrBracket)> = Vec::with_capacity(list.len());
     for it in list {
-        let no = it.get("bracket").and_then(|x| x.as_i64()).ok_or("bracket no yok")?;
+        let no = it
+            .get("bracket")
+            .and_then(|x| x.as_i64())
+            .ok_or("bracket no yok")?;
         rows.push((
             no,
             dca_math::MmrBracket {
@@ -600,10 +841,18 @@ mod binance_sign_tests {
         assert!(q.starts_with(&format!("{payload}&timestamp=1700000000000&signature=")));
         let sig = q.rsplit("&signature=").next().unwrap();
         assert_eq!(sig.len(), 64, "SHA-256 hex digest length");
-        assert!(sig.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()), "signature must be UPPER hex");
+        assert!(
+            sig.chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
+            "signature must be UPPER hex"
+        );
         let mut expected = Hmac::<Sha256>::new_from_slice(b"Jefe").unwrap();
         expected.update(format!("{payload}&timestamp=1700000000000").as_bytes());
-        assert_eq!(sig, hex::encode_upper(expected.finalize().into_bytes()), "signature must cover params + timestamp");
+        assert_eq!(
+            sig,
+            hex::encode_upper(expected.finalize().into_bytes()),
+            "signature must cover params + timestamp"
+        );
     }
 }
 
@@ -619,7 +868,8 @@ mod permission_tests {
             "enableSpotAndMarginTrading": false,
             "enableFutures": false,
             "enableReading": true
-        })).is_err());
+        }))
+        .is_err());
     }
 
     #[test]
@@ -630,7 +880,8 @@ mod permission_tests {
             "enableFutures": false,
             "enableReading": true,
             "ipRestrict": true
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(!safe.can_withdraw);
         assert!(safe.spot_trade);
         assert!(!safe.contract_trade);
@@ -642,7 +893,8 @@ mod permission_tests {
             "enableFutures": false,
             "enableReading": true,
             "ipRestrict": false
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(unsafe_key.can_withdraw);
     }
 }
@@ -654,9 +906,18 @@ mod order_status_tests {
     #[test]
     fn normalizes_terminal_and_partial_binance_order_states() {
         assert_eq!(normalize_binance_order_status("FILLED"), "Filled");
-        assert_eq!(normalize_binance_order_status("PARTIALLY_FILLED"), "PartiallyFilled");
+        assert_eq!(
+            normalize_binance_order_status("PARTIALLY_FILLED"),
+            "PartiallyFilled"
+        );
         assert_eq!(normalize_binance_order_status("CANCELED"), "Cancelled");
-        assert_eq!(normalize_binance_order_status("EXPIRED_IN_MATCH"), "Expired");
-        assert_eq!(normalize_binance_order_status("SOME_FUTURE_STATE"), "SOME_FUTURE_STATE");
+        assert_eq!(
+            normalize_binance_order_status("EXPIRED_IN_MATCH"),
+            "Expired"
+        );
+        assert_eq!(
+            normalize_binance_order_status("SOME_FUTURE_STATE"),
+            "SOME_FUTURE_STATE"
+        );
     }
 }

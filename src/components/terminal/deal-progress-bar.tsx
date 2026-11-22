@@ -199,6 +199,11 @@ export function DealProgressBar({
     };
   }, [isOpen, avgPrice, tpPrice, liqPrice, nextSafetyPrice, slPrice, curNum, ladder, safetyTriggered, isShort, marginMode]);
 
+  const formatMovePct = (pct: number, digits = 2) => {
+    const movesUp = (pct >= 0) === isShort;
+    return `${movesUp ? "+" : "-"}%${Math.abs(pct).toFixed(digits)}`;
+  };
+
   if (!isOpen || !metrics) {
     return (
       <div className={cn("flex items-center gap-2 rounded-lg border border-border/60 bg-surface/60 px-3 py-2 text-xs text-slate-500", className)}>
@@ -259,7 +264,7 @@ export function DealProgressBar({
               <span className="flex items-center gap-1 text-emerald-400">
                 <Flag className="h-3 w-3" />
                 <span>TP: {fmtFrac(metrics.tp)}</span>
-                <span className="font-semibold">(+{metrics.distToTpPct.toFixed(2)}%)</span>
+                <span className="font-semibold">(%{metrics.distToTpPct.toFixed(2)} kaldı)</span>
               </span>
             )}
           </div>
@@ -305,7 +310,7 @@ export function DealProgressBar({
           </div>
           {metrics.nextSo > 0 && !isBagHolding && (
             <span className="text-amber-300/90 font-medium">
-              Sonraki SO: {fmtFrac(metrics.nextSo)} (-%{metrics.nextSoDistPct?.toFixed(1)})
+              Sonraki SO: {fmtFrac(metrics.nextSo)} ({metrics.nextSoDistPct == null ? "—" : formatMovePct(metrics.nextSoDistPct, 1)})
             </span>
           )}
         </div>
@@ -336,7 +341,11 @@ export function DealProgressBar({
           </div>
           <div className="num mt-1.5 text-xl font-black text-cyan-100">{fmtFrac(metrics.cur)}</div>
           <div className="mt-1 text-[10px] text-slate-400">
-            {metrics.isProfitable ? "Maliyetin üzerinde (Kârda)" : "Maliyetin altında (Çekilmede)"}
+            {metrics.devFromAvgPct === 0
+              ? "Maliyet seviyesinde (Başabaş)"
+              : metrics.isProfitable
+                ? isShort ? "Maliyetin altında (Kârda)" : "Maliyetin üzerinde (Kârda)"
+                : isShort ? "Maliyetin üzerinde (Zararda)" : "Maliyetin altında (Zararda)"}
           </div>
         </div>
 
@@ -359,7 +368,7 @@ export function DealProgressBar({
             </span>
             {metrics.distToTpPct != null && (
               <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[9px] font-bold text-emerald-400">
-                +%{metrics.distToTpPct.toFixed(2)} kaldı
+                %{metrics.distToTpPct.toFixed(2)} kaldı
               </span>
             )}
           </div>
@@ -398,7 +407,7 @@ export function DealProgressBar({
           <div className="mt-1 text-[10px] text-slate-400">
             {marginMode && metrics.liqDistFromCurPct != null ? (
               <span className={cn("font-bold", metrics.liqTier?.color)}>
-                Şimdiki Fiyata Mesafe: -%{metrics.liqDistFromCurPct.toFixed(1)}
+                Şimdiki Fiyata Mesafe: {formatMovePct(metrics.liqDistFromCurPct, 1)}
               </span>
             ) : (
               "Spot işlemde tasfiye riski bulunmaz"
@@ -447,13 +456,13 @@ export function DealProgressBar({
                 <span className="text-slate-400">Şimdiki Fiyata Oran:</span>
                 <span className="num font-black text-rose-400">
                   {marginMode && metrics.liqDistFromCurPct != null
-                    ? `-%${metrics.liqDistFromCurPct.toFixed(2)}`
+                    ? formatMovePct(metrics.liqDistFromCurPct)
                     : "—"}
                 </span>
               </div>
               <div className="mt-0.5 text-[9px] text-slate-400 leading-snug">
                 {marginMode
-                  ? "Piyasa bu oranda düştüğünde marjin tükenir ve tasfiye olur"
+                  ? `Piyasa bu oranda ${isShort ? "yükseldiğinde" : "düştüğünde"} marjin tükenir ve tasfiye olur`
                   : "Spot modunda likidasyon yoktur"}
               </div>
             </div>
@@ -508,16 +517,16 @@ export function DealProgressBar({
                       )}
                     >
                       {so.isFilled
-                        ? `Alındı (${so.distPct >= 0 ? `-%${so.distPct.toFixed(2)}` : `+${Math.abs(so.distPct).toFixed(2)}%`})`
-                        : `-%${Math.abs(so.distPct).toFixed(2)}`}
+                        ? `${isShort ? "Satıldı" : "Alındı"} (${formatMovePct(so.distPct)})`
+                        : formatMovePct(so.distPct)}
                     </span>
                   </div>
                   <div className="mt-0.5 text-[9px] text-slate-400 leading-snug">
                     {so.isFilled
-                      ? "Pozisyona dahil edildi, ortalamayı aşağı çekti"
+                      ? `Pozisyona dahil edildi, ortalamayı ${isShort ? "yukarı taşıdı" : "aşağı çekti"}`
                       : so.isNext
-                        ? `Fiyat %${Math.abs(so.distPct).toFixed(2)} daha düşerse otomatik alım yapacak`
-                        : "Daha derin düşüşlerde devreye girecek kademe"}
+                        ? `Fiyat %${Math.abs(so.distPct).toFixed(2)} daha ${isShort ? "yükselirse otomatik satış" : "düşerse otomatik alım"} yapacak`
+                        : `Daha derin ${isShort ? "yükselişlerde" : "düşüşlerde"} devreye girecek kademe`}
                   </div>
                 </div>
               </div>
@@ -543,11 +552,11 @@ export function DealProgressBar({
                 <div className="flex items-center justify-between">
                   <span className="text-slate-400">Şimdiki Fiyata Oran:</span>
                   <span className="num font-black text-amber-400">
-                    {metrics.nextSoDistPct != null ? `-%${metrics.nextSoDistPct.toFixed(2)}` : "—"}
+                    {metrics.nextSoDistPct != null ? formatMovePct(metrics.nextSoDistPct) : "—"}
                   </span>
                 </div>
                 <div className="mt-0.5 text-[9px] text-slate-400 leading-snug">
-                  Fiyat bu oranda düştüğünde bir sonraki güvenlik emri tetiklenir
+                  Fiyat bu oranda {isShort ? "yükseldiğinde" : "düştüğünde"} bir sonraki güvenlik emri tetiklenir
                 </div>
               </div>
             </div>
@@ -571,10 +580,10 @@ export function DealProgressBar({
           </div>
 
           {/* Critical Markers across the Spectrum */}
-          <div className="mt-2.5 flex items-center justify-between text-[11px]">
+          <div className={cn("mt-2.5 flex items-center justify-between text-[11px]", isShort && "flex-row-reverse")}>
             {/* Left: Liquidation */}
-            <div className="space-y-0.5 text-left">
-              <div className="flex items-center gap-1 font-semibold text-rose-400">
+            <div className={cn("space-y-0.5", isShort ? "text-right" : "text-left")}>
+              <div className={cn("flex items-center gap-1 font-semibold text-rose-400", isShort && "justify-end")}>
                 <ShieldAlert className="h-3 w-3" />
                 <span>{marginMode && metrics.liq > 0 ? "Likidasyon" : "Alt Taban"}</span>
               </div>
@@ -583,7 +592,7 @@ export function DealProgressBar({
               </div>
               {marginMode && metrics.liqDistFromCurPct != null && (
                 <div className={cn("text-[9px] font-bold", metrics.liqTier?.color)}>
-                  -%{metrics.liqDistFromCurPct.toFixed(1)} mesafe
+                  {formatMovePct(metrics.liqDistFromCurPct, 1)} mesafe
                 </div>
               )}
             </div>
@@ -598,7 +607,7 @@ export function DealProgressBar({
                 <div className="num font-mono text-[10px] text-slate-200">{fmtFrac(metrics.nextSo)}</div>
                 {metrics.nextSoDistPct != null && (
                   <div className="text-[9px] text-amber-300/90 font-bold">
-                    -%{metrics.nextSoDistPct.toFixed(1)} tetik mesafesi
+                    {formatMovePct(metrics.nextSoDistPct, 1)} tetik mesafesi
                   </div>
                 )}
               </div>
@@ -617,15 +626,15 @@ export function DealProgressBar({
             </div>
 
             {/* Right: Take Profit (TP) */}
-            <div className="space-y-0.5 text-right">
-              <div className="flex items-center justify-end gap-1 font-semibold text-emerald-400">
+            <div className={cn("space-y-0.5", isShort ? "text-left" : "text-right")}>
+              <div className={cn("flex items-center gap-1 font-semibold text-emerald-400", !isShort && "justify-end")}>
                 <Flag className="h-3 w-3" />
                 <span>Hedef (TP)</span>
               </div>
               <div className="num font-mono text-[10px] font-bold text-emerald-300">{fmtFrac(metrics.tp)}</div>
               {metrics.distToTpPct != null && (
                 <div className="text-[9px] font-bold text-emerald-400">
-                  +%{metrics.distToTpPct.toFixed(2)} kaldı
+                  %{metrics.distToTpPct.toFixed(2)} kaldı
                 </div>
               )}
             </div>

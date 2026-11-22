@@ -85,10 +85,13 @@ export function verifyPassword(password: string): boolean {
   }
   const inputBuf = Buffer.from(password);
   const expBuf = Buffer.from(expected);
-  if (inputBuf.length !== expBuf.length) {
-    return false;
-  }
-  return crypto.timingSafeEqual(inputBuf, expBuf);
+  // Hash both inputs first so timingSafeEqual always receives fixed-size
+  // buffers. Preserve exact password bytes; trimming only one side changes
+  // the configured credential and creates surprising whitespace behavior.
+  const inputDigest = crypto.createHash("sha256").update(inputBuf).digest();
+  const expectedDigest = crypto.createHash("sha256").update(expBuf).digest();
+  const digestMatches = crypto.timingSafeEqual(inputDigest, expectedDigest);
+  return digestMatches && inputBuf.length === expBuf.length;
 }
 
 const LOGIN_WINDOW_MS = 60_000;

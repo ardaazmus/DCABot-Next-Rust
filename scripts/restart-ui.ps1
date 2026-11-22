@@ -11,20 +11,37 @@ $recordHelpers = Join-Path $PSScriptRoot 'process-records.ps1'
 # Keys: same persistent server-side file as start-local.ps1.
 $keysFile = Join-Path $runtimeDirectory 'local-keys.env'
 if (Test-Path -LiteralPath $keysFile) {
-    Get-Content -LiteralPath $keysFile | ForEach-Object {
-        $line = $_.TrimStart([char]0xFEFF)
-        if ($line -cmatch '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {
-            Set-Item -Path ('env:' + $Matches[1]) -Value $Matches[2]
-        }
+    Protect-LocalRuntimeDirectory -Path $runtimeDirectory
+    Protect-LocalSecretFile -Path $keysFile
+    $keyValues = @{}
+    foreach ($keyLine in [System.IO.File]::ReadAllLines($keysFile)) {
+        $line = $keyLine.TrimStart([char]0xFEFF)
+        if ($line -cmatch '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') { $keyValues[$Matches[1]] = $Matches[2] }
     }
+} else {
+    throw "local-keys.env yok: $keysFile"
 }
+if (-not $keyValues['DCA_API_KEY'] -or -not $keyValues['DCA_SESSION_SECRET']) { throw 'local-keys.env UI anahtarlari eksik' }
+Remove-Item Env:DCA_API_KEY -ErrorAction SilentlyContinue
+Remove-Item Env:DCA_VAULT_KEY -ErrorAction SilentlyContinue
+$env:ENGINE_API_KEY = $keyValues['DCA_API_KEY']
+$env:DCA_SESSION_SECRET = $keyValues['DCA_SESSION_SECRET']
 
 $records = Read-LocalProcessRecords -Path $processFile
 $nextEntry = (Join-Path $projectRoot 'node_modules/next/dist/bin/next').Replace('/', '\')
 $nextServerEntry = (Join-Path $projectRoot 'node_modules/next/dist/server/lib/start-server.js').Replace('/', '\')
 $old = Get-NetTCPConnection -State Listen -LocalPort 3000 -ErrorAction SilentlyContinue
+$handledListenerIds = @{}
 foreach ($listener in $old) {
     $processId = [int]$listener.OwningProcess
+    if ($handledListenerIds.ContainsKey([string]$processId)) { continue }
+    $handledListenerIds[[string]$processId] = $true
+    $nextPair = Get-VerifiedLocalNextProcessPair -ListenerProcessId $processId -Records $records -ProjectRoot $projectRoot
+    if ($nextPair) {
+        Stop-Process -Id $nextPair.ChildId -Force -ErrorAction SilentlyContinue
+        Stop-Process -Id $nextPair.ParentId -Force -ErrorAction SilentlyContinue
+        continue
+    }
     $record = $records | Where-Object { [int]$_.Id -eq $processId } | Select-Object -First 1
     $processInfo = Get-CimInstance Win32_Process -Filter ("ProcessId={0}" -f $processId) -ErrorAction SilentlyContinue
     $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
@@ -67,4 +84,6 @@ $process = Get-Process -Id $proc.Id
 $records = @($records | Where-Object { $_.Name -ne 'node' })
 $records += @{ Id = $proc.Id; Name = $proc.ProcessName; Started = $process.StartTime.ToUniversalTime().Ticks }
 Write-LocalProcessRecords -Path $processFile -Records $records
+Remove-Item Env:ENGINE_API_KEY -ErrorAction SilentlyContinue
+Remove-Item Env:DCA_SESSION_SECRET -ErrorAction SilentlyContinue
 Write-Output "ui restarted (PID $($proc.Id))"

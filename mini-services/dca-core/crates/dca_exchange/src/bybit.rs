@@ -5,9 +5,10 @@
 //!
 //! Reference: docs/BYBIT_RESEARCH.md (live-verified field names).
 
-use super::{VenueCreds,
-    ExecutionRecord, KeyPermissions, Kline, OrderBook, OrderBookLevel, OrderRequest, PositionSnapshot, Ticker24h, TickerSnapshot,
-    VenueAdapter, VenueOrderState, WalletSnapshot,
+use super::{
+    ExecutionRecord, KeyPermissions, Kline, OrderBook, OrderBookLevel, OrderRequest,
+    PositionSnapshot, Ticker24h, TickerSnapshot, VenueAdapter, VenueCreds, VenueOrderState,
+    WalletSnapshot,
 };
 use dca_math::fraction::Fraction;
 use dca_math::Instrument;
@@ -32,22 +33,40 @@ fn parse_key_permissions(v: &Value) -> Result<KeyPermissions, String> {
             .ok_or_else(|| format!("bybit query-api: permissions.{name} missing or malformed"))?;
         values
             .iter()
-            .map(|value| value.as_str().map(str::to_string).ok_or_else(|| format!("bybit query-api: permissions.{name} contains a non-string value")))
+            .map(|value| {
+                value.as_str().map(str::to_string).ok_or_else(|| {
+                    format!("bybit query-api: permissions.{name} contains a non-string value")
+                })
+            })
             .collect()
     };
     let wallet_perms = required_permissions("Wallet")?;
     let spot_perms = required_permissions("Spot")?;
     let contract_perms = required_permissions("ContractTrade")?;
     let wallet_movement = wallet_perms.iter().any(|permission| {
-        matches!(permission.as_str(), "Withdraw" | "AccountTransfer" | "SubMemberTransfer" | "SubMemberTransferList")
+        matches!(
+            permission.as_str(),
+            "Withdraw" | "AccountTransfer" | "SubMemberTransfer" | "SubMemberTransferList"
+        )
     });
-    let spot = spot_perms.iter().any(|permission| permission == "SpotTrade");
-    let contract = contract_perms.iter().any(|permission| permission == "Order")
-        && contract_perms.iter().any(|permission| permission == "Position");
+    let spot = spot_perms
+        .iter()
+        .any(|permission| permission == "SpotTrade");
+    let contract = contract_perms
+        .iter()
+        .any(|permission| permission == "Order")
+        && contract_perms
+            .iter()
+            .any(|permission| permission == "Position");
     let ips = v
         .get("ips")
         .and_then(|x| x.as_array())
-        .map(|values| values.iter().filter_map(|item| item.as_str().map(str::to_string)).collect())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
     Ok(KeyPermissions {
         read_only,
@@ -55,7 +74,9 @@ fn parse_key_permissions(v: &Value) -> Result<KeyPermissions, String> {
         spot_trade: spot,
         contract_trade: contract,
         ips,
-        note: format!("wallet_movement_permission={wallet_movement}, spot={spot}, contract={contract}"),
+        note: format!(
+            "wallet_movement_permission={wallet_movement}, spot={spot}, contract={contract}"
+        ),
     })
 }
 
@@ -68,7 +89,9 @@ pub struct BybitAdapter {
 
 impl BybitAdapter {
     pub fn new(testnet: bool) -> Self {
-        let raw_base_url = if let Ok(u) = std::env::var("BYBIT_BASE_URL").or_else(|_| std::env::var("DCA_BYBIT_BASE_URL")) {
+        let raw_base_url = if let Ok(u) =
+            std::env::var("BYBIT_BASE_URL").or_else(|_| std::env::var("DCA_BYBIT_BASE_URL"))
+        {
             u
         } else if testnet || std::env::var("DCA_BYBIT_TESTNET").as_deref() == Ok("1") {
             TESTNET.into()
@@ -78,7 +101,11 @@ impl BybitAdapter {
         let base_url = super::guarded_venue_base_url(
             &raw_base_url,
             "Bybit",
-            &["api.bybit.com", "api-testnet.bybit.com", "api-demo.bybit.com"],
+            &[
+                "api.bybit.com",
+                "api-testnet.bybit.com",
+                "api-demo.bybit.com",
+            ],
             &["api.bybit.com"],
             false,
         );
@@ -89,6 +116,7 @@ impl BybitAdapter {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
                 .build()
                 .expect("reqwest client"),
             time_offset_ms: AtomicI64::new(0),
@@ -113,17 +141,31 @@ impl BybitAdapter {
             .await
             .map_err(|e| format!("bybit time sync network error: {e}"))?;
         let status = resp.status();
-        let body = resp.text().await.map_err(|e| format!("bybit time sync body error: {e}"))?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("bybit time sync body error: {e}"))?;
         if !status.is_success() {
             let snippet: String = body.chars().take(200).collect();
             return Err(format!("bybit time sync HTTP error {status}: {snippet}"));
         }
-        let v: Value = serde_json::from_str(&body).map_err(|e| format!("bybit time sync json error: {e}"))?;
+        let v: Value =
+            serde_json::from_str(&body).map_err(|e| format!("bybit time sync json error: {e}"))?;
         let server_ms = if let Some(t) = v.get("time").and_then(|x| x.as_i64()) {
             t
-        } else if let Some(nano) = v.get("result").and_then(|r| r.get("timeNano")).and_then(|x| x.as_str()).and_then(|s| s.parse::<i64>().ok()) {
+        } else if let Some(nano) = v
+            .get("result")
+            .and_then(|r| r.get("timeNano"))
+            .and_then(|x| x.as_str())
+            .and_then(|s| s.parse::<i64>().ok())
+        {
             nano / 1_000_000
-        } else if let Some(sec) = v.get("result").and_then(|r| r.get("timeSecond")).and_then(|x| x.as_str()).and_then(|s| s.parse::<i64>().ok()) {
+        } else if let Some(sec) = v
+            .get("result")
+            .and_then(|r| r.get("timeSecond"))
+            .and_then(|x| x.as_str())
+            .and_then(|s| s.parse::<i64>().ok())
+        {
             sec * 1000
         } else {
             return Err("bybit time sync: server time not found in payload".into());
@@ -132,7 +174,12 @@ impl BybitAdapter {
         let local_mid = (local_before + local_after) / 2;
         let offset = server_ms - local_mid;
         self.time_offset_ms.store(offset, Ordering::Relaxed);
-        tracing::info!("Bybit server time synced: offset={}ms (server={}, local={})", offset, server_ms, local_mid);
+        tracing::info!(
+            "Bybit server time synced: offset={}ms (server={}, local={})",
+            offset,
+            server_ms,
+            local_mid
+        );
         Ok(offset)
     }
 
@@ -163,11 +210,16 @@ impl BybitAdapter {
             .map_err(|e| format!("bybit GET {path} failed: {e}"))?;
 
         let status = resp.status();
-        let body_text = resp.text().await.map_err(|e| format!("bybit GET {path} read body error: {e}"))?;
+        let body_text = resp
+            .text()
+            .await
+            .map_err(|e| format!("bybit GET {path} read body error: {e}"))?;
         if !status.is_success() {
             let snippet: String = body_text.chars().take(200).collect();
             if status.as_u16() == 429 {
-                return Err(format!("bybit HTTP 429 Too Many Requests on {path}: {snippet}"));
+                return Err(format!(
+                    "bybit HTTP 429 Too Many Requests on {path}: {snippet}"
+                ));
             }
             return Err(format!("bybit HTTP {status} on {path}: {snippet}"));
         }
@@ -178,7 +230,13 @@ impl BybitAdapter {
         check_ret(v, path)
     }
 
-    async fn private_get(&self, key: &str, secret: &str, path: &str, query: &str) -> Result<Value, String> {
+    async fn private_get(
+        &self,
+        key: &str,
+        secret: &str,
+        path: &str,
+        query: &str,
+    ) -> Result<Value, String> {
         let ts = self.now_ms().to_string();
         let sign = self.sign_get(&ts, key, secret, query);
         let url = if query.is_empty() {
@@ -198,11 +256,16 @@ impl BybitAdapter {
             .map_err(|e| format!("bybit private GET {path} failed: {e}"))?;
 
         let status = resp.status();
-        let body_text = resp.text().await.map_err(|e| format!("bybit private GET {path} read body error: {e}"))?;
+        let body_text = resp
+            .text()
+            .await
+            .map_err(|e| format!("bybit private GET {path} read body error: {e}"))?;
         if !status.is_success() {
             let snippet: String = body_text.chars().take(200).collect();
             if status.as_u16() == 429 {
-                return Err(format!("bybit HTTP 429 Too Many Requests on {path}: {snippet}"));
+                return Err(format!(
+                    "bybit HTTP 429 Too Many Requests on {path}: {snippet}"
+                ));
             }
             return Err(format!("bybit HTTP {status} on {path}: {snippet}"));
         }
@@ -213,7 +276,13 @@ impl BybitAdapter {
         check_ret(v, path)
     }
 
-    async fn private_post(&self, key: &str, secret: &str, path: &str, body: &str) -> Result<Value, String> {
+    async fn private_post(
+        &self,
+        key: &str,
+        secret: &str,
+        path: &str,
+        body: &str,
+    ) -> Result<Value, String> {
         let ts = self.now_ms().to_string();
         let sign = self.sign_post(&ts, key, secret, body);
         let url = format!("{}{}", self.base_url, path);
@@ -231,11 +300,16 @@ impl BybitAdapter {
             .map_err(|e| format!("bybit private POST {path} failed: {e}"))?;
 
         let status = resp.status();
-        let body_text = resp.text().await.map_err(|e| format!("bybit private POST {path} read body error: {e}"))?;
+        let body_text = resp
+            .text()
+            .await
+            .map_err(|e| format!("bybit private POST {path} read body error: {e}"))?;
         if !status.is_success() {
             let snippet: String = body_text.chars().take(200).collect();
             if status.as_u16() == 429 {
-                return Err(format!("bybit HTTP 429 Too Many Requests on {path}: {snippet}"));
+                return Err(format!(
+                    "bybit HTTP 429 Too Many Requests on {path}: {snippet}"
+                ));
             }
             return Err(format!("bybit HTTP {status} on {path}: {snippet}"));
         }
@@ -252,7 +326,10 @@ impl BybitAdapter {
     pub async fn switch_pos_mode(&self, creds: &VenueCreds, one_way: bool) -> Result<(), String> {
         let mode = if one_way { 0 } else { 3 };
         let body = serde_json::json!({ "category": "linear", "mode": mode }).to_string();
-        match self.private_post(&creds.key, &creds.secret, "/v5/position/switch-mode", &body).await {
+        match self
+            .private_post(&creds.key, &creds.secret, "/v5/position/switch-mode", &body)
+            .await
+        {
             Ok(_) => Ok(()),
             Err(e) => Err(format!("switch-mode({mode}): {e}")),
         }
@@ -266,28 +343,54 @@ impl BybitAdapter {
 
     fn parse_instrument(&self, category: &str, item: &Value) -> Option<Instrument> {
         let symbol = item.get("symbol")?.as_str()?.to_string();
-        let base = item.get("baseCoin").and_then(|x| x.as_str()).unwrap_or("").to_string();
-        let quote = item.get("quoteCoin").and_then(|x| x.as_str()).unwrap_or("USDT").to_string();
+        let base = item
+            .get("baseCoin")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let quote = item
+            .get("quoteCoin")
+            .and_then(|x| x.as_str())
+            .unwrap_or("USDT")
+            .to_string();
         let tick = item
             .pointer("/priceFilter/tickSize")
             .and_then(|x| x.as_str())
             .unwrap_or("0.01");
         let (qty_step, min_qty, min_notional, max_lev) = if category == "linear" {
             (
-                item.pointer("/lotSizeFilter/qtyStep").and_then(|x| x.as_str()).unwrap_or("0.001"),
-                item.pointer("/lotSizeFilter/minOrderQty").and_then(|x| x.as_str()).unwrap_or("0.001"),
-                item.pointer("/lotSizeFilter/minNotionalValue").and_then(|x| x.as_str()).unwrap_or("5"),
-                item.pointer("/leverageFilter/maxLeverage").and_then(|x| x.as_str()).unwrap_or("50"),
+                item.pointer("/lotSizeFilter/qtyStep")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("0.001"),
+                item.pointer("/lotSizeFilter/minOrderQty")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("0.001"),
+                item.pointer("/lotSizeFilter/minNotionalValue")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("5"),
+                item.pointer("/leverageFilter/maxLeverage")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("50"),
             )
         } else {
             (
-                item.pointer("/lotSizeFilter/qtyStep").and_then(|x| x.as_str()).unwrap_or("0.00001"),
-                item.pointer("/lotSizeFilter/minOrderQty").and_then(|x| x.as_str()).unwrap_or("0.00001"),
-                item.pointer("/lotSizeFilter/minNotionalValue").and_then(|x| x.as_str()).unwrap_or("1"),
+                item.pointer("/lotSizeFilter/qtyStep")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("0.00001"),
+                item.pointer("/lotSizeFilter/minOrderQty")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("0.00001"),
+                item.pointer("/lotSizeFilter/minNotionalValue")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("1"),
                 "1",
             )
         };
-        let (maker, taker) = if category == "linear" { ("0.0002", "0.00055") } else { ("0.001", "0.001") };
+        let (maker, taker) = if category == "linear" {
+            ("0.0002", "0.00055")
+        } else {
+            ("0.001", "0.001")
+        };
         Some(Instrument {
             symbol,
             base,
@@ -329,12 +432,17 @@ pub fn now_ms() -> i64 {
 fn check_ret(v: Value, path: &str) -> Result<Value, String> {
     let code = v.get("retCode").and_then(|x| x.as_i64()).unwrap_or(-1);
     if code != 0 {
-        let msg = v.get("retMsg").and_then(|x| x.as_str()).unwrap_or("unknown");
+        let msg = v
+            .get("retMsg")
+            .and_then(|x| x.as_str())
+            .unwrap_or("unknown");
         if code == 10002 {
             return Err(format!("bybit {path} retCode=10002 (clock drift/expired timestamp): {msg} - sync_server_time required"));
         }
         if code == 10006 {
-            return Err(format!("bybit {path} retCode=10006 (rate limit exceeded): {msg}"));
+            return Err(format!(
+                "bybit {path} retCode=10006 (rate limit exceeded): {msg}"
+            ));
         }
         return Err(format!("bybit {path} retCode={code}: {msg}"));
     }
@@ -348,14 +456,23 @@ fn check_ret(v: Value, path: &str) -> Result<Value, String> {
 /// surekliliginden turetilir: cum_i = floor_i*(mmr_i-mmr_{i-1}) + cum_{i-1}
 /// (ilk kademe cum=0). maxLeverage tasinmaz — M07 tuketmiyor (notlu).
 pub fn parse_bybit_risk_limit(v: &Value) -> Result<Vec<dca_math::MmrBracket>, String> {
-    let list = v.get("list").and_then(|x| x.as_array()).ok_or("bybit risk-limit: list yok")?;
+    let list = v
+        .get("list")
+        .and_then(|x| x.as_array())
+        .ok_or("bybit risk-limit: list yok")?;
     if list.is_empty() {
         return Err("bybit risk-limit: bos kademe".into());
     }
     let mut rows: Vec<(Fraction, Fraction)> = Vec::with_capacity(list.len());
     for it in list {
-        let cap = it.get("riskLimitValue").and_then(|x| x.as_str()).ok_or("riskLimitValue yok")?;
-        let mmr = it.get("maintenanceMargin").and_then(|x| x.as_str()).ok_or("maintenanceMargin yok")?;
+        let cap = it
+            .get("riskLimitValue")
+            .and_then(|x| x.as_str())
+            .ok_or("riskLimitValue yok")?;
+        let mmr = it
+            .get("maintenanceMargin")
+            .and_then(|x| x.as_str())
+            .ok_or("maintenanceMargin yok")?;
         rows.push((
             Fraction::from_any_str(cap).map_err(|e| format!("cap cozulmedi: {e}"))?,
             Fraction::from_any_str(mmr).map_err(|e| format!("mmr cozulmedi: {e}"))?,
@@ -374,9 +491,18 @@ pub fn parse_bybit_risk_limit(v: &Value) -> Result<Vec<dca_math::MmrBracket>, St
             zero.clone()
         } else {
             let d = mmr.sub(&prev_mmr).map_err(|e| format!("cum fark: {e}"))?;
-            floor.mul(&d).map_err(|e| format!("cum carpim: {e}"))?.add(&prev_cum).map_err(|e| format!("cum toplam: {e}"))?
+            floor
+                .mul(&d)
+                .map_err(|e| format!("cum carpim: {e}"))?
+                .add(&prev_cum)
+                .map_err(|e| format!("cum toplam: {e}"))?
         };
-        tiers.push(dca_math::MmrBracket { min_notional: floor, max_notional: cap.clone(), mmr: mmr.clone(), deduction: cum.clone() });
+        tiers.push(dca_math::MmrBracket {
+            min_notional: floor,
+            max_notional: cap.clone(),
+            mmr: mmr.clone(),
+            deduction: cum.clone(),
+        });
         prev_cap = cap;
         prev_mmr = mmr;
         prev_cum = cum;
@@ -431,7 +557,11 @@ impl VenueAdapter for BybitAdapter {
         Err("no time".into())
     }
 
-    async fn instruments(&self, category: &str, symbol: Option<&str>) -> Result<Vec<Instrument>, String> {
+    async fn instruments(
+        &self,
+        category: &str,
+        symbol: Option<&str>,
+    ) -> Result<Vec<Instrument>, String> {
         // Bybit tek sayfada en fazla 1000 enstrüman döner — tam liste (Linear
         // ~600+ çift) için nextPageCursor bitene kadar sayfala. Sayfalama yokken
         // liste 500'de kesiliyor, SOLUSDT gibi büyük pariteler düşüyordu.
@@ -445,7 +575,9 @@ impl VenueAdapter for BybitAdapter {
             if !cursor.is_empty() {
                 query.push_str(&format!("&cursor={cursor}"));
             }
-            let v = self.public_get("/v5/market/instruments-info", &query).await?;
+            let v = self
+                .public_get("/v5/market/instruments-info", &query)
+                .await?;
             if let Some(list) = v.get("list").and_then(|x| x.as_array()) {
                 for item in list {
                     if let Some(i) = self.parse_instrument(category, item) {
@@ -465,7 +597,13 @@ impl VenueAdapter for BybitAdapter {
         Ok(out)
     }
 
-    async fn klines(&self, category: &str, symbol: &str, interval: &str, limit: usize) -> Result<Vec<Kline>, String> {
+    async fn klines(
+        &self,
+        category: &str,
+        symbol: &str,
+        interval: &str,
+        limit: usize,
+    ) -> Result<Vec<Kline>, String> {
         let query = format!(
             "category={category}&symbol={symbol}&interval={interval}&limit={}",
             limit.min(1000)
@@ -476,7 +614,11 @@ impl VenueAdapter for BybitAdapter {
             for row in list {
                 if let Some(arr) = row.as_array() {
                     if arr.len() >= 6 {
-                        let t: i64 = arr[0].as_str().and_then(|s| s.parse().ok()).or_else(|| arr[0].as_i64()).unwrap_or(0);
+                        let t: i64 = arr[0]
+                            .as_str()
+                            .and_then(|s| s.parse().ok())
+                            .or_else(|| arr[0].as_i64())
+                            .unwrap_or(0);
                         out.push(Kline {
                             t,
                             o: arr[1].as_str().unwrap_or("0").to_string(),
@@ -503,14 +645,27 @@ impl VenueAdapter for BybitAdapter {
             .and_then(|a| a.first())
             .cloned()
             .ok_or("no ticker")?;
-        let last = item.get("lastPrice").and_then(|x| x.as_str()).unwrap_or("0");
-        let mark = item.get("markPrice").and_then(|x| x.as_str()).unwrap_or(last);
+        let last = item
+            .get("lastPrice")
+            .and_then(|x| x.as_str())
+            .unwrap_or("0");
+        let mark = item
+            .get("markPrice")
+            .and_then(|x| x.as_str())
+            .unwrap_or(last);
         Ok(TickerSnapshot {
             symbol: symbol.into(),
             last_price: Fraction::from_any_str(last).unwrap_or_else(|_| Fraction::zero()),
             mark_price: Fraction::from_any_str(mark).unwrap_or_else(|_| Fraction::zero()),
-            funding_rate: item.get("fundingRate").and_then(|x| x.as_str()).and_then(|s| Fraction::from_decimal_str(s).ok()),
-            next_funding_ts: item.get("nextFundingTime").and_then(|x| x.as_str()).and_then(|s| s.parse().ok()).or_else(|| item.get("nextFundingTime").and_then(|x| x.as_i64())),
+            funding_rate: item
+                .get("fundingRate")
+                .and_then(|x| x.as_str())
+                .and_then(|s| Fraction::from_decimal_str(s).ok()),
+            next_funding_ts: item
+                .get("nextFundingTime")
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse().ok())
+                .or_else(|| item.get("nextFundingTime").and_then(|x| x.as_i64())),
         })
     }
 
@@ -518,10 +673,23 @@ impl VenueAdapter for BybitAdapter {
         let query = format!("category={category}");
         let v = self.public_get("/v5/market/tickers", &query).await?;
         let mut out = Vec::new();
-        if let Some(list) = v.get("result").and_then(|r| r.get("list")).and_then(|x| x.as_array()).or_else(|| v.get("list").and_then(|x| x.as_array())) {
+        if let Some(list) = v
+            .get("result")
+            .and_then(|r| r.get("list"))
+            .and_then(|x| x.as_array())
+            .or_else(|| v.get("list").and_then(|x| x.as_array()))
+        {
             for item in list {
-                let s = |k: &str| item.get(k).and_then(|x| x.as_str()).unwrap_or("0").to_string();
-                let raw_pcnt = item.get("price24hPcnt").and_then(|x| x.as_str()).unwrap_or("0");
+                let s = |k: &str| {
+                    item.get(k)
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("0")
+                        .to_string()
+                };
+                let raw_pcnt = item
+                    .get("price24hPcnt")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("0");
                 let pct = Fraction::from_decimal_str(raw_pcnt)
                     .ok()
                     .and_then(|f| f.mul(&Fraction::from_u64(100)).ok())
@@ -550,15 +718,23 @@ impl VenueAdapter for BybitAdapter {
         symbol: &str,
     ) -> Result<Option<(Fraction, Fraction)>, String> {
         let query = format!("category={category}&symbol={symbol}");
-        let v = self.private_get(&creds.key, &creds.secret, "/v5/account/fee-rate", &query).await?;
+        let v = self
+            .private_get(&creds.key, &creds.secret, "/v5/account/fee-rate", &query)
+            .await?;
         let Some(list) = v.get("list").and_then(|x| x.as_array()) else {
             return Ok(None);
         };
         let Some(item) = list.first() else {
             return Ok(None);
         };
-        let maker = item.get("makerFeeRate").and_then(|x| x.as_str()).unwrap_or("");
-        let taker = item.get("takerFeeRate").and_then(|x| x.as_str()).unwrap_or("");
+        let maker = item
+            .get("makerFeeRate")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        let taker = item
+            .get("takerFeeRate")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
         if maker.is_empty() || taker.is_empty() {
             return Ok(None);
         }
@@ -568,14 +744,29 @@ impl VenueAdapter for BybitAdapter {
         )))
     }
 
-    async fn funding_history(&self, symbol: &str, limit: usize) -> Result<Vec<(i64, String)>, String> {
+    async fn funding_history(
+        &self,
+        symbol: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, String)>, String> {
         let query = format!("category=linear&symbol={symbol}&limit={}", limit.min(200));
-        let v = self.public_get("/v5/market/funding/history", &query).await?;
+        let v = self
+            .public_get("/v5/market/funding/history", &query)
+            .await?;
         let mut out = Vec::new();
         if let Some(list) = v.get("list").and_then(|x| x.as_array()) {
             for item in list {
-                let ts = item.get("fundingRateTimestamp").and_then(|x| x.as_str()).and_then(|s| s.parse().ok()).or_else(|| item.get("fundingRateTimestamp").and_then(|x| x.as_i64())).unwrap_or(0);
-                let rate = item.get("fundingRate").and_then(|x| x.as_str()).unwrap_or("0").to_string();
+                let ts = item
+                    .get("fundingRateTimestamp")
+                    .and_then(|x| x.as_str())
+                    .and_then(|s| s.parse().ok())
+                    .or_else(|| item.get("fundingRateTimestamp").and_then(|x| x.as_i64()))
+                    .unwrap_or(0);
+                let rate = item
+                    .get("fundingRate")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("0")
+                    .to_string();
                 out.push((ts, rate));
             }
         }
@@ -584,20 +775,30 @@ impl VenueAdapter for BybitAdapter {
 
     /// GET /v5/user/query-api (live-verified; the old query-api-key path is 404).
     async fn key_permissions(&self, creds: &VenueCreds) -> Result<KeyPermissions, String> {
-        let v = self.private_get(&creds.key, &creds.secret, "/v5/user/query-api", "").await?;
+        let v = self
+            .private_get(&creds.key, &creds.secret, "/v5/user/query-api", "")
+            .await?;
         parse_key_permissions(&v)
     }
 
     async fn wallet(&self, creds: &VenueCreds, coin: &str) -> Result<WalletSnapshot, String> {
         let v = self
-            .private_get(&creds.key, &creds.secret, "/v5/account/wallet-balance", "accountType=UNIFIED")
+            .private_get(
+                &creds.key,
+                &creds.secret,
+                "/v5/account/wallet-balance",
+                "accountType=UNIFIED",
+            )
             .await?;
         let list = v
             .pointer("/list")
             .and_then(|x| x.as_array())
             .and_then(|a| a.first())
             .ok_or("no account")?;
-        let coins = list.get("coin").and_then(|x| x.as_array()).ok_or("no coins")?;
+        let coins = list
+            .get("coin")
+            .and_then(|x| x.as_array())
+            .ok_or("no coins")?;
         let target = coins
             .iter()
             .find(|c| c.get("coin").and_then(|x| x.as_str()) == Some(coin))
@@ -611,14 +812,43 @@ impl VenueAdapter for BybitAdapter {
             .and_then(|x| x.as_str())
             .and_then(|v| Fraction::from_any_str(v).ok())
             .unwrap_or_else(Fraction::zero);
-        let coin_avail = Fraction::from_any_str(target.get("availableToWithdraw").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero());
-        let avail = if account_avail > coin_avail { account_avail } else { coin_avail };
+        let coin_avail = Fraction::from_any_str(
+            target
+                .get("availableToWithdraw")
+                .and_then(|x| x.as_str())
+                .unwrap_or("0"),
+        )
+        .unwrap_or_else(|_| Fraction::zero());
+        let avail = if account_avail > coin_avail {
+            account_avail
+        } else {
+            coin_avail
+        };
         Ok(WalletSnapshot {
-            coin: target.get("coin").and_then(|x| x.as_str()).unwrap_or(coin).to_string(),
-            wallet_balance: Fraction::from_any_str(target.get("walletBalance").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()),
+            coin: target
+                .get("coin")
+                .and_then(|x| x.as_str())
+                .unwrap_or(coin)
+                .to_string(),
+            wallet_balance: Fraction::from_any_str(
+                target
+                    .get("walletBalance")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("0"),
+            )
+            .unwrap_or_else(|_| Fraction::zero()),
             available: avail,
-            equity: Fraction::from_any_str(target.get("equity").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()),
-            unrealized_pnl: Fraction::from_any_str(target.get("unrealisedPnl").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()),
+            equity: Fraction::from_any_str(
+                target.get("equity").and_then(|x| x.as_str()).unwrap_or("0"),
+            )
+            .unwrap_or_else(|_| Fraction::zero()),
+            unrealized_pnl: Fraction::from_any_str(
+                target
+                    .get("unrealisedPnl")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("0"),
+            )
+            .unwrap_or_else(|_| Fraction::zero()),
         })
     }
 
@@ -632,7 +862,12 @@ impl VenueAdapter for BybitAdapter {
             "orderLinkId": req.order_link_id,
         });
         if !req.is_market {
-            body["price"] = Value::String(req.price.as_ref().map(|p| p.to_half_even_display(8)).unwrap_or_default());
+            body["price"] = Value::String(
+                req.price
+                    .as_ref()
+                    .map(|p| p.to_half_even_display(8))
+                    .unwrap_or_default(),
+            );
             body["timeInForce"] = Value::String("GTC".into());
         }
         if req.category == "spot" {
@@ -647,8 +882,13 @@ impl VenueAdapter for BybitAdapter {
             }
         }
         let body_str = serde_json::to_string(&body).map_err(|e| e.to_string())?;
-        let v = self.private_post(&creds.key, &creds.secret, "/v5/order/create", &body_str).await?;
-        v.get("orderId").and_then(|x| x.as_str()).map(String::from).ok_or_else(|| "no orderId".into())
+        let v = self
+            .private_post(&creds.key, &creds.secret, "/v5/order/create", &body_str)
+            .await?;
+        v.get("orderId")
+            .and_then(|x| x.as_str())
+            .map(String::from)
+            .ok_or_else(|| "no orderId".into())
     }
 
     async fn cancel_order(
@@ -664,35 +904,84 @@ impl VenueAdapter for BybitAdapter {
             "orderLinkId": order_link_id,
         });
         let body_str = serde_json::to_string(&body).map_err(|e| e.to_string())?;
-        match self.private_post(&creds.key, &creds.secret, "/v5/order/cancel", &body_str).await {
+        match self
+            .private_post(&creds.key, &creds.secret, "/v5/order/cancel", &body_str)
+            .await
+        {
             Ok(_) => Ok(()),
             // retCode 110001 "Order not exists or too late to cancel" — the order
             // already filled/cancelled venue-side; treat as idempotent success
             // (same contract as Binance -2011) so the caller's cancel chain
             // continues instead of aborting on the first already-gone order.
-            Err(e) if e.contains("retCode=110001") || e.to_lowercase().contains("order not exists") => Ok(()),
+            Err(e)
+                if e.contains("retCode=110001")
+                    || e.to_lowercase().contains("order not exists") =>
+            {
+                Ok(())
+            }
             Err(e) => Err(e),
         }
     }
 
-    async fn open_orders(&self, creds: &VenueCreds, category: &str, symbol: &str) -> Result<Vec<VenueOrderState>, String> {
+    async fn open_orders(
+        &self,
+        creds: &VenueCreds,
+        category: &str,
+        symbol: &str,
+    ) -> Result<Vec<VenueOrderState>, String> {
         // Task 20 L1: kategori botun ÜRÜN kategorisidir — sabit "linear"
         // spot resting emirlerini görmezdi (phantom-fill kusuru, düzeltildi).
         let query = format!("category={category}&symbol={symbol}&openOnly=0");
-        let v = self.private_get(&creds.key, &creds.secret, "/v5/order/realtime", &query).await?;
+        let v = self
+            .private_get(&creds.key, &creds.secret, "/v5/order/realtime", &query)
+            .await?;
         let mut out = Vec::new();
         if let Some(list) = v.get("list").and_then(|x| x.as_array()) {
             for item in list {
                 out.push(VenueOrderState {
-                    order_id: item.get("orderId").and_then(|x| x.as_str()).unwrap_or("").into(),
-                    order_link_id: item.get("orderLinkId").and_then(|x| x.as_str()).unwrap_or("").into(),
-                    symbol: item.get("symbol").and_then(|x| x.as_str()).unwrap_or("").into(),
-                    side: item.get("side").and_then(|x| x.as_str()).unwrap_or("").into(),
-                    price: item.get("price").and_then(|x| x.as_str()).and_then(|s| Fraction::from_decimal_str(s).ok()),
-                    qty: Fraction::from_any_str(item.get("qty").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()),
-                    cum_exec_qty: Fraction::from_any_str(item.get("cumExecQty").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()),
-                    cum_exec_fee: item.get("cumExecFee").and_then(|x| x.as_str()).and_then(|s| Fraction::from_any_str(s).ok()),
-                    status: item.get("orderStatus").and_then(|x| x.as_str()).unwrap_or("").into(),
+                    order_id: item
+                        .get("orderId")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .into(),
+                    order_link_id: item
+                        .get("orderLinkId")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .into(),
+                    symbol: item
+                        .get("symbol")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .into(),
+                    side: item
+                        .get("side")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .into(),
+                    price: item
+                        .get("price")
+                        .and_then(|x| x.as_str())
+                        .and_then(|s| Fraction::from_decimal_str(s).ok()),
+                    qty: Fraction::from_any_str(
+                        item.get("qty").and_then(|x| x.as_str()).unwrap_or("0"),
+                    )
+                    .unwrap_or_else(|_| Fraction::zero()),
+                    cum_exec_qty: Fraction::from_any_str(
+                        item.get("cumExecQty")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("0"),
+                    )
+                    .unwrap_or_else(|_| Fraction::zero()),
+                    cum_exec_fee: item
+                        .get("cumExecFee")
+                        .and_then(|x| x.as_str())
+                        .and_then(|s| Fraction::from_any_str(s).ok()),
+                    status: item
+                        .get("orderStatus")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .into(),
                 });
             }
         }
@@ -709,27 +998,48 @@ impl VenueAdapter for BybitAdapter {
         symbol: &str,
         order_link_id: &str,
     ) -> Result<Vec<ExecutionRecord>, String> {
-        let query = format!("category={category}&symbol={symbol}&orderLinkId={order_link_id}&limit=100");
-        let v = self.private_get(&creds.key, &creds.secret, "/v5/execution/list", &query).await?;
+        let query =
+            format!("category={category}&symbol={symbol}&orderLinkId={order_link_id}&limit=100");
+        let v = self
+            .private_get(&creds.key, &creds.secret, "/v5/execution/list", &query)
+            .await?;
         let mut out = Vec::new();
         if let Some(list) = v.get("list").and_then(|x| x.as_array()) {
             for item in list {
-                let exec_id = item.get("execId").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let exec_id = item
+                    .get("execId")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if exec_id.is_empty() {
                     continue;
                 }
-                let returned_link_id = item.get("orderLinkId").and_then(|x| x.as_str()).unwrap_or("");
+                let returned_link_id = item
+                    .get("orderLinkId")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
                 if returned_link_id.is_empty() || returned_link_id != order_link_id {
                     continue;
                 }
-                let exec_qty = Fraction::from_any_str(item.get("execQty").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero());
-                let exec_price = Fraction::from_any_str(item.get("execPrice").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero());
+                let exec_qty = Fraction::from_any_str(
+                    item.get("execQty").and_then(|x| x.as_str()).unwrap_or("0"),
+                )
+                .unwrap_or_else(|_| Fraction::zero());
+                let exec_price = Fraction::from_any_str(
+                    item.get("execPrice")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("0"),
+                )
+                .unwrap_or_else(|_| Fraction::zero());
                 // H-4 (fee-coin): Bybit spot alışında ücret BASE cinsinden kesilir
                 // (satışta quote). Muhasebe quote olduğundan alış ücreti quote
                 // karşılığına çevrilir: fee_q = fee_base * execPrice. Lineer
                 // vadeli ücreti zaten USDT(quote) cinsindendir.
                 let side_str = item.get("side").and_then(|x| x.as_str()).unwrap_or("");
-                let raw_fee = item.get("execFee").and_then(|x| x.as_str()).and_then(|s| Fraction::from_any_str(s).ok());
+                let raw_fee = item
+                    .get("execFee")
+                    .and_then(|x| x.as_str())
+                    .and_then(|s| Fraction::from_any_str(s).ok());
                 let exec_fee = match (raw_fee, category) {
                     (Some(f), "spot") if side_str == "Buy" => f.mul(&exec_price).ok().or(Some(f)),
                     (f, _) => f,
@@ -740,8 +1050,16 @@ impl VenueAdapter for BybitAdapter {
                     exec_qty,
                     exec_price,
                     exec_fee,
-                    is_maker: item.get("isMaker").and_then(|x| x.as_bool()).unwrap_or(false),
-                    exec_time: item.get("execTime").and_then(|x| x.as_str()).and_then(|s| s.parse().ok()).or_else(|| item.get("execTime").and_then(|x| x.as_i64())).unwrap_or(0),
+                    is_maker: item
+                        .get("isMaker")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(false),
+                    exec_time: item
+                        .get("execTime")
+                        .and_then(|x| x.as_str())
+                        .and_then(|s| s.parse().ok())
+                        .or_else(|| item.get("execTime").and_then(|x| x.as_i64()))
+                        .unwrap_or(0),
                 });
             }
         }
@@ -761,22 +1079,59 @@ impl VenueAdapter for BybitAdapter {
         let parse_item = |item: &serde_json::Value| -> Option<VenueOrderState> {
             let avg = item.get("avgPrice").and_then(|x| x.as_str()).unwrap_or("");
             let px = item.get("price").and_then(|x| x.as_str()).unwrap_or("");
-            let price_src = if !avg.is_empty() && avg != "0" { avg } else { px };
+            let price_src = if !avg.is_empty() && avg != "0" {
+                avg
+            } else {
+                px
+            };
             Some(VenueOrderState {
-                order_id: item.get("orderId").and_then(|x| x.as_str()).unwrap_or("").into(),
-                order_link_id: item.get("orderLinkId").and_then(|x| x.as_str()).unwrap_or("").into(),
-                symbol: item.get("symbol").and_then(|x| x.as_str()).unwrap_or("").into(),
-                side: item.get("side").and_then(|x| x.as_str()).unwrap_or("").into(),
+                order_id: item
+                    .get("orderId")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .into(),
+                order_link_id: item
+                    .get("orderLinkId")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .into(),
+                symbol: item
+                    .get("symbol")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .into(),
+                side: item
+                    .get("side")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .into(),
                 price: Fraction::from_decimal_str(price_src).ok(),
-                qty: Fraction::from_any_str(item.get("qty").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()),
-                cum_exec_qty: Fraction::from_any_str(item.get("cumExecQty").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()),
-                cum_exec_fee: item.get("cumExecFee").and_then(|x| x.as_str()).and_then(|s| Fraction::from_any_str(s).ok()),
-                status: item.get("orderStatus").and_then(|x| x.as_str()).unwrap_or("").into(),
+                qty: Fraction::from_any_str(
+                    item.get("qty").and_then(|x| x.as_str()).unwrap_or("0"),
+                )
+                .unwrap_or_else(|_| Fraction::zero()),
+                cum_exec_qty: Fraction::from_any_str(
+                    item.get("cumExecQty")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("0"),
+                )
+                .unwrap_or_else(|_| Fraction::zero()),
+                cum_exec_fee: item
+                    .get("cumExecFee")
+                    .and_then(|x| x.as_str())
+                    .and_then(|s| Fraction::from_any_str(s).ok()),
+                status: item
+                    .get("orderStatus")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .into(),
             })
         };
         // 1) açık emirler arasında ara
         let q1 = format!("category={category}&symbol={symbol}&orderLinkId={order_link_id}");
-        let v = self.private_get(&creds.key, &creds.secret, "/v5/order/realtime", &q1).await?;
+        let v = self
+            .private_get(&creds.key, &creds.secret, "/v5/order/realtime", &q1)
+            .await?;
         if let Some(list) = v.get("list").and_then(|x| x.as_array()) {
             if let Some(item) = list.first() {
                 return Ok(parse_item(item));
@@ -784,7 +1139,9 @@ impl VenueAdapter for BybitAdapter {
         }
         // 2) terminal geçmişinde ara (market emir anında terminale düşer)
         let q2 = format!("category={category}&symbol={symbol}&orderLinkId={order_link_id}&limit=1");
-        let v = self.private_get(&creds.key, &creds.secret, "/v5/order/history", &q2).await?;
+        let v = self
+            .private_get(&creds.key, &creds.secret, "/v5/order/history", &q2)
+            .await?;
         if let Some(list) = v.get("list").and_then(|x| x.as_array()) {
             if let Some(item) = list.first() {
                 return Ok(parse_item(item));
@@ -793,23 +1150,62 @@ impl VenueAdapter for BybitAdapter {
         Ok(None)
     }
 
-    async fn positions(&self, creds: &VenueCreds, symbol: &str) -> Result<Vec<PositionSnapshot>, String> {
+    async fn positions(
+        &self,
+        creds: &VenueCreds,
+        symbol: &str,
+    ) -> Result<Vec<PositionSnapshot>, String> {
         let query = format!("category=linear&symbol={symbol}");
-        let v = self.private_get(&creds.key, &creds.secret, "/v5/position/list", &query).await?;
+        let v = self
+            .private_get(&creds.key, &creds.secret, "/v5/position/list", &query)
+            .await?;
         let mut out = Vec::new();
         if let Some(list) = v.get("list").and_then(|x| x.as_array()) {
             for item in list {
                 out.push(PositionSnapshot {
-                    symbol: item.get("symbol").and_then(|x| x.as_str()).unwrap_or("").into(),
-                    side: item.get("side").and_then(|x| x.as_str()).unwrap_or("").into(),
-                    size: Fraction::from_any_str(item.get("size").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()),
-                    avg_price: Fraction::from_any_str(item.get("avgPrice").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()),
-                    mark_price: Fraction::from_any_str(item.get("markPrice").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()),
-                    unrealized_pnl: Fraction::from_any_str(item.get("unrealisedPnl").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()),
-                    liq_price: item.get("liqPrice").and_then(|x| x.as_str()).and_then(|s| Fraction::from_decimal_str(s).ok()),
-                    leverage: Fraction::from_any_str(item.get("leverage").and_then(|x| x.as_str()).unwrap_or("1")).unwrap_or_else(|_| Fraction::one()),
+                    symbol: item
+                        .get("symbol")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .into(),
+                    side: item
+                        .get("side")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .into(),
+                    size: Fraction::from_any_str(
+                        item.get("size").and_then(|x| x.as_str()).unwrap_or("0"),
+                    )
+                    .unwrap_or_else(|_| Fraction::zero()),
+                    avg_price: Fraction::from_any_str(
+                        item.get("avgPrice").and_then(|x| x.as_str()).unwrap_or("0"),
+                    )
+                    .unwrap_or_else(|_| Fraction::zero()),
+                    mark_price: Fraction::from_any_str(
+                        item.get("markPrice")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("0"),
+                    )
+                    .unwrap_or_else(|_| Fraction::zero()),
+                    unrealized_pnl: Fraction::from_any_str(
+                        item.get("unrealisedPnl")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("0"),
+                    )
+                    .unwrap_or_else(|_| Fraction::zero()),
+                    liq_price: item
+                        .get("liqPrice")
+                        .and_then(|x| x.as_str())
+                        .and_then(|s| Fraction::from_decimal_str(s).ok()),
+                    leverage: Fraction::from_any_str(
+                        item.get("leverage").and_then(|x| x.as_str()).unwrap_or("1"),
+                    )
+                    .unwrap_or_else(|_| Fraction::one()),
                     // Faz 4.5: 0=one-way, 1/2=hedge (docs: position/position-mode)
-                    position_idx: item.get("positionIdx").and_then(|x| x.as_i64()).map(|v| v as i32),
+                    position_idx: item
+                        .get("positionIdx")
+                        .and_then(|x| x.as_i64())
+                        .map(|v| v as i32),
                 });
             }
         }
@@ -821,36 +1217,71 @@ impl VenueAdapter for BybitAdapter {
     /// 1/2=hedge/long_short). Pozisyonu olmayan hesapta belirsiz → None
     /// (denetim devre dışı kalır; emir reddi gelirse venue hatası zaten görünür).
     async fn pos_mode(&self, creds: &VenueCreds) -> Result<Option<String>, String> {
-        let v = self.private_get(&creds.key, &creds.secret, "/v5/position/list", "category=linear&settleCoin=USDT&limit=10").await?;
+        let v = self
+            .private_get(
+                &creds.key,
+                &creds.secret,
+                "/v5/position/list",
+                "category=linear&settleCoin=USDT&limit=10",
+            )
+            .await?;
         let list = v.get("list").and_then(|x| x.as_array());
         let idx = list
             .and_then(|a| a.first())
             .and_then(|i| i.get("positionIdx"))
             .and_then(|x| x.as_i64());
-        Ok(idx.map(|i| if i == 0 { "net_mode".into() } else { "long_short_mode".into() }))
+        Ok(idx.map(|i| {
+            if i == 0 {
+                "net_mode".into()
+            } else {
+                "long_short_mode".into()
+            }
+        }))
     }
 
     /// Faz 2.7 — Bybit risk-limit aynası (halka açık, anahtarsız).
-    async fn mmr_brackets(&self, symbol: &str, _creds: Option<&super::VenueCreds>) -> Result<Vec<dca_math::MmrBracket>, String> {
+    async fn mmr_brackets(
+        &self,
+        symbol: &str,
+        _creds: Option<&super::VenueCreds>,
+    ) -> Result<Vec<dca_math::MmrBracket>, String> {
         let v = self
-            .public_get("/v5/market/risk-limit", &format!("category=linear&symbol={symbol}&limit=200"))
+            .public_get(
+                "/v5/market/risk-limit",
+                &format!("category=linear&symbol={symbol}&limit=200"),
+            )
             .await?;
         parse_bybit_risk_limit(&v)
     }
 
     /// P3-6 L2 derinlik (Bybit /v5/market/orderbook, halka açık).
-    async fn orderbook(&self, category: &str, symbol: &str, limit: usize) -> Result<OrderBook, String> {
+    async fn orderbook(
+        &self,
+        category: &str,
+        symbol: &str,
+        limit: usize,
+    ) -> Result<OrderBook, String> {
         let lim = limit.clamp(1, 200);
-        let v = self.public_get("/v5/market/orderbook", &format!("category={category}&symbol={symbol}&limit={lim}")).await?;
+        let v = self
+            .public_get(
+                "/v5/market/orderbook",
+                &format!("category={category}&symbol={symbol}&limit={lim}"),
+            )
+            .await?;
         let side = |k: &str| -> Vec<OrderBookLevel> {
-            v.get(k).and_then(|x| x.as_array()).map(|a| {
-                a.iter().filter_map(|e| {
-                    Some(OrderBookLevel {
-                        price: e.get(0)?.as_str()?.into(),
-                        qty: e.get(1)?.as_str()?.into(),
-                    })
-                }).collect()
-            }).unwrap_or_default()
+            v.get(k)
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|e| {
+                            Some(OrderBookLevel {
+                                price: e.get(0)?.as_str()?.into(),
+                                qty: e.get(1)?.as_str()?.into(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
         };
         Ok(OrderBook {
             symbol: v.get("s").and_then(|x| x.as_str()).unwrap_or(symbol).into(),
@@ -881,13 +1312,25 @@ impl VenueAdapter for BybitAdapter {
         // M-12: private_post içindeki check_ret retCode!=0'da (110043 dahil)
         // Err üretir — "leverage not modified" zaten-hedefte BAŞARISIDIR;
         // metinden yakalanır, sonsuz WARN-retry kapanır.
-        match self.private_post(&creds.key, &creds.secret, "/v5/position/set-leverage", &body).await {
+        match self
+            .private_post(
+                &creds.key,
+                &creds.secret,
+                "/v5/position/set-leverage",
+                &body,
+            )
+            .await
+        {
             Ok(_) => Ok(()),
-            Err(e) if e.contains("retCode=110043") || e.to_lowercase().contains("leverage not modified") => Ok(()),
+            Err(e)
+                if e.contains("retCode=110043")
+                    || e.to_lowercase().contains("leverage not modified") =>
+            {
+                Ok(())
+            }
             Err(e) => Err(e),
         }
     }
-
 }
 
 #[cfg(test)]
@@ -912,7 +1355,10 @@ mod tests {
         // gerçek dünyada [u8; N] taşınır, uzunluk korunumu dizi impl'idir).
         let mut key: [u8; 32] = [0xAB; 32];
         key.zeroize();
-        assert!(key.iter().all(|&b| b == 0), "zeroize() çağrısı anahtar baytlarını sıfırlamalı");
+        assert!(
+            key.iter().all(|&b| b == 0),
+            "zeroize() çağrısı anahtar baytlarını sıfırlamalı"
+        );
         // (2) Zeroizing zarfı drop yolunda aynı impl'i çağırır — zarf tipi
         // derleme-zamanı sözleşme testi; crate'in kendi testleri drop
         // davranışını kanıtlar.
@@ -960,11 +1406,19 @@ mod tests {
         // ts=1658384314791 key=X key recv=5000
         // payload = "1658384314791" + key + "5000" + "category=option&symbol=BTC-29JUL22-25000-C"
         // The exact expected digest depends on the key; here we verify determinism + hex format.
-        let s1 = sign_hmac("secret", "1658384314791XXXXXXXXXX5000category=option&symbol=BTC-29JUL22-25000-C");
-        let s2 = sign_hmac("secret", "1658384314791XXXXXXXXXX5000category=option&symbol=BTC-29JUL22-25000-C");
+        let s1 = sign_hmac(
+            "secret",
+            "1658384314791XXXXXXXXXX5000category=option&symbol=BTC-29JUL22-25000-C",
+        );
+        let s2 = sign_hmac(
+            "secret",
+            "1658384314791XXXXXXXXXX5000category=option&symbol=BTC-29JUL22-25000-C",
+        );
         assert_eq!(s1, s2);
         assert_eq!(s1.len(), 64);
-        assert!(s1.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(s1
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
@@ -1007,7 +1461,10 @@ mod tests {
         let t1 = adapter.now_ms();
         adapter.time_offset_ms.store(5000, Ordering::Relaxed);
         let t2 = adapter.now_ms();
-        assert!(t2 >= t1 + 4900, "now_ms with 5000ms offset should reflect clock adjustment");
+        assert!(
+            t2 >= t1 + 4900,
+            "now_ms with 5000ms offset should reflect clock adjustment"
+        );
     }
 }
 
@@ -1032,15 +1489,26 @@ mod permission_tests {
         assert!(parse_key_permissions(&serde_json::json!({ "readOnly": 0 })).is_err());
         assert!(parse_key_permissions(&serde_json::json!({
             "permissions": {"Wallet": [], "Spot": [], "ContractTrade": []}
-        })).is_err());
+        }))
+        .is_err());
         assert!(parse_key_permissions(&permission_payload(serde_json::json!("Withdraw"))).is_err());
     }
 
     #[test]
     fn wallet_withdrawal_and_internal_transfer_permissions_are_rejected() {
-        for permission in ["Withdraw", "AccountTransfer", "SubMemberTransfer", "SubMemberTransferList"] {
-            let parsed = parse_key_permissions(&permission_payload(serde_json::json!([permission]))).unwrap();
-            assert!(parsed.can_withdraw, "wallet permission {permission} must trip the hard gate");
+        for permission in [
+            "Withdraw",
+            "AccountTransfer",
+            "SubMemberTransfer",
+            "SubMemberTransferList",
+        ] {
+            let parsed =
+                parse_key_permissions(&permission_payload(serde_json::json!([permission])))
+                    .unwrap();
+            assert!(
+                parsed.can_withdraw,
+                "wallet permission {permission} must trip the hard gate"
+            );
         }
         let parsed = parse_key_permissions(&permission_payload(serde_json::json!([]))).unwrap();
         assert!(!parsed.can_withdraw);

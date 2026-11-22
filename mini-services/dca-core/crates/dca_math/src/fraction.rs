@@ -14,6 +14,7 @@ use std::str::FromStr;
 use thiserror::Error;
 
 pub const MAX_BITS: u64 = 4096;
+const MAX_PARSE_CHARS: usize = 8192;
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum MathError {
@@ -41,9 +42,17 @@ impl Fraction {
         if den.is_zero() {
             return Err(MathError::DivisionByZero);
         }
-        let (num, den) = if den.is_negative() { (-num, -den) } else { (num, den) };
+        let (num, den) = if den.is_negative() {
+            (-num, -den)
+        } else {
+            (num, den)
+        };
         let gcd = num.abs().gcd(&den);
-        let (num, den) = if gcd.is_zero() { (num, BigInt::one()) } else { (num / &gcd, den / &gcd) };
+        let (num, den) = if gcd.is_zero() {
+            (num, BigInt::one())
+        } else {
+            (num / &gcd, den / &gcd)
+        };
         if num.bits() > MAX_BITS || den.bits() > MAX_BITS {
             return Err(MathError::BitLimitExceeded);
         }
@@ -51,35 +60,57 @@ impl Fraction {
     }
 
     pub fn zero() -> Self {
-        Self { num: BigInt::zero(), den: BigInt::one() }
+        Self {
+            num: BigInt::zero(),
+            den: BigInt::one(),
+        }
     }
 
     pub fn one() -> Self {
-        Self { num: BigInt::one(), den: BigInt::one() }
+        Self {
+            num: BigInt::one(),
+            den: BigInt::one(),
+        }
     }
 
     pub fn neg_one() -> Self {
-        Self { num: -BigInt::one(), den: BigInt::one() }
+        Self {
+            num: -BigInt::one(),
+            den: BigInt::one(),
+        }
     }
 
     pub fn from_i64(v: i64) -> Self {
-        Self { num: BigInt::from(v), den: BigInt::one() }
+        Self {
+            num: BigInt::from(v),
+            den: BigInt::one(),
+        }
     }
 
     pub fn from_u64(v: u64) -> Self {
-        Self { num: BigInt::from(v), den: BigInt::one() }
+        Self {
+            num: BigInt::from(v),
+            den: BigInt::one(),
+        }
     }
 
     /// Exact decimal string parsing ("123.45", "-0.007", "1e-4", "+2.50").
     /// Rejects NaN/Inf/empty/garbage. Scientific notation with explicit exponent allowed.
     pub fn from_decimal_str(s: &str) -> Result<Self, MathError> {
+        if s.len() > MAX_PARSE_CHARS {
+            return Err(MathError::InvalidDecimalString(
+                "input exceeds parser limit".into(),
+            ));
+        }
         let trimmed = s.trim();
         if trimmed.is_empty() {
             return Err(MathError::InvalidDecimalString(s.to_string()));
         }
         if let Some((n, d)) = trimmed.split_once('/') {
-            let num = BigInt::from_str(n.trim()).map_err(|_| MathError::InvalidDecimalString(s.to_string()))?;
-            let den = BigInt::from_str(d.trim()).map_err(|_| MathError::InvalidDecimalString(s.to_string()))?;
+            let num = BigInt::from_str(n.trim())
+                .map_err(|_| MathError::InvalidDecimalString(s.to_string()))?;
+            let den = BigInt::from_str(d.trim())
+                .map_err(|_| MathError::InvalidDecimalString(s.to_string()))?;
             return Self::new(num, den);
         }
         let parts: Vec<&str> = trimmed.split(['e', 'E']).collect();
@@ -89,7 +120,9 @@ impl Fraction {
                 if parts[1].is_empty() {
                     return Err(MathError::InvalidDecimalString(s.to_string()));
                 }
-                let exp = parts[1].parse::<i64>().map_err(|_| MathError::InvalidDecimalString(s.to_string()))?;
+                let exp = parts[1]
+                    .parse::<i64>()
+                    .map_err(|_| MathError::InvalidDecimalString(s.to_string()))?;
                 (parts[0], exp)
             }
             _ => return Err(MathError::InvalidDecimalString(s.to_string())),
@@ -111,7 +144,8 @@ impl Fraction {
             return Err(MathError::InvalidDecimalString(s.to_string()));
         }
 
-        let mut num = BigInt::from_str(&digits).map_err(|_| MathError::InvalidDecimalString(s.to_string()))?;
+        let mut num = BigInt::from_str(&digits)
+            .map_err(|_| MathError::InvalidDecimalString(s.to_string()))?;
         let frac_len = frac_part.len() as i64;
         let mut den = BigInt::from(10u32).pow(frac_len.max(0) as u32);
 
@@ -135,10 +169,17 @@ impl Fraction {
 
     /// Parse either exact decimal ("123.45") or canonical rational ("124901/2").
     pub fn from_any_str(s: &str) -> Result<Self, MathError> {
+        if s.len() > MAX_PARSE_CHARS {
+            return Err(MathError::InvalidDecimalString(
+                "input exceeds parser limit".into(),
+            ));
+        }
         let t = s.trim();
         if let Some((n, d)) = t.split_once('/') {
-            let num = BigInt::from_str(n.trim()).map_err(|_| MathError::InvalidDecimalString(s.to_string()))?;
-            let den = BigInt::from_str(d.trim()).map_err(|_| MathError::InvalidDecimalString(s.to_string()))?;
+            let num = BigInt::from_str(n.trim())
+                .map_err(|_| MathError::InvalidDecimalString(s.to_string()))?;
+            let den = BigInt::from_str(d.trim())
+                .map_err(|_| MathError::InvalidDecimalString(s.to_string()))?;
             return Self::new(num, den);
         }
         Self::from_decimal_str(t)
@@ -169,11 +210,17 @@ impl Fraction {
     }
 
     pub fn add(&self, other: &Self) -> Result<Self, MathError> {
-        Self::new(&self.num * &other.den + &other.num * &self.den, &self.den * &other.den)
+        Self::new(
+            &self.num * &other.den + &other.num * &self.den,
+            &self.den * &other.den,
+        )
     }
 
     pub fn sub(&self, other: &Self) -> Result<Self, MathError> {
-        Self::new(&self.num * &other.den - &other.num * &self.den, &self.den * &other.den)
+        Self::new(
+            &self.num * &other.den - &other.num * &self.den,
+            &self.den * &other.den,
+        )
     }
 
     pub fn mul(&self, other: &Self) -> Result<Self, MathError> {
@@ -267,11 +314,19 @@ impl Fraction {
     /// Rounding only at reporting boundary; internal state stays exact.
     pub fn to_half_even_display(&self, decimals: usize) -> String {
         if self.is_zero() {
-            return if decimals == 0 { "0".into() } else { format!("0.{}", "0".repeat(decimals)) };
+            return if decimals == 0 {
+                "0".into()
+            } else {
+                format!("0.{}", "0".repeat(decimals))
+            };
         }
         let scale = BigInt::from(10u32).pow(decimals as u32);
         let t = &self.num * &scale; // signed
-        let (t_abs, sign) = if t.is_negative() { (-&t, "-") } else { (t.clone(), "") };
+        let (t_abs, sign) = if t.is_negative() {
+            (-&t, "-")
+        } else {
+            (t.clone(), "")
+        };
         let d = &self.den;
         let q = &t_abs / d;
         let r = &t_abs % d;
@@ -284,7 +339,12 @@ impl Fraction {
         if decimals == 0 {
             format!("{}{}", sign, digits)
         } else if digits.len() <= decimals {
-            format!("{}0.{}{}", sign, "0".repeat(decimals - digits.len()), digits)
+            format!(
+                "{}0.{}{}",
+                sign,
+                "0".repeat(decimals - digits.len()),
+                digits
+            )
         } else {
             let split = digits.len() - decimals;
             format!("{}{}.{}", sign, &digits[..split], &digits[split..])
@@ -295,13 +355,20 @@ impl Fraction {
     pub fn to_trunc_display(&self, decimals: usize) -> String {
         let scale = BigInt::from(10u32).pow(decimals as u32);
         let t = &self.num * &scale;
-        let q = t.div_floor(&self.den);
+        // BigInt division truncates toward zero; div_floor would turn a
+        // negative partial unit into an extra negative displayed unit.
+        let q = t / &self.den;
         let (q_abs, sign) = if q.is_negative() { (-q, "-") } else { (q, "") };
         let digits = q_abs.to_string();
         if decimals == 0 {
             format!("{}{}", sign, digits)
         } else if digits.len() <= decimals {
-            format!("{}0.{}{}", sign, "0".repeat(decimals - digits.len()), digits)
+            format!(
+                "{}0.{}{}",
+                sign,
+                "0".repeat(decimals - digits.len()),
+                digits
+            )
         } else {
             let split = digits.len() - decimals;
             format!("{}{}.{}", sign, &digits[..split], &digits[split..])
@@ -410,10 +477,12 @@ mod tests {
 
     #[test]
     fn parse_rejects_minimum_i64_exponent_without_panicking() {
-        let parsed = std::panic::catch_unwind(|| {
-            Fraction::from_decimal_str("1e-9223372036854775808")
-        });
-        assert!(parsed.is_ok(), "an extreme exponent must not panic the request task");
+        let parsed =
+            std::panic::catch_unwind(|| Fraction::from_decimal_str("1e-9223372036854775808"));
+        assert!(
+            parsed.is_ok(),
+            "an extreme exponent must not panic the request task"
+        );
         assert!(parsed.unwrap().is_err());
     }
 
@@ -424,12 +493,23 @@ mod tests {
         // 0.1 + 0.2 = 0.3 EXACTLY (float would give 0.30000000000000004)
         assert_eq!(a.add(&b).unwrap().to_string(), "3/10");
         assert_eq!(f("1").div(&f("3")).unwrap().to_string(), "1/3");
-        assert_eq!(f("1").div(&f("3")).unwrap().mul(&f("3")).unwrap().to_string(), "1");
+        assert_eq!(
+            f("1")
+                .div(&f("3"))
+                .unwrap()
+                .mul(&f("3"))
+                .unwrap()
+                .to_string(),
+            "1"
+        );
     }
 
     #[test]
     fn division_by_zero() {
-        assert_eq!(f("1").div(&Fraction::zero()).unwrap_err(), MathError::DivisionByZero);
+        assert_eq!(
+            f("1").div(&Fraction::zero()).unwrap_err(),
+            MathError::DivisionByZero
+        );
     }
 
     #[test]
@@ -479,7 +559,10 @@ mod tests {
     fn big_values_no_overflow_u64() {
         // Values beyond u64 must stay exact
         let big = f("123456789012345678901234567890.5");
-        assert_eq!(big.mul(&f("2")).unwrap().to_string(), "246913578024691357802469135781");
+        assert_eq!(
+            big.mul(&f("2")).unwrap().to_string(),
+            "246913578024691357802469135781"
+        );
     }
 
     #[test]
@@ -508,5 +591,19 @@ mod tests {
         assert_eq!(frac.to_string(), "1/2");
         let parsed = Fraction::from_decimal_str(&frac.to_string()).unwrap();
         assert_eq!(parsed, frac);
+    }
+
+    #[test]
+    fn trunc_display_rounds_toward_zero_for_negative_values() {
+        assert_eq!(f("-1.29").to_trunc_display(1), "-1.2");
+        assert_eq!(f("-0.09").to_trunc_display(1), "0.0");
+        assert_eq!(f("1.29").to_trunc_display(1), "1.2");
+    }
+
+    #[test]
+    fn decimal_parser_rejects_oversized_input_before_bigint_parse() {
+        let input = "9".repeat(MAX_PARSE_CHARS + 1);
+        assert!(Fraction::from_decimal_str(&input).is_err());
+        assert!(Fraction::from_any_str(&input).is_err());
     }
 }

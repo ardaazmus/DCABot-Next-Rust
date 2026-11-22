@@ -13,12 +13,17 @@ pub struct Db {
 
 impl Db {
     pub fn open(path: &str) -> Result<Self, String> {
+        secure_database_file(path)?;
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
-        conn.pragma_update(None, "journal_mode", "WAL").map_err(|e| e.to_string())?;
-        conn.pragma_update(None, "synchronous", "NORMAL").map_err(|e| e.to_string())?;
-        conn.pragma_update(None, "foreign_keys", "ON").map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|e| e.to_string())?;
         // Faz 0.9 (B-7): busy_timeout PRAGMA — eşzamanlı okuma/yazma kilitlerinde SQLITE_BUSY önlenir
-        conn.pragma_update(None, "busy_timeout", "5000").map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "busy_timeout", "5000")
+            .map_err(|e| e.to_string())?;
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS bots (
@@ -152,7 +157,9 @@ impl Db {
         )
         .map_err(|e| e.to_string())?;
         Self::migrate_columns(&conn)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// Additive column migrations for databases created before a column existed.
@@ -179,8 +186,11 @@ impl Db {
         // P4-3 OKX passphrase: eski kasalara sonradan eklenir (boş = yok).
         let vault_cols = cols("vault_keys")?;
         if !vault_cols.iter().any(|c| c == "api_pass_enc") {
-            conn.execute("ALTER TABLE vault_keys ADD COLUMN api_pass_enc TEXT NOT NULL DEFAULT ''", [])
-                .map_err(|e| e.to_string())?;
+            conn.execute(
+                "ALTER TABLE vault_keys ADD COLUMN api_pass_enc TEXT NOT NULL DEFAULT ''",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
         }
         // Faz 3 (C-4): kalıcı runtime snapshot — motor fazı + stepper durumu.
         if !existing.iter().any(|c| c == "runtime_state") {
@@ -193,6 +203,11 @@ impl Db {
             conn.execute("ALTER TABLE events ADD COLUMN trace_id TEXT", [])
                 .map_err(|e| e.to_string())?;
         }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_trace_id ON events(trace_id, id)",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
         // Faz 28 (P1-3) göçü: deals tablosu eski fazlardan kalansa net_pnl
         // kolonu yoktur — CREATE TABLE IF NOT EXISTS mevcut tabloya dokunmaz.
         // Eksik kolon DealClosed yazımını CRITICAL ile düşürürdü (günlük
@@ -204,6 +219,31 @@ impl Db {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn secure_database_file(path: &str) -> Result<(), String> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if path == ":memory:" || path.starts_with("file:") {
+        return Ok(());
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("open database file permissions: {e}"))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("secure database file permissions: {e}"))
+}
+
+#[cfg(not(unix))]
+fn secure_database_file(_path: &str) -> Result<(), String> {
+    // Local Windows runtime directories receive an explicit user-only ACL from
+    // the PowerShell launcher. Unix and Docker installations use mode 0600.
+    Ok(())
 }
 
 // ---------------- AES-256-GCM Vault ----------------
@@ -227,7 +267,12 @@ impl Vault {
     pub fn new(_db: &Db) -> Result<Self, String> {
         let master_secret = std::env::var("DCA_VAULT_KEY")
             .map_err(|_| "DCA_VAULT_KEY environment variable is required — master key must be provided out-of-DB (SEC-02)")?;
-        Ok(Self { master_secret: Zeroizing::new(master_secret) })
+        if master_secret.trim().is_empty() {
+            return Err("DCA_VAULT_KEY must not be empty".into());
+        }
+        Ok(Self {
+            master_secret: Zeroizing::new(master_secret),
+        })
     }
 
     /// Faz 22 (P2-4): YENİ yazılar Argon2id zarfıyla —
@@ -304,7 +349,9 @@ mod vault_tests {
     #[test]
     fn argon2id_envelope_roundtrip_and_legacy_read() {
         std::env::set_var("DCA_VAULT_KEY_TEST", "1"); // no-op; Vault env'i new()'da okur
-        let v = Vault { master_secret: Zeroizing::new("test-master-secret".into()) };
+        let v = Vault {
+            master_secret: Zeroizing::new("test-master-secret".into()),
+        };
         // yeni yazı: v2 zarf
         let enc = v.encrypt("secret-abc").expect("encrypt");
         let raw = hex::decode(&enc).unwrap();
@@ -317,7 +364,9 @@ mod vault_tests {
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
-        let ct = cipher.encrypt(Nonce::from_slice(&nonce_bytes), legacy_secret).unwrap();
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), legacy_secret)
+            .unwrap();
         let mut legacy = nonce_bytes.to_vec();
         legacy.extend(ct);
         let legacy_hex = hex::encode(legacy);
@@ -326,13 +375,17 @@ mod vault_tests {
         let mut nonce_bytes_v2_prefix = [0u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes_v2_prefix);
         nonce_bytes_v2_prefix[0] = ENVELOPE_V2;
-        let ct2 = cipher.encrypt(Nonce::from_slice(&nonce_bytes_v2_prefix), legacy_secret).unwrap();
+        let ct2 = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes_v2_prefix), legacy_secret)
+            .unwrap();
         let mut legacy2 = nonce_bytes_v2_prefix.to_vec();
         legacy2.extend(ct2);
         let legacy2_hex = hex::encode(legacy2);
         assert_eq!(v.decrypt(&legacy2_hex).unwrap(), "legacy-secret");
         // farklı secret ile çözümleme başarısız (fail-closed)
-        let v2 = Vault { master_secret: Zeroizing::new("wrong".into()) };
+        let v2 = Vault {
+            master_secret: Zeroizing::new("wrong".into()),
+        };
         assert!(v2.decrypt(&enc).is_err());
     }
 }
@@ -351,7 +404,11 @@ fn derive_argon2id(secret: &str, salt: &[u8]) -> Result<[u8; 32], String> {
 /// Used to arm LIVE-mode bots at creation/restore. Errors surface decryption
 /// problems; None means the venue simply has no usable key yet.
 /// P4-3: OKX passphrase üçüncü bileşendir (boş kayıt = None).
-pub fn load_active_key(db: &Db, vault: &Vault, venue: &str) -> Result<Option<dca_exchange::VenueCreds>, String> {
+pub fn load_active_key(
+    db: &Db,
+    vault: &Vault,
+    venue: &str,
+) -> Result<Option<dca_exchange::VenueCreds>, String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
@@ -366,8 +423,16 @@ pub fn load_active_key(db: &Db, vault: &Vault, venue: &str) -> Result<Option<dca
             let ep: String = row.get(2).map_err(|e| e.to_string())?;
             let k = vault.decrypt(&ek)?;
             let s = vault.decrypt(&es)?;
-            let p = if ep.trim().is_empty() { None } else { Some(vault.decrypt(&ep)?) };
-            Ok(Some(dca_exchange::VenueCreds { key: k, secret: s, passphrase: p }))
+            let p = if ep.trim().is_empty() {
+                None
+            } else {
+                Some(vault.decrypt(&ep)?)
+            };
+            Ok(Some(dca_exchange::VenueCreds {
+                key: k,
+                secret: s,
+                passphrase: p,
+            }))
         }
         None => Ok(None),
     }

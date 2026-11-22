@@ -110,7 +110,7 @@ function LiquidationBar({ anchor, liq, leverage, direction }: { anchor: number; 
           style={direction === "long" ? { width: `${liqPct}%` } : { left: `${liqPct}%`, width: `${100 - liqPct}%` }}
         />
         <div className="absolute inset-y-0 w-0.5 bg-slate-100" style={{ left: `${anchorPct}%` }} />
-        <span className="num absolute left-2 top-1/2 -translate-y-1/2 text-[10px] font-bold text-white/90">
+        <span className={`num absolute ${direction === "short" ? "right-2" : "left-2"} top-1/2 -translate-y-1/2 text-[10px] font-bold text-white/90`}>
           LIQ {fmtNum(liq, 2)}
         </span>
         <span
@@ -121,7 +121,7 @@ function LiquidationBar({ anchor, liq, leverage, direction }: { anchor: number; 
         </span>
       </div>
       <div className="mt-1.5 flex justify-between text-[10px] text-slate-400">
-        <span>0</span>
+        <span className="num">{fmtNum(min, 2)}</span>
         <span className="num">{fmtNum(max, 2)}</span>
       </div>
     </div>

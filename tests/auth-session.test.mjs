@@ -94,6 +94,14 @@ test("the UI password cannot fall back to exchange or engine API keys", () => {
   });
 });
 
+test("password comparison preserves exact bytes and safely rejects length mismatch", () => {
+  withEnv({ DCA_UI_PASSWORD: "  correct horse  " }, () => {
+    assert.equal(authSession.verifyPassword("  correct horse  "), true);
+    assert.equal(authSession.verifyPassword("correct horse"), false);
+    assert.equal(authSession.verifyPassword("  correct horse  extra"), false);
+  });
+});
+
 test("login failures are throttled and the lockout backs off", () => {
   authSession.clearLoginFailures();
   for (let i = 0; i < 4; i += 1) assert.equal(authSession.recordLoginFailure(1_000 + i), 0);

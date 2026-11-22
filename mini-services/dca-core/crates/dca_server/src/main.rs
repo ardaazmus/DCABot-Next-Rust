@@ -5,10 +5,11 @@
 mod ai;
 mod bnb;
 mod brackets;
+mod deals;
 mod dryrun;
-mod forensics;
 mod engine;
 mod fleet;
+mod forensics;
 mod indicators;
 mod memory;
 mod multistatus;
@@ -16,12 +17,14 @@ mod risk;
 mod routes_backtest;
 mod routes_calc;
 mod routes_common;
-mod status;
-mod thin;
 mod state;
+mod status;
 mod store;
-mod deals;
+mod thin;
 
+use crate::routes_common::{
+    err403, err404, err422, fill_marks_json, is_blacklisted, normalize_pair, parse_kind,
+};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::middleware;
@@ -29,7 +32,9 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
-use dca_exchange::{validate_key_permissions, KeyPermissions, VenueAdapter, VenueCreds, WithdrawalGate};
+use dca_exchange::{
+    validate_key_permissions, KeyPermissions, VenueAdapter, VenueCreds, WithdrawalGate,
+};
 use dca_kernel::GuardAction;
 use dca_math::fraction::Fraction;
 use dca_math::Instrument;
@@ -38,15 +43,14 @@ use dca_strategy::{certify, certify_verdict, run_backtest, BotConfig, StrategyKi
 use futures_util::FutureExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use crate::routes_common::{err403, err404, err422, fill_marks_json, is_blacklisted, normalize_pair, parse_kind};
 use state::{AppState, SseEvent};
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Mutex as AsyncMutex;
 use store::{Db, Vault};
+use tokio::sync::Mutex as AsyncMutex;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use uuid::Uuid;
 
@@ -71,9 +75,8 @@ impl RateLimiter {
         // Yeni kimlikler için önce süresi dolmuş kovaları temizle; doluysa
         // yeni kimliği reddet ki saldırgan anahtarla bellek sınırsız büyümesin.
         if !self.buckets.contains_key(key) && self.buckets.len() >= RATE_LIMIT_MAX_BUCKETS {
-            self.buckets.retain(|_, v| {
-                v.iter().any(|t| *t > window_start)
-            });
+            self.buckets
+                .retain(|_, v| v.iter().any(|t| *t > window_start));
             if self.buckets.len() >= RATE_LIMIT_MAX_BUCKETS {
                 return false;
             }
@@ -103,22 +106,36 @@ fn rate_limit_key(req: &axum::extract::Request) -> String {
 async fn acquire_bot_poll_guard(app: &AppState, bot_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
     let lock = {
         let mut locks = app.poll_locks.lock().await;
-        locks.entry(bot_id.to_string()).or_insert_with(|| Arc::new(AsyncMutex::new(()))).clone()
+        locks
+            .entry(bot_id.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
     };
     lock.lock_owned().await
 }
 
 fn normalized_live_market(venue: &str, symbol: &str) -> (String, String) {
-    (venue.trim().to_ascii_uppercase(), symbol.trim().to_ascii_uppercase())
+    (
+        venue.trim().to_ascii_uppercase(),
+        symbol.trim().to_ascii_uppercase(),
+    )
 }
 
-fn live_status_requires_ownership(status: &str, exposure: bool, open_orders: bool, pending_actions: bool) -> bool {
+fn live_status_requires_ownership(
+    status: &str,
+    exposure: bool,
+    open_orders: bool,
+    pending_actions: bool,
+) -> bool {
     !status.eq_ignore_ascii_case("STOPPED") || exposure || open_orders || pending_actions
 }
 
 fn live_runtime_has_ownership(rt: &state::BotRuntime) -> bool {
     let main_exposure = !rt.stepper.position.qty.is_zero();
-    let hedge_exposure = rt.hedge_stepper.as_ref().is_some_and(|stepper| !stepper.position.qty.is_zero());
+    let hedge_exposure = rt
+        .hedge_stepper
+        .as_ref()
+        .is_some_and(|stepper| !stepper.position.qty.is_zero());
     live_status_requires_ownership(
         &rt.status,
         main_exposure || hedge_exposure,
@@ -133,10 +150,15 @@ fn duplicate_live_markets<'a>(
     let mut counts = HashMap::<(String, String), usize>::new();
     for (venue, mode, symbol, status) in rows {
         if mode.eq_ignore_ascii_case("LIVE") && matches!(status, "RUNNING" | "PAUSED" | "FROZEN") {
-            *counts.entry(normalized_live_market(venue, symbol)).or_default() += 1;
+            *counts
+                .entry(normalized_live_market(venue, symbol))
+                .or_default() += 1;
         }
     }
-    counts.into_iter().filter_map(|(market, count)| (count > 1).then_some(market)).collect()
+    counts
+        .into_iter()
+        .filter_map(|(market, count)| (count > 1).then_some(market))
+        .collect()
 }
 
 fn competing_live_bot(
@@ -152,7 +174,7 @@ fn competing_live_bot(
             && rt.mode.eq_ignore_ascii_case("LIVE")
             && existing == requested
             && live_runtime_has_ownership(rt))
-            .then(|| id.clone())
+        .then(|| id.clone())
     })
 }
 
@@ -196,12 +218,13 @@ async fn main() {
             break;
         }
     }
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
     let db_path = std::env::var("DCA_DB_PATH").unwrap_or_else(|_| {
-        let candidates = [
-            "db/dca-core.sqlite3",
-            "../../db/dca-core.sqlite3",
-        ];
+        let candidates = ["db/dca-core.sqlite3", "../../db/dca-core.sqlite3"];
         for c in &candidates {
             if std::path::Path::new(c).exists() {
                 return c.to_string();
@@ -289,12 +312,17 @@ async fn main() {
             let drain = async {
                 while let Some(joined) = poll_tasks.join_next().await {
                     match joined {
-                        Ok(id) => { in_flight.remove(&id); }
+                        Ok(id) => {
+                            in_flight.remove(&id);
+                        }
                         Err(e) => tracing::error!("bot poll task failed during drain: {e}"),
                     }
                 }
             };
-            if tokio::time::timeout(std::time::Duration::from_secs(45), drain).await.is_err() {
+            if tokio::time::timeout(std::time::Duration::from_secs(45), drain)
+                .await
+                .is_err()
+            {
                 tracing::error!("[shutdown] Poll drain exceeded 45s; aborting remaining tasks before snapshot persistence.");
                 poll_tasks.abort_all();
                 while poll_tasks.join_next().await.is_some() {}
@@ -326,14 +354,14 @@ async fn main() {
     // Canlı ortamda mutlaka ayarlanmalıdır.
     let api_key = std::env::var("DCA_API_KEY").unwrap_or_default();
     if api_key.is_empty() {
-        tracing::warn!("DCA_API_KEY ayarlanmamış — tüm authenticated istekler 401 dönecek (SEC-01)");
+        tracing::warn!(
+            "DCA_API_KEY ayarlanmamış — tüm authenticated istekler 401 dönecek (SEC-01)"
+        );
     }
     let api_key_clone = api_key.clone();
 
     // SEC-01: /api/health kimlik doğrulaması iSTEMEN (load balancer / monitoring açık erişim).
-    let health_routes = Router::new()
-        .route("/api/health", get(health))
-        .route("/metrics", get(prometheus_metrics));
+    let health_routes = Router::new().route("/api/health", get(health));
     // P0-8: TradingView webhook'u auth middleware DIŞINDA — TradingView alert'i
     // Bearer başlığı ekleyemez. Uç kendi savunma katmanlarıyla korunur:
     // sabit-zamanlı per-bot secret + ±60sn replay penceresi + DUPLICATE dedup
@@ -345,13 +373,17 @@ async fn main() {
     // Tüm yönetim routes'ları kimlik doğrulama altına alınır.
     let api_routes = Router::new()
         .route("/api/summary", get(summary))
+        .route("/metrics", get(prometheus_metrics))
         .route("/api/equity", get(equity_curve))
         .route("/api/deals", get(deals::list_deals))
         .route("/api/daily-pnl", get(deals::daily_pnl))
         .route("/api/notifications/config", get(notifications_config))
         .route("/api/notifications/test", post(notifications_test))
         .route("/api/bots", get(list_bots).post(create_bot))
-        .route("/api/bots/:id", get(get_bot).patch(patch_bot).delete(delete_bot))
+        .route(
+            "/api/bots/:id",
+            get(get_bot).patch(patch_bot).delete(delete_bot),
+        )
         .route("/api/bots/:id/actions", post(bot_actions))
         .route("/api/bots/:id/fills", get(bot_fills))
         .route("/api/bots/:id/events", get(bot_events))
@@ -362,10 +394,16 @@ async fn main() {
         .route("/api/backtest", post(routes_backtest::backtest))
         .route("/api/backtest/cert", post(backtest_cert))
         .route("/api/signals/preview", post(signals_preview))
-    .route("/api/pine/validate", post(pine_validate))
-    .route("/api/pine/backtest", post(pine_backtest))
-    .route("/api/pine/scripts", get(list_pine_scripts).post(save_pine_script))
-    .route("/api/pine/scripts/:id", patch(patch_pine_script).delete(delete_pine_script))
+        .route("/api/pine/validate", post(pine_validate))
+        .route("/api/pine/backtest", post(pine_backtest))
+        .route(
+            "/api/pine/scripts",
+            get(list_pine_scripts).post(save_pine_script),
+        )
+        .route(
+            "/api/pine/scripts/:id",
+            patch(patch_pine_script).delete(delete_pine_script),
+        )
         .route("/api/markets", get(markets))
         .route("/api/tickers", get(tickers))
         .route("/api/klines", get(klines))
@@ -373,12 +411,18 @@ async fn main() {
         .route("/api/live/reconcile", get(reconcile))
         .route("/api/live/dryrun", post(dryrun::dryrun))
         .route("/api/live/status", get(status::live_status))
-        .route("/api/live/multi-status", get(multistatus::live_multi_status))
+        .route(
+            "/api/live/multi-status",
+            get(multistatus::live_multi_status),
+        )
         .route("/api/fleet/overview", get(fleet::fleet_overview))
         .route("/api/fleet/risk", get(risk::fleet_risk))
         .route("/api/indicators", get(indicators::indicators))
         .route("/api/live/selfcheck", post(selfcheck))
-        .route("/api/live/killswitch", get(get_killswitch).post(set_killswitch))
+        .route(
+            "/api/live/killswitch",
+            get(get_killswitch).post(set_killswitch),
+        )
         .route("/api/live/freeze", get(get_freeze).post(set_freeze))
         .route("/api/live/bnb", get(bnb::live_bnb))
         .route("/api/blacklist", get(list_blacklist).post(add_blacklist))
@@ -386,8 +430,14 @@ async fn main() {
         .route("/api/analysis/regime", get(analysis_regime))
         .route("/api/analysis/calibration", post(analysis_calibration))
         .route("/api/analysis/grid-suggest", get(analysis_grid_suggest))
-        .route("/api/system/maintenance", get(get_maintenance).post(set_maintenance))
-        .route("/api/system/maintenance/simulate", post(thin::simulate_maintenance))
+        .route(
+            "/api/system/maintenance",
+            get(get_maintenance).post(set_maintenance),
+        )
+        .route(
+            "/api/system/maintenance/simulate",
+            post(thin::simulate_maintenance),
+        )
         .route("/api/market/ping", get(thin::market_ping))
         .route("/api/macro/state", get(thin::macro_state))
         .route("/api/orderbook", get(orderbook))
@@ -398,14 +448,25 @@ async fn main() {
         .route("/api/ai/providers", get(ai::ai_providers))
         .route("/api/bots/:id/grid", get(bot_grid))
         .route("/api/bots/:id/tick", post(bot_tick))
-        .route("/api/bots/:id/memory", get(memory::list_memory).post(memory::generate_memory))
-        .route("/api/vault/keys", get(list_keys).post(add_key).route_layer(axum::extract::DefaultBodyLimit::max(64 * 1024)))
+        .route(
+            "/api/bots/:id/memory",
+            get(memory::list_memory).post(memory::generate_memory),
+        )
+        .route(
+            "/api/vault/keys",
+            get(list_keys)
+                .post(add_key)
+                .route_layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
+        )
         .route("/api/vault/keys/:id", delete(remove_key))
         // SEC-01: kimlik doğrulama middleware'i (yönetim routes'ları).
-        .route_layer(middleware::from_fn_with_state(api_key_clone, auth_middleware))
+        .route_layer(middleware::from_fn_with_state(
+            api_key_clone,
+            auth_middleware,
+        ))
         // SEC-04: rate limiting — 400 istek / 10 sn per istemci (P2-1).
-        .layer(
-            middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
+        .layer(middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
                 let limiter = rate_limiter.clone();
                 async move {
                     // The engine only accepts loopback connections from the
@@ -421,55 +482,60 @@ async fn main() {
                     }
                     Ok(next.run(req).await)
                 }
-            }),
-        )
+            },
+        ))
         // M-15: yönetim uçlarında gövde limiti — 1MB isim gibi aşırı yük reddedilir.
         .layer(axum::extract::DefaultBodyLimit::max(131_072));
 
     // SEC-FIND-03: SSE akışı yalnız Authorization Bearer başlığıyla doğrulanır.
     let sse_api_key = api_key.clone();
-    let sse_routes = Router::new().route(
-        "/api/stream",
-        get(move |headers: axum::http::HeaderMap| {
-            let st = sse_state.clone();
-            let key = sse_api_key.clone();
-            async move {
-                // Bound the number of concurrent streams before allocating a
-                // replay query and a new broadcast receiver for the client.
-                if st.sse.receiver_count() > 128 {
-                    return (StatusCode::SERVICE_UNAVAILABLE, "too many event streams").into_response();
-                }
-                let rx = sse_rx.resubscribe();
-                let auth_header = headers
-                    .get("authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|h| h.strip_prefix("Bearer "));
-                let provided = auth_header.unwrap_or("");
-                if !constant_time_eq_str(provided, &key) {
-                    return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-                }
+    let sse_routes = Router::new()
+        .route(
+            "/api/stream",
+            get(move |headers: axum::http::HeaderMap| {
+                let st = sse_state.clone();
+                let key = sse_api_key.clone();
+                async move {
+                    // Bound the number of concurrent streams before allocating a
+                    // replay query and a new broadcast receiver for the client.
+                    if st.sse.receiver_count() > 128 {
+                        return (StatusCode::SERVICE_UNAVAILABLE, "too many event streams")
+                            .into_response();
+                    }
+                    let rx = sse_rx.resubscribe();
+                    let auth_header = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|h| h.strip_prefix("Bearer "));
+                    let provided = auth_header.unwrap_or("");
+                    if !constant_time_eq_str(provided, &key) {
+                        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+                    }
 
-                let last_event_id = headers
-                    .get("last-event-id")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<i64>().ok());
-                sse_handler(st, rx, last_event_id).await.into_response()
-            }
-        }),
-    ).layer(middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
-        let limiter = sse_rate_limiter.clone();
-        async move {
-            let key = rate_limit_key(&req);
-            let allowed = {
-                let mut limiter = limiter.lock().await;
-                limiter.check(&key)
-            };
-            if !allowed {
-                return Err(StatusCode::TOO_MANY_REQUESTS);
-            }
-            Ok(next.run(req).await)
-        }
-    }));
+                    let last_event_id = headers
+                        .get("last-event-id")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<i64>().ok());
+                    sse_handler(st, rx, last_event_id).await.into_response()
+                }
+            }),
+        )
+        .layer(middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let limiter = sse_rate_limiter.clone();
+                async move {
+                    let key = rate_limit_key(&req);
+                    let allowed = {
+                        let mut limiter = limiter.lock().await;
+                        limiter.check(&key)
+                    };
+                    if !allowed {
+                        return Err(StatusCode::TOO_MANY_REQUESTS);
+                    }
+                    Ok(next.run(req).await)
+                }
+            },
+        ));
 
     let app = health_routes
         .merge(api_routes)
@@ -485,8 +551,12 @@ async fn main() {
                     // Faz 14-D: varsayılan localhost ikilisi + DCA_EXTRA_ORIGINS
                     // (virgülle ayrık) — Tunnel domain'i kod değişikliği olmadan eklenir.
                     let mut origins = vec![
-                        "http://localhost:3000".parse::<axum::http::HeaderValue>().unwrap(),
-                        "http://127.0.0.1:3000".parse::<axum::http::HeaderValue>().unwrap(),
+                        "http://localhost:3000"
+                            .parse::<axum::http::HeaderValue>()
+                            .unwrap(),
+                        "http://127.0.0.1:3000"
+                            .parse::<axum::http::HeaderValue>()
+                            .unwrap(),
                     ];
                     if let Ok(extra) = std::env::var("DCA_EXTRA_ORIGINS") {
                         for o in extra.split(',').map(str::trim).filter(|o| !o.is_empty()) {
@@ -497,12 +567,22 @@ async fn main() {
                     }
                     AllowOrigin::list(origins)
                 })
-                .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::PATCH, axum::http::Method::DELETE])
-                .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::AUTHORIZATION]),
+                .allow_methods([
+                    axum::http::Method::GET,
+                    axum::http::Method::POST,
+                    axum::http::Method::PATCH,
+                    axum::http::Method::DELETE,
+                ])
+                .allow_headers([
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::header::AUTHORIZATION,
+                ]),
         )
         .with_state(app_state.clone());
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3002").await.expect("bind 3002");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3002")
+        .await
+        .expect("bind 3002");
     tracing::info!("dca-core engine listening on :3002");
     // Faz 28 (P2-1): ConnectInfo servis eder — rate limiter gerçek istemci
     // IP'sini (XFF yoksa) okur.
@@ -510,9 +590,8 @@ async fn main() {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-        .with_graceful_shutdown(shutdown_signal(shutdown_tx.clone()))
-        .await
-        ;
+    .with_graceful_shutdown(shutdown_signal(shutdown_tx.clone()))
+    .await;
     if let Err(e) = &serve_result {
         tracing::error!("HTTP server stopped with an error: {e}");
         shutdown_tx.send_replace(true);
@@ -530,12 +609,16 @@ async fn main() {
         }
     }
     match app_state.db.conn.lock() {
-        Ok(conn) => match conn.query_row(
-            "PRAGMA wal_checkpoint(TRUNCATE)",
-            [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
-        ) {
-            Ok((busy, log_frames, checkpointed_frames)) if busy == 0 && checkpointed_frames >= log_frames => {
+        Ok(conn) => match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        }) {
+            Ok((busy, log_frames, checkpointed_frames))
+                if busy == 0 && checkpointed_frames >= log_frames =>
+            {
                 tracing::info!("[shutdown] Final WAL checkpoint completed ({checkpointed_frames}/{log_frames} frames).");
             }
             Ok((busy, log_frames, checkpointed_frames)) => {
@@ -569,7 +652,11 @@ async fn seed_pine_library(app: &Arc<AppState>) {
             Err(_) => return,
         };
         let exists: i64 = conn
-            .query_row("SELECT COUNT(*) FROM pine_scripts WHERE name=?1", [name], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM pine_scripts WHERE name=?1",
+                [name],
+                |r| r.get(0),
+            )
             .unwrap_or(0);
         if exists == 0 {
             // pine_scripts.id TEXT PRIMARY KEY — id'siz satır NULL-PK olur ve
@@ -597,8 +684,12 @@ async fn shutdown_signal(shutdown_tx: tokio::sync::watch::Sender<bool>) {
     #[cfg(unix)]
     let terminate = async {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut s) => { s.recv().await; }
-            Err(_) => { std::future::pending::<()>().await; }
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => {
+                std::future::pending::<()>().await;
+            }
         }
     };
 
@@ -620,7 +711,11 @@ async fn prometheus_metrics(State(app): State<Arc<AppState>>) -> impl IntoRespon
     let now = state::now_ms();
     let uptime_sec = (now - started).max(0) / 1000;
     let last_tick = app.last_tick_at.lock().map(|g| *g).unwrap_or(0);
-    let tick_age_sec = if last_tick > 0 { (now - last_tick).max(0) / 1000 } else { 0 };
+    let tick_age_sec = if last_tick > 0 {
+        (now - last_tick).max(0) / 1000
+    } else {
+        0
+    };
 
     let (bot_count, running_count, stopped_count, active_deals) = {
         let runtimes = app.runtimes.lock().await;
@@ -628,8 +723,14 @@ async fn prometheus_metrics(State(app): State<Arc<AppState>>) -> impl IntoRespon
         let mut stopped = 0;
         let mut deals = 0;
         for (_, rt) in runtimes.iter() {
-            if rt.status == "RUNNING" { running += 1; } else { stopped += 1; }
-            if !rt.stepper.position.qty.is_zero() || !rt.live_open_orders.is_empty() { deals += 1; }
+            if rt.status == "RUNNING" {
+                running += 1;
+            } else {
+                stopped += 1;
+            }
+            if !rt.stepper.position.qty.is_zero() || !rt.live_open_orders.is_empty() {
+                deals += 1;
+            }
         }
         (runtimes.len(), running, stopped, deals)
     };
@@ -668,7 +769,10 @@ dcabot_db_size_bytes {db_size}\n"
     );
 
     (
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         body,
     )
 }
@@ -697,7 +801,8 @@ async fn notifications_test(State(app): State<Arc<AppState>>) -> Json<Value> {
         data: json!({
             "message": "DCABOT Terminal Bildirim Testi — Sistem başarıyla bağlandı.",
             "ts": state::now_ms()
-        }).to_string(),
+        })
+        .to_string(),
     });
     Json(json!({
         "success": true,
@@ -714,7 +819,16 @@ async fn notifications_test(State(app): State<Arc<AppState>>) -> Json<Value> {
 ///   • Outgoing webhook : NOTIFY_WEBHOOK_URL  ({event, data, ts} JSON POST)
 ///   • E-posta (SMTP)   : NOTIFY_SMTP_HOST + NOTIFY_SMTP_TO (+USER/PASS/FROM)
 /// Hiçbiri set değilse abone olunmaz — tamamen opsiyonel.
-const NOTIFY_EVENTS: &[&str] = &["FILL", "LIQUIDATION", "RISK", "WEBHOOK_START", "KILL_SWITCH", "FREEZE", "BOT_STATE", "TEST"];
+const NOTIFY_EVENTS: &[&str] = &[
+    "FILL",
+    "LIQUIDATION",
+    "RISK",
+    "WEBHOOK_START",
+    "KILL_SWITCH",
+    "FREEZE",
+    "BOT_STATE",
+    "TEST",
+];
 
 struct NotifyCfg {
     telegram: Option<(String, String)>,
@@ -732,8 +846,13 @@ struct SmtpCfg {
 }
 
 fn notify_cfg() -> Option<NotifyCfg> {
-    let telegram = match (std::env::var("TELEGRAM_BOT_TOKEN"), std::env::var("TELEGRAM_CHAT_ID")) {
-        (Ok(t), Ok(c)) if !t.trim().is_empty() && !c.trim().is_empty() => Some((t.trim().to_string(), c.trim().to_string())),
+    let telegram = match (
+        std::env::var("TELEGRAM_BOT_TOKEN"),
+        std::env::var("TELEGRAM_CHAT_ID"),
+    ) {
+        (Ok(t), Ok(c)) if !t.trim().is_empty() && !c.trim().is_empty() => {
+            Some((t.trim().to_string(), c.trim().to_string()))
+        }
         _ => None,
     };
     let webhook = std::env::var("NOTIFY_WEBHOOK_URL")
@@ -746,7 +865,9 @@ fn notify_cfg() -> Option<NotifyCfg> {
         std::env::var("NOTIFY_SMTP_USER"),
         std::env::var("NOTIFY_SMTP_PASS"),
     ) {
-        (Ok(h), Ok(to), Ok(u), Ok(p)) if !h.trim().is_empty() && !to.trim().is_empty() && !u.trim().is_empty() => {
+        (Ok(h), Ok(to), Ok(u), Ok(p))
+            if !h.trim().is_empty() && !to.trim().is_empty() && !u.trim().is_empty() =>
+        {
             Some(SmtpCfg {
                 host: h.trim().to_string(),
                 user: u.trim().to_string(),
@@ -763,7 +884,11 @@ fn notify_cfg() -> Option<NotifyCfg> {
     if telegram.is_none() && webhook.is_none() && smtp.is_none() {
         return None;
     }
-    Some(NotifyCfg { telegram, webhook, smtp })
+    Some(NotifyCfg {
+        telegram,
+        webhook,
+        smtp,
+    })
 }
 
 fn spawn_notifiers(app: &Arc<AppState>) {
@@ -788,7 +913,11 @@ fn spawn_notifiers(app: &Arc<AppState>) {
                     }
                     let payload = serde_json::json!({ "event": ev.event, "data": ev.data, "ts": state::now_ms() });
                     if let Some((token, chat)) = &cfg.telegram {
-                        let text = format!("*DCABOT {}*\n{}", ev.event, ev.data.chars().take(3600).collect::<String>());
+                        let text = format!(
+                            "*DCABOT {}*\n{}",
+                            ev.event,
+                            ev.data.chars().take(3600).collect::<String>()
+                        );
                         let url = format!("https://api.telegram.org/bot{token}/sendMessage");
                         let body = serde_json::json!({
                             "chat_id": chat,
@@ -808,7 +937,13 @@ fn spawn_notifiers(app: &Arc<AppState>) {
                     if let Some(sm) = &cfg.smtp {
                         let subject = format!("[DCABOT] {}", ev.event);
                         let body = serde_json::to_string_pretty(&payload).unwrap_or_default();
-                        let sm = SmtpCfg { host: sm.host.clone(), user: sm.user.clone(), pass: sm.pass.clone(), from: sm.from.clone(), to: sm.to.clone() };
+                        let sm = SmtpCfg {
+                            host: sm.host.clone(),
+                            user: sm.user.clone(),
+                            pass: sm.pass.clone(),
+                            from: sm.from.clone(),
+                            to: sm.to.clone(),
+                        };
                         let host = sm.host.clone();
                         let _ = tokio::task::spawn_blocking(move || {
                             use lettre::Transport;
@@ -867,22 +1002,42 @@ struct GridSuggestQuery {
     levels: usize,
 }
 
-fn default_gs_bars() -> usize { 500 }
-fn default_gs_investment() -> String { "1000".into() }
-fn default_gs_levels() -> usize { 16 }
+fn default_gs_bars() -> usize {
+    500
+}
+fn default_gs_investment() -> String {
+    "1000".into()
+}
+fn default_gs_levels() -> usize {
+    16
+}
 
-async fn analysis_grid_suggest(State(app): State<Arc<AppState>>, Query(q): Query<GridSuggestQuery>) -> Result<Json<Value>, axum::response::Response> {
+async fn analysis_grid_suggest(
+    State(app): State<Arc<AppState>>,
+    Query(q): Query<GridSuggestQuery>,
+) -> Result<Json<Value>, axum::response::Response> {
     let symbol = normalize_pair(&q.symbol);
     let iv = engine::bybit_interval(&q.interval).map_err(err422)?;
     let bars_req = q.bars.clamp(100, 1000);
     let venue = q.venue.unwrap_or_else(|| "BYBIT".into()).to_uppercase();
-    let adapter = app.adapter(&venue).ok_or_else(|| err422("venue desteklenmiyor"))?;
-    let kl = adapter.klines("linear", &symbol, &iv, bars_req).await.map_err(err422)?;
+    let adapter = app
+        .adapter(&venue)
+        .ok_or_else(|| err422("venue desteklenmiyor"))?;
+    let kl = adapter
+        .klines("linear", &symbol, &iv, bars_req)
+        .await
+        .map_err(err422)?;
     if kl.len() < 60 {
         return Err(err422(format!("yetersiz bar: {} (min 60)", kl.len())));
     }
-    let closes: Vec<f64> = kl.iter().filter_map(|k| k.c.parse::<f64>().ok()).filter(|c| *c > 0.0).collect();
-    let (lo, hi) = closes.iter().fold((f64::MAX, f64::MIN), |(a, b), c| (a.min(*c), b.max(*c)));
+    let closes: Vec<f64> = kl
+        .iter()
+        .filter_map(|k| k.c.parse::<f64>().ok())
+        .filter(|c| *c > 0.0)
+        .collect();
+    let (lo, hi) = closes
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(a, b), c| (a.min(*c), b.max(*c)));
     // Volatilite: bar-başı log-return sigma (kalibrasyonla aynı yöntem)
     let rets: Vec<f64> = closes.windows(2).map(|w| (w[1] / w[0]).ln()).collect();
     let n = rets.len() as f64;
@@ -891,7 +1046,11 @@ async fn analysis_grid_suggest(State(app): State<Arc<AppState>>, Query(q): Query
     // Seviye sayısı: sigma×√bar penceresinin %75'i adım başına → seviye = pencere/adım
     let span = hi / lo;
     let steps_target = ((span.ln() / (0.75 * sigma)).exp()).clamp(8.0, 48.0);
-    let levels = if q.levels >= 8 { q.levels as f64 } else { steps_target };
+    let levels = if q.levels >= 8 {
+        q.levels as f64
+    } else {
+        steps_target
+    };
     let investment = Fraction::from_decimal_str(&q.investment).map_err(err422)?;
     if !investment.is_positive() {
         return Err(err422("investment > 0 olmalı"));
@@ -903,10 +1062,22 @@ async fn analysis_grid_suggest(State(app): State<Arc<AppState>>, Query(q): Query
     // Ücret-kırıcı: g_min ≈ (f_b+f_s)/(1−f_s); spot varsayılan %0.10/%0.10
     let g_min = (0.001 + 0.001) / (1.0 - 0.001);
     let breaker_ok = step_pct > g_min;
-    let per_level = investment.div(&Fraction::from_u64(levels as u64)).map_err(err422)?;
-    let inst = adapter.instruments("linear", Some(&symbol)).await.ok().and_then(|l| l.into_iter().next());
-    let step_size = inst.as_ref().map(|i| i.step_size.to_half_even_display(8)).unwrap_or_else(|| "0.001".into());
-    let tick_size = inst.as_ref().map(|i| i.tick_size.to_half_even_display(8)).unwrap_or_else(|| "0.1".into());
+    let per_level = investment
+        .div(&Fraction::from_u64(levels as u64))
+        .map_err(err422)?;
+    let inst = adapter
+        .instruments("linear", Some(&symbol))
+        .await
+        .ok()
+        .and_then(|l| l.into_iter().next());
+    let step_size = inst
+        .as_ref()
+        .map(|i| i.step_size.to_half_even_display(8))
+        .unwrap_or_else(|| "0.001".into());
+    let tick_size = inst
+        .as_ref()
+        .map(|i| i.tick_size.to_half_even_display(8))
+        .unwrap_or_else(|| "0.1".into());
     Ok(Json(json!({
         "symbol": symbol,
         "interval": q.interval,
@@ -926,7 +1097,17 @@ async fn analysis_grid_suggest(State(app): State<Arc<AppState>>, Query(q): Query
 }
 
 async fn restore_bots(app: &Arc<AppState>) {
-    let rows: Vec<(String, String, String, String, String, String, String, Option<String>, Option<String>)> = {
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    )> = {
         let conn = match app.db.conn.lock() {
             Ok(c) => c,
             Err(_) => return,
@@ -957,7 +1138,12 @@ async fn restore_bots(app: &Arc<AppState>) {
     };
     let ambiguous_live_markets = duplicate_live_markets(rows.iter().map(
         |(_, _, _, venue, mode, symbol, status, _, _)| {
-            (venue.as_str(), mode.as_str(), symbol.as_str(), status.as_str())
+            (
+                venue.as_str(),
+                mode.as_str(),
+                symbol.as_str(),
+                status.as_str(),
+            )
         },
     ));
 
@@ -965,10 +1151,12 @@ async fn restore_bots(app: &Arc<AppState>) {
         let ambiguous_live_market = mode.eq_ignore_ascii_case("LIVE")
             && ambiguous_live_markets.contains(&normalized_live_market(&venue, &symbol));
         let (cfg_json,): (String,) = match app.db.conn.lock() {
-            Ok(conn) => match conn.query_row("SELECT config FROM bots WHERE id=?1", [&id], |r| r.get(0)) {
-                Ok(v) => (v,),
-                Err(_) => continue,
-            },
+            Ok(conn) => {
+                match conn.query_row("SELECT config FROM bots WHERE id=?1", [&id], |r| r.get(0)) {
+                    Ok(v) => (v,),
+                    Err(_) => continue,
+                }
+            }
             Err(_) => continue,
         };
         let cfg: BotConfig = match serde_json::from_str(&cfg_json) {
@@ -993,13 +1181,28 @@ async fn restore_bots(app: &Arc<AppState>) {
                 // dal yapısı korundu; ileride tekrar kilit gerekirse buraya.
             } else if venue.to_uppercase() != "BYBIT" && venue.to_uppercase() != "OKX" {
                 effective_mode = "PAPER".into();
-                state::persist_event(app, &id, "WARN", "RESTORE", &format!("{venue} LIVE kanalı desteklenmiyor — bot PAPER modunda restore edildi")).await;
+                state::persist_event(
+                    app,
+                    &id,
+                    "WARN",
+                    "RESTORE",
+                    &format!(
+                        "{venue} LIVE kanalı desteklenmiyor — bot PAPER modunda restore edildi"
+                    ),
+                )
+                .await;
             } else {
                 match store::load_active_key(&app.db, &app.vault, &venue.to_uppercase()) {
                     Ok(Some(creds)) => {
                         // P4-3: OKX passphrase'siz LIVE'a kalkamaz (imza eksik
                         // kalır, ilk poll'da hata verirdi — restore'da dürüst düşür).
-                        if venue.to_uppercase() == "OKX" && creds.passphrase.as_deref().map(|p| p.trim().is_empty()).unwrap_or(true) {
+                        if venue.to_uppercase() == "OKX"
+                            && creds
+                                .passphrase
+                                .as_deref()
+                                .map(|p| p.trim().is_empty())
+                                .unwrap_or(true)
+                        {
                             effective_mode = "PAPER".into();
                             state::persist_event(app, &id, "WARN", "RESTORE", "OKX passphrase yok — bot PAPER moduna düşürüldü (anahtarı passphrase ile yeniden ekleyin)").await;
                         } else {
@@ -1012,13 +1215,37 @@ async fn restore_bots(app: &Arc<AppState>) {
                     }
                     Err(e) => {
                         effective_mode = "PAPER".into();
-                        state::persist_event(app, &id, "WARN", "RESTORE", &format!("LIVE anahtarı çözülemedi ({e}) — bot PAPER moduna düşürüldü")).await;
+                        state::persist_event(
+                            app,
+                            &id,
+                            "WARN",
+                            "RESTORE",
+                            &format!("LIVE anahtarı çözülemedi ({e}) — bot PAPER moduna düşürüldü"),
+                        )
+                        .await;
                     }
                 }
             }
         }
-        let restored_status = if ambiguous_live_market && effective_mode == "LIVE" { "FROZEN" } else { &status };
-        if let Err(e) = state::create_runtime(app, &id, &name, &effective_mode, &venue, restored_status, cfg, &interval, start_cash, credentials).await {
+        let restored_status = if ambiguous_live_market && effective_mode == "LIVE" {
+            "FROZEN"
+        } else {
+            &status
+        };
+        if let Err(e) = state::create_runtime(
+            app,
+            &id,
+            &name,
+            &effective_mode,
+            &venue,
+            restored_status,
+            cfg,
+            &interval,
+            start_cash,
+            credentials,
+        )
+        .await
+        {
             tracing::warn!("restore bot {id} failed: {e}");
         } else if ambiguous_live_market && effective_mode == "LIVE" {
             state::persist_status(app, &id, "FROZEN");
@@ -1040,13 +1267,22 @@ async fn restore_bots(app: &Arc<AppState>) {
 /// BOT-03: restore edilen RUNNING/PAUSED/FROZEN botları venue ile uzlaştır:
 /// açık pozisyonu stepper'a, açık emirleri live_open_orders'a yükler.
 /// Uzlaştırma bitmeden yeni deal açılmaz (durum RECONCILING).
-fn restored_order_semantics(bot_id: &str, order_id: &str) -> Option<(&'static str, dca_kernel::OrderKind)> {
+fn restored_order_semantics(
+    bot_id: &str,
+    order_id: &str,
+) -> Option<(&'static str, dca_kernel::OrderKind)> {
     let prefix = format!("{bot_id}-");
     let suffix = order_id.strip_prefix(&prefix)?;
     let role = if suffix.contains("-GRID_CLOSE-") {
         ("GRID_CLOSE", dca_kernel::OrderKind::Reduce)
     } else if suffix.contains("-TPL-") || suffix.contains("-SL-") || suffix.contains("-MANUAL-") {
-        let role = if suffix.contains("-TPL-") { "TP" } else if suffix.contains("-SL-") { "SL" } else { "MANUAL" };
+        let role = if suffix.contains("-TPL-") {
+            "TP"
+        } else if suffix.contains("-SL-") {
+            "SL"
+        } else {
+            "MANUAL"
+        };
         (role, dca_kernel::OrderKind::Reduce)
     } else if suffix.contains("-TRAIL-") || suffix.contains("-INF-") {
         ("TP", dca_kernel::OrderKind::Reduce)
@@ -1062,10 +1298,18 @@ fn restored_order_semantics(bot_id: &str, order_id: &str) -> Option<(&'static st
     Some(role)
 }
 
-async fn reconcile_restored_bots(app: &Arc<AppState>, ambiguous_live_markets: &HashSet<(String, String)>) {
+async fn reconcile_restored_bots(
+    app: &Arc<AppState>,
+    ambiguous_live_markets: &HashSet<(String, String)>,
+) {
     let bot_ids: Vec<String> = {
         let rts = app.runtimes.lock().await;
-        rts.iter().filter(|(_, rt)| rt.status == "RUNNING" || rt.status == "PAUSED" || rt.status == "FROZEN").map(|(id, _)| id.clone()).collect()
+        rts.iter()
+            .filter(|(_, rt)| {
+                rt.status == "RUNNING" || rt.status == "PAUSED" || rt.status == "FROZEN"
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
     };
     for id in bot_ids {
         let (creds_opt, venue, mode, symbol, is_futures) = {
@@ -1092,10 +1336,19 @@ async fn reconcile_restored_bots(app: &Arc<AppState>, ambiguous_live_markets: &H
             continue;
         }
         let Some(creds) = creds_opt else {
-            state::persist_event(app, &id, "WARN", "RESTORE", "LIVE anahtarı yok — yeniden başlatma pozisyonu geri yüklenemedi").await;
+            state::persist_event(
+                app,
+                &id,
+                "WARN",
+                "RESTORE",
+                "LIVE anahtarı yok — yeniden başlatma pozisyonu geri yüklenemedi",
+            )
+            .await;
             continue;
         };
-        let Some(adapter) = app.adapter(&venue) else { continue };
+        let Some(adapter) = app.adapter(&venue) else {
+            continue;
+        };
         let category = if is_futures { "linear" } else { "spot" };
         // Açık pozisyonu geri yükle.
         match adapter.positions(&creds, &symbol).await {
@@ -1109,15 +1362,39 @@ async fn reconcile_restored_bots(app: &Arc<AppState>, ambiguous_live_markets: &H
                         if let Some(rt_mut) = rts.get_mut(&id) {
                             rt_mut.stepper.position.qty = qty.clone();
                             rt_mut.stepper.position.avg_price = Some(avg.clone());
-                            rt_mut.stepper.position.cost = qty.mul(&avg).unwrap_or_else(|_| Fraction::zero());
-                            rt_mut.stepper.position.direction = if pos.side.eq_ignore_ascii_case("Sell") { -1 } else { 1 };
+                            rt_mut.stepper.position.cost =
+                                qty.mul(&avg).unwrap_or_else(|_| Fraction::zero());
+                            rt_mut.stepper.position.direction =
+                                if pos.side.eq_ignore_ascii_case("Sell") {
+                                    -1
+                                } else {
+                                    1
+                                };
                         }
                     }
-                    state::persist_event(app, &id, "INFO", "RESTORE", &format!("açık pozisyon geri yüklendi: {} @ {}", qty.to_half_even_display(8), avg.to_half_even_display(8))).await;
+                    state::persist_event(
+                        app,
+                        &id,
+                        "INFO",
+                        "RESTORE",
+                        &format!(
+                            "açık pozisyon geri yüklendi: {} @ {}",
+                            qty.to_half_even_display(8),
+                            avg.to_half_even_display(8)
+                        ),
+                    )
+                    .await;
                 }
             }
             Err(e) => {
-                state::persist_event(app, &id, "WARN", "RESTORE", &format!("pozisyon uzlaştırma hatası: {e}")).await;
+                state::persist_event(
+                    app,
+                    &id,
+                    "WARN",
+                    "RESTORE",
+                    &format!("pozisyon uzlaştırma hatası: {e}"),
+                )
+                .await;
             }
         }
         // Faz 3 (H-3): kalıcı emir takip kayıtları (PENDING/PARTIAL) önce —
@@ -1159,7 +1436,9 @@ async fn reconcile_restored_bots(app: &Arc<AppState>, ambiguous_live_markets: &H
                     };
                     let already = {
                         let rts = app.runtimes.lock().await;
-                        rts.get(&id).map(|rt| rt.live_open_orders.iter().any(|t| t.id == o.order_link_id)).unwrap_or(false)
+                        rts.get(&id)
+                            .map(|rt| rt.live_open_orders.iter().any(|t| t.id == o.order_link_id))
+                            .unwrap_or(false)
                     };
                     if !already {
                         {
@@ -1167,7 +1446,10 @@ async fn reconcile_restored_bots(app: &Arc<AppState>, ambiguous_live_markets: &H
                             if let Some(rt_mut) = rts.get_mut(&id) {
                                 rt_mut.live_open_orders.push(state::LiveTrackedOrder {
                                     id: o.order_link_id.clone(),
-                                    side: match o.side.as_str() { "Sell" => dca_math::Side::Sell, _ => dca_math::Side::Buy },
+                                    side: match o.side.as_str() {
+                                        "Sell" => dca_math::Side::Sell,
+                                        _ => dca_math::Side::Buy,
+                                    },
                                     kind,
                                     price: o.price.clone().unwrap_or_else(Fraction::zero),
                                     qty: o.qty.clone(),
@@ -1179,11 +1461,25 @@ async fn reconcile_restored_bots(app: &Arc<AppState>, ambiguous_live_markets: &H
                     }
                 }
                 if added > 0 {
-                    state::persist_event(app, &id, "INFO", "RESTORE", &format!("{} açık emir geri yüklendi", added)).await;
+                    state::persist_event(
+                        app,
+                        &id,
+                        "INFO",
+                        "RESTORE",
+                        &format!("{} açık emir geri yüklendi", added),
+                    )
+                    .await;
                 }
             }
             Err(e) => {
-                state::persist_event(app, &id, "WARN", "RESTORE", &format!("açık emir uzlaştırma hatası: {e}")).await;
+                state::persist_event(
+                    app,
+                    &id,
+                    "WARN",
+                    "RESTORE",
+                    &format!("açık emir uzlaştırma hatası: {e}"),
+                )
+                .await;
             }
         }
     }
@@ -1199,7 +1495,10 @@ pub fn constant_time_eq_str(provided: &str, expected: &str) -> bool {
     }
     let h1 = Sha256::digest(provided.as_bytes());
     let h2 = Sha256::digest(expected.as_bytes());
-    h1.iter().zip(h2.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    h1.iter()
+        .zip(h2.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 /// SEC-01: API key auth middleware — `Authorization: Bearer <DCA_API_KEY>`.
@@ -1232,12 +1531,19 @@ async fn health(State(app): State<Arc<AppState>>) -> Json<Value> {
         .db
         .conn
         .lock()
-        .map(|c| c.query_row::<i64, _, _>("SELECT 1", [], |r| r.get(0)).unwrap_or(0) == 1)
+        .map(|c| {
+            c.query_row::<i64, _, _>("SELECT 1", [], |r| r.get(0))
+                .unwrap_or(0)
+                == 1
+        })
         .unwrap_or(false);
     let (active_bots, total_bots) = {
         let rts = app.runtimes.lock().await;
         let total = rts.len();
-        let active = rts.values().filter(|r| matches!(r.status.as_str(), "RUNNING" | "FROZEN")).count();
+        let active = rts
+            .values()
+            .filter(|r| matches!(r.status.as_str(), "RUNNING" | "FROZEN"))
+            .count();
         (active, total)
     };
     let last_tick_ms = *app.last_tick_at.lock().unwrap_or_else(|e| e.into_inner());
@@ -1283,9 +1589,7 @@ async fn equity_curve(
             .into_response()
     })?;
     let mut stmt = conn
-        .prepare(
-            "SELECT ts, equity FROM equity_points WHERE ts >= ?1 ORDER BY ts ASC",
-        )
+        .prepare("SELECT ts, equity FROM equity_points WHERE ts >= ?1 ORDER BY ts ASC")
         .map_err(|e| {
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -1294,7 +1598,9 @@ async fn equity_curve(
                 .into_response()
         })?;
     let rows = stmt
-        .query_map([since_ms], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .query_map([since_ms], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })
         .map_err(|e| {
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -1324,13 +1630,17 @@ async fn equity_curve(
     let total = raw.len();
     if total > 720 {
         let step = total as f64 / 720.0;
-        raw = (0..720).map(|i| raw[((i as f64) * step) as usize]).collect();
+        raw = (0..720)
+            .map(|i| raw[((i as f64) * step) as usize])
+            .collect();
     }
     let points: Vec<serde_json::Value> = raw
         .iter()
         .map(|(t, v)| serde_json::json!({"ts": t, "equity": (v * 100.0).round() / 100.0}))
         .collect();
-    Ok(Json(serde_json::json!({"days": days, "points": points, "total": total})))
+    Ok(Json(
+        serde_json::json!({"days": days, "points": points, "total": total}),
+    ))
 }
 
 async fn summary(State(app): State<Arc<AppState>>) -> Json<Value> {
@@ -1348,7 +1658,9 @@ async fn summary(State(app): State<Arc<AppState>>) -> Json<Value> {
 }
 
 /// Cache-anlık görüntülerinden özet agregasyonu (frontend sözleşmesi aynen).
-fn summarize_from_cache(cache: &std::collections::HashMap<String, serde_json::Value>) -> serde_json::Value {
+fn summarize_from_cache(
+    cache: &std::collections::HashMap<String, serde_json::Value>,
+) -> serde_json::Value {
     use dca_math::fraction::Fraction;
     let mut total_equity = Fraction::zero();
     let mut total_unreal = Fraction::zero();
@@ -1360,7 +1672,11 @@ fn summarize_from_cache(cache: &std::collections::HashMap<String, serde_json::Va
     let mut long_exp = Fraction::zero();
     let mut short_exp = Fraction::zero();
     let mut alloc: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-    let fr = |v: &serde_json::Value| -> Fraction { v.as_str().and_then(|s| Fraction::from_any_str(s).ok()).unwrap_or_else(Fraction::zero) };
+    let fr = |v: &serde_json::Value| -> Fraction {
+        v.as_str()
+            .and_then(|s| Fraction::from_any_str(s).ok())
+            .unwrap_or_else(Fraction::zero)
+    };
     for v in cache.values() {
         let status = v["status"].as_str().unwrap_or("");
         if matches!(status, "RUNNING" | "FROZEN") {
@@ -1369,18 +1685,33 @@ fn summarize_from_cache(cache: &std::collections::HashMap<String, serde_json::Va
         if v["stats"]["deal_id"].is_string() {
             active_deals += 1;
         }
-        total_equity = total_equity.add(&fr(&v["equityNow"])).unwrap_or_else(|_| total_equity.clone());
-        total_unreal = total_unreal.add(&fr(&v["unrealizedNow"])).unwrap_or_else(|_| total_unreal.clone());
-        total_realized = total_realized.add(&fr(&v["stats"]["realized_gross"])).unwrap_or_else(|_| total_realized.clone());
-        total_fees = total_fees.add(&fr(&v["cumulativeFees"])).unwrap_or_else(|_| total_fees.clone());
-        total_funding = total_funding.add(&fr(&v["cumulativeFunding"])).unwrap_or_else(|_| total_funding.clone());
+        total_equity = total_equity
+            .add(&fr(&v["equityNow"]))
+            .unwrap_or_else(|_| total_equity.clone());
+        total_unreal = total_unreal
+            .add(&fr(&v["unrealizedNow"]))
+            .unwrap_or_else(|_| total_unreal.clone());
+        total_realized = total_realized
+            .add(&fr(&v["stats"]["realized_gross"]))
+            .unwrap_or_else(|_| total_realized.clone());
+        total_fees = total_fees
+            .add(&fr(&v["cumulativeFees"]))
+            .unwrap_or_else(|_| total_fees.clone());
+        total_funding = total_funding
+            .add(&fr(&v["cumulativeFunding"]))
+            .unwrap_or_else(|_| total_funding.clone());
         let qty = fr(&v["stats"]["position_qty"]);
         let avg = fr(&v["stats"]["avg_price"]);
         let notional = qty.mul(&avg).unwrap_or_else(|_| Fraction::zero());
         if !notional.is_zero() {
-            let short_dir = v["kind"].as_str().map(|k| k.contains("SHORT") || k.contains("HEDGE")).unwrap_or(false);
+            let short_dir = v["kind"]
+                .as_str()
+                .map(|k| k.contains("SHORT") || k.contains("HEDGE"))
+                .unwrap_or(false);
             if short_dir {
-                short_exp = short_exp.add(&notional).unwrap_or_else(|_| short_exp.clone());
+                short_exp = short_exp
+                    .add(&notional)
+                    .unwrap_or_else(|_| short_exp.clone());
             } else {
                 long_exp = long_exp.add(&notional).unwrap_or_else(|_| long_exp.clone());
             }
@@ -1389,7 +1720,10 @@ fn summarize_from_cache(cache: &std::collections::HashMap<String, serde_json::Va
         }
         // hedge short bacağı
         if let Some(leg) = v["stats"]["hedge"]["hedge_leg"].as_object() {
-            let lq = leg.get("position_qty").map(fr).unwrap_or_else(Fraction::zero);
+            let lq = leg
+                .get("position_qty")
+                .map(fr)
+                .unwrap_or_else(Fraction::zero);
             if let Some(a) = leg.get("avg_price") {
                 let la = fr(a);
                 let ln = lq.mul(&la).unwrap_or_else(|_| Fraction::zero());
@@ -1453,13 +1787,22 @@ async fn summarize_locked(State(app): State<Arc<AppState>>) -> Json<Value> {
         if let Some(avg) = snap.avg_price.and_then(|a| Fraction::from_any_str(&a).ok()) {
             let notional = qty.mul(&avg).unwrap_or_else(|_| Fraction::zero());
             if !notional.is_zero() {
-                let dir_sign: i32 = if matches!(rt.cfg.kind, StrategyKind::DcaShort) { -1 } else { 1 };
-                if dir_sign > 0 {
-                    long_exposure = long_exposure.add(&notional).unwrap_or_else(|_| long_exposure.clone());
+                let dir_sign: i32 = if matches!(rt.cfg.kind, StrategyKind::DcaShort) {
+                    -1
                 } else {
-                    short_exposure = short_exposure.add(&notional).unwrap_or_else(|_| short_exposure.clone());
+                    1
+                };
+                if dir_sign > 0 {
+                    long_exposure = long_exposure
+                        .add(&notional)
+                        .unwrap_or_else(|_| long_exposure.clone());
+                } else {
+                    short_exposure = short_exposure
+                        .add(&notional)
+                        .unwrap_or_else(|_| short_exposure.clone());
                 }
-                *allocation.entry(rt.cfg.symbol.clone()).or_insert(0.0) += notional.to_f64_display();
+                *allocation.entry(rt.cfg.symbol.clone()).or_insert(0.0) +=
+                    notional.to_f64_display();
             }
         }
         // Task 21 — hedge botların kısa bacağı artık görünüyor: eski davranışta
@@ -1468,11 +1811,15 @@ async fn summarize_locked(State(app): State<Arc<AppState>>) -> Json<Value> {
             if let Some(leg) = &h.hedge_leg {
                 if let (Ok(lq), Some(lavg)) = (
                     Fraction::from_any_str(&leg.position_qty),
-                    leg.avg_price.as_ref().and_then(|a| Fraction::from_any_str(a).ok()),
+                    leg.avg_price
+                        .as_ref()
+                        .and_then(|a| Fraction::from_any_str(a).ok()),
                 ) {
                     let lnotional = lq.mul(&lavg).unwrap_or_else(|_| Fraction::zero());
                     if !lnotional.is_zero() {
-                        short_exposure = short_exposure.add(&lnotional).unwrap_or_else(|_| short_exposure.clone());
+                        short_exposure = short_exposure
+                            .add(&lnotional)
+                            .unwrap_or_else(|_| short_exposure.clone());
                     }
                 }
             }
@@ -1488,19 +1835,40 @@ async fn summarize_locked(State(app): State<Arc<AppState>>) -> Json<Value> {
             .unwrap_or_else(|_| total_funding.clone());
         // Real equity = cash + committed IM + unrealized PnL at the last mark
         // (SimulationStepper::equity — margin-aware; zero-float throughout).
-        match rt.stepper.last_close.as_deref().and_then(|s| Fraction::from_any_str(s).ok()) {
+        match rt
+            .stepper
+            .last_close
+            .as_deref()
+            .and_then(|s| Fraction::from_any_str(s).ok())
+        {
             Some(mark) => {
                 equity_total = rt
                     .stepper
                     .equity(&mark)
-                    .map(|eq| equity_total.add(&eq).unwrap_or_else(|_| equity_total.clone()))
-                    .unwrap_or_else(|_| equity_total.add(&rt.stepper.cash).unwrap_or_else(|_| equity_total.clone()));
-                let upnl = rt.stepper.position.unrealized_gross(&mark).unwrap_or_else(|_| Fraction::zero());
-                total_unrealized = total_unrealized.add(&upnl).unwrap_or_else(|_| total_unrealized.clone());
+                    .map(|eq| {
+                        equity_total
+                            .add(&eq)
+                            .unwrap_or_else(|_| equity_total.clone())
+                    })
+                    .unwrap_or_else(|_| {
+                        equity_total
+                            .add(&rt.stepper.cash)
+                            .unwrap_or_else(|_| equity_total.clone())
+                    });
+                let upnl = rt
+                    .stepper
+                    .position
+                    .unrealized_gross(&mark)
+                    .unwrap_or_else(|_| Fraction::zero());
+                total_unrealized = total_unrealized
+                    .add(&upnl)
+                    .unwrap_or_else(|_| total_unrealized.clone());
             }
             None => {
                 // No mark yet (no bar processed): fall back to legacy cash sum.
-                equity_total = equity_total.add(&rt.stepper.cash).unwrap_or_else(|_| equity_total.clone());
+                equity_total = equity_total
+                    .add(&rt.stepper.cash)
+                    .unwrap_or_else(|_| equity_total.clone());
             }
         }
     }
@@ -1540,7 +1908,12 @@ async fn list_bots(State(app): State<Arc<AppState>>) -> Json<Value> {
         let cache = app.ui_cache.lock().await;
         if !cache.is_empty() {
             let mut bots: Vec<Value> = cache.values().cloned().collect();
-            bots.sort_by(|a, b| a["id"].as_str().unwrap_or("").cmp(b["id"].as_str().unwrap_or("")));
+            bots.sort_by(|a, b| {
+                a["id"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(b["id"].as_str().unwrap_or(""))
+            });
             return Json(json!({ "bots": bots }));
         }
     }
@@ -1597,8 +1970,13 @@ fn default_start_cash() -> String {
 /// a silently-defaulted order size would place real orders with the wrong
 /// size. `allow_zero` is used for safety_order_size (0 = no safety orders).
 fn validate_cfg_positive(name: &str, raw: &str, allow_zero: bool) -> Result<(), String> {
-    let v = Fraction::from_decimal_str(raw).map_err(|e| format!("config.{name}: '{raw}' geçerli bir sayı değil ({e})"))?;
-    let ok = if allow_zero { !v.is_negative() } else { v > Fraction::zero() };
+    let v = Fraction::from_decimal_str(raw)
+        .map_err(|e| format!("config.{name}: '{raw}' geçerli bir sayı değil ({e})"))?;
+    let ok = if allow_zero {
+        !v.is_negative()
+    } else {
+        v > Fraction::zero()
+    };
     if !ok {
         let bound = if allow_zero { "≥ 0" } else { "> 0" };
         return Err(format!("config.{name}: '{raw}' {bound} olmalı"));
@@ -1606,8 +1984,14 @@ fn validate_cfg_positive(name: &str, raw: &str, allow_zero: bool) -> Result<(), 
     Ok(())
 }
 
-async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotReq>) -> Result<axum::response::Response, axum::response::Response> {
-    let kind = match parse_kind(&req.kind) { Ok(k) => k, Err(e) => return Err(err422(e)) };
+async fn create_bot(
+    State(app): State<Arc<AppState>>,
+    Json(req): Json<CreateBotReq>,
+) -> Result<axum::response::Response, axum::response::Response> {
+    let kind = match parse_kind(&req.kind) {
+        Ok(k) => k,
+        Err(e) => return Err(err422(e)),
+    };
     // Bar interval must be a real venue timeframe — a fake fallback would run
     // the bot on a timeframe it was never configured for.
     if let Err(e) = engine::validate_interval(&req.interval) {
@@ -1627,7 +2011,9 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
     {
         let pair = normalize_pair(&cfg.symbol);
         if !pair.is_empty() && is_blacklisted(&app, &pair) {
-            return Err(err422(format!("sembol kara listede: {pair} — Ayarlar > Kara Liste'den kaldırın")));
+            return Err(err422(format!(
+                "sembol kara listede: {pair} — Ayarlar > Kara Liste'den kaldırın"
+            )));
         }
     }
 
@@ -1655,7 +2041,11 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
     // Sessiz sahte emir yerine dürüst 422 — fail-closed felsefe.
     for (name, raw, min_excl) in [
         ("base_order_size", cfg.base_order_size.as_str(), None),
-        ("safety_order_size", cfg.safety_order_size.as_str(), Some(true)),
+        (
+            "safety_order_size",
+            cfg.safety_order_size.as_str(),
+            Some(true),
+        ),
         ("deviation_pct", cfg.deviation_pct.as_str(), None),
         ("step_scale", cfg.step_scale.as_str(), None),
         ("volume_scale", cfg.volume_scale.as_str(), None),
@@ -1703,16 +2093,25 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
     let inst_resolved = state::resolve_instrument(&cfg, &req.venue.to_uppercase(), &app).await;
     let mut stress_warning: Option<dca_kernel::risk_policy::AdvisoryWarning> = None;
     {
-        let gridish = matches!(kind, StrategyKind::SpotGrid | StrategyKind::FuturesGrid | StrategyKind::InfinityGrid);
+        let gridish = matches!(
+            kind,
+            StrategyKind::SpotGrid | StrategyKind::FuturesGrid | StrategyKind::InfinityGrid
+        );
         if !gridish {
             // validate_cfg_positive yukarıda parse edilebilirliği garanti etti.
-            let real_tick_ok = !inst_resolved.tick_size.is_zero() && inst_resolved.tick_size.is_positive();
-            let tick = if real_tick_ok { inst_resolved.tick_size.clone() } else { Fraction::from_decimal_str("0.01").unwrap() };
-            let step = if !inst_resolved.step_size.is_zero() && inst_resolved.step_size.is_positive() {
-                inst_resolved.step_size.clone()
+            let real_tick_ok =
+                !inst_resolved.tick_size.is_zero() && inst_resolved.tick_size.is_positive();
+            let tick = if real_tick_ok {
+                inst_resolved.tick_size.clone()
             } else {
-                Fraction::from_decimal_str("0.001").unwrap()
+                Fraction::from_decimal_str("0.01").unwrap()
             };
+            let step =
+                if !inst_resolved.step_size.is_zero() && inst_resolved.step_size.is_positive() {
+                    inst_resolved.step_size.clone()
+                } else {
+                    Fraction::from_decimal_str("0.001").unwrap()
+                };
             let anchor = Fraction::from_decimal_str("1000").unwrap();
             let base = Fraction::from_decimal_str(&cfg.base_order_size).unwrap();
             let safety = Fraction::from_decimal_str(&cfg.safety_order_size).unwrap();
@@ -1741,10 +2140,14 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
             // M03_STRESS_COLLATERAL uyarısı düşür (onay akışı: RISK_ACK -
             // gerekli; fiziksel sermaye kısıtı onaylansa bile GATE6
             // fiziksel değişmezdir — safetiler dolmaz).
-            let start_cash_frac = Fraction::from_decimal_str(&req.start_cash).unwrap_or_else(|_| Fraction::zero());
+            let start_cash_frac =
+                Fraction::from_decimal_str(&req.start_cash).unwrap_or_else(|_| Fraction::zero());
             let is_spot_cfg = !kind.is_futures();
             let anchor_real = match app.adapter(&req.venue.to_uppercase()) {
-                Some(a) => match a.ticker(if is_spot_cfg { "spot" } else { "linear" }, &req.symbol).await {
+                Some(a) => match a
+                    .ticker(if is_spot_cfg { "spot" } else { "linear" }, &req.symbol)
+                    .await
+                {
                     Ok(t) if t.last_price.is_positive() => Some(t.last_price),
                     _ => None,
                 },
@@ -1793,9 +2196,15 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
                             &pn.estimated_initial_margin,
                             &mm,
                             &shock,
-                            &pn.planned_gross_notional.mul(&extra).unwrap_or_else(|_| Fraction::zero()),
-                            &pn.planned_gross_notional.mul(&funding_buf).unwrap_or_else(|_| Fraction::zero()),
-                            &pn.planned_gross_notional.mul(&gap).unwrap_or_else(|_| Fraction::zero()),
+                            &pn.planned_gross_notional
+                                .mul(&extra)
+                                .unwrap_or_else(|_| Fraction::zero()),
+                            &pn.planned_gross_notional
+                                .mul(&funding_buf)
+                                .unwrap_or_else(|_| Fraction::zero()),
+                            &pn.planned_gross_notional
+                                .mul(&gap)
+                                .unwrap_or_else(|_| Fraction::zero()),
                             is_spot_cfg,
                         ) {
                             let available = match start_cash_frac.mul(&leverage) {
@@ -1803,7 +2212,8 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
                                 Err(_) => start_cash_frac.clone(),
                             };
                             if !required.is_zero()
-                                && dca_math::fraction::Fraction::cmp(&required, &available) == std::cmp::Ordering::Greater
+                                && dca_math::fraction::Fraction::cmp(&required, &available)
+                                    == std::cmp::Ordering::Greater
                             {
                                 stress_warning = Some(dca_kernel::risk_policy::AdvisoryWarning {
                                     code: "M03_STRESS_COLLATERAL".into(),
@@ -1836,7 +2246,9 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
     // (gerçek mesh + en dar segment + asimetrik ücret) — create 422 ile
     // runtime reddi farklı hüküm veremeyecek.
     if is_grid_kind && cfg.risk_policy.grid_fee_breaker == GuardAction::Enforce {
-        if let Some((per_level, g_min)) = dca_strategy::grid_fee_breaker_violation(&cfg, &inst_for_warnings) {
+        if let Some((per_level, g_min)) =
+            dca_strategy::grid_fee_breaker_violation(&cfg, &inst_for_warnings)
+        {
             return Err(err422(format!(
                 "fee-breaker: en dar mesh segmenti {} <= g_min {}; aralığı büyütün veya kademe sayısını düşürün",
                 per_level.to_half_even_display(6),
@@ -1861,7 +2273,9 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
         let expected_funding = Fraction::from_decimal_str("0.002").unwrap(); // koruyucu varsayım: tutma süresi içinde ~%0.2 funding
         if let (Ok(tp), Ok(rt_cost)) = (
             Fraction::from_decimal_str(&cfg.target_profit_pct),
-            entry_fee.add(exit_fee).and_then(|x| x.add(&expected_funding)),
+            entry_fee
+                .add(exit_fee)
+                .and_then(|x| x.add(&expected_funding)),
         ) {
             if dca_math::fraction::Fraction::cmp(&tp, &rt_cost) != std::cmp::Ordering::Greater {
                 warnings.push(dca_kernel::risk_policy::AdvisoryWarning {
@@ -1909,10 +2323,16 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
     let id = format!("b-{}", short_uuid.chars().take(8).collect::<String>());
     let mode = req.mode.to_uppercase();
     if !matches!(mode.as_str(), "PAPER" | "LIVE") {
-        return Err(err422(format!("geçersiz mode '{mode}' — geçerli değerler: PAPER | LIVE")));
+        return Err(err422(format!(
+            "geçersiz mode '{mode}' — geçerli değerler: PAPER | LIVE"
+        )));
     }
     let _live_ownership_guard = if mode == "LIVE" {
-        Some(lock_live_ownership(&app, "", &req.venue, &cfg.symbol).await.map_err(err422)?)
+        Some(
+            lock_live_ownership(&app, "", &req.venue, &cfg.symbol)
+                .await
+                .map_err(err422)?,
+        )
     } else {
         None
     };
@@ -1921,7 +2341,12 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
     // kurulumun G6'yı hiç test etmeden geçmesine yol açardı.
     let start_cash = match Fraction::from_decimal_str(&req.start_cash) {
         Ok(x) if x.is_positive() => x,
-        Ok(_) => return Err(err422(format!("start_cash 0'dan büyük olmalı (gelen: {})", req.start_cash))),
+        Ok(_) => {
+            return Err(err422(format!(
+                "start_cash 0'dan büyük olmalı (gelen: {})",
+                req.start_cash
+            )))
+        }
         Err(e) => return Err(err422(e)),
     };
 
@@ -1936,14 +2361,21 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
     // Hedge validation (M18): ratio in (0, 1], combined exit target > 0.
     // Task 21 — koruma tetikleyici (hedge_drawdown_trigger_pct) artık config'ten:
     // (0, 100] aralığında PERCENT olmalı ("6" = %6); hardcode dönemi kapandı.
-    if matches!(kind, StrategyKind::HedgeProtective | StrategyKind::HedgeDual) {
+    if matches!(
+        kind,
+        StrategyKind::HedgeProtective | StrategyKind::HedgeDual
+    ) {
         match Fraction::from_decimal_str(&cfg.hedge_ratio) {
             Ok(r) if r.is_positive() && r <= Fraction::one() => {}
             _ => return Err(err422("Hedge oranı (hedge_ratio) (0, 1] aralığında olmalı — örn. 0.5 = ana pozisyonun %50'si")),
         }
         match Fraction::from_decimal_str(&cfg.combined_target_profit) {
             Ok(t) if t.is_positive() => {}
-            _ => return Err(err422("Birleşik kâr hedefi (combined_target_profit) 0'dan büyük olmalı")),
+            _ => {
+                return Err(err422(
+                    "Birleşik kâr hedefi (combined_target_profit) 0'dan büyük olmalı",
+                ))
+            }
         }
         match Fraction::from_decimal_str(&cfg.hedge_drawdown_trigger_pct) {
             Ok(d) if d.is_positive() && d <= Fraction::from_u64(100) => {}
@@ -1963,7 +2395,10 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
         // Faz 0.5 (B-6): LIVE Mainnet Gate — venue bazlı testnet/demo kapısı (Arena P0-3 düzeltmesi)
         let is_testnet_env = match venue_uc.as_str() {
             "BYBIT" => std::env::var("DCA_BYBIT_TESTNET").as_deref() == Ok("1"),
-            "OKX" => std::env::var("DCA_OKX_DEMO").as_deref() == Ok("1") || std::env::var("DCA_OKX_TESTNET").as_deref() == Ok("1"),
+            "OKX" => {
+                std::env::var("DCA_OKX_DEMO").as_deref() == Ok("1")
+                    || std::env::var("DCA_OKX_TESTNET").as_deref() == Ok("1")
+            }
             _ => false,
         };
         let allow_mainnet = std::env::var("DCA_ALLOW_MAINNET").as_deref() == Ok("1");
@@ -2006,9 +2441,20 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
         };
         // Kapı penceresi Lab varsayılanıyla aynı (500 bar); üst sınır backtest ile aynı (1000).
         const GATE_BARS: usize = 500;
-        let bars = match routes_backtest::fetch_backtest_klines(adapter, &venue_uc, category, &req.symbol, &iv, GATE_BARS).await {
+        let bars = match routes_backtest::fetch_backtest_klines(
+            adapter,
+            &venue_uc,
+            category,
+            &req.symbol,
+            &iv,
+            GATE_BARS,
+        )
+        .await
+        {
             Ok(b) if !b.is_empty() => b,
-            _ => return Err(err422("LIVE sertifika kapısı: market verisi alınamadı — veri yokken KALDI (fail-closed)")) ,
+            _ => return Err(err422(
+                "LIVE sertifika kapısı: market verisi alınamadı — veri yokken KALDI (fail-closed)",
+            )),
         };
         // Faz 4 (H-6): venue-dogru mikro-yapi LIVE icin ZORUNLU — metadata
         // alinamazsa varsayilan tick/step ile canli emir kabul edilmez.
@@ -2032,28 +2478,61 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
         let funding_ok = funding_err.is_none();
         let bars_n: Vec<dca_kernel::Bar> = bars
             .into_iter()
-            .map(|k| dca_kernel::Bar { t: k.t, o: k.o, h: k.h, l: k.l, c: k.c, v: k.v })
+            .map(|k| dca_kernel::Bar {
+                t: k.t,
+                o: k.o,
+                h: k.h,
+                l: k.l,
+                c: k.c,
+                v: k.v,
+            })
             .collect();
         let gate_cfg = cfg.clone();
         let gate_cash = start_cash.clone();
         let gate_attempts = req.attempts;
         let (gate_cert, gate_base) = tokio::task::spawn_blocking(move || {
-            let base = run_backtest(&bars_n, &inst, &gate_cfg, gate_cash.clone(), dca_math::sessions::SessionType::Crypto24_7, &funding).ok();
+            let base = run_backtest(
+                &bars_n,
+                &inst,
+                &gate_cfg,
+                gate_cash.clone(),
+                dca_math::sessions::SessionType::Crypto24_7,
+                &funding,
+            )
+            .ok();
             // Faz 18 (P0-10): denemeler de base ile aynı funding takviminde —
             // ortak maliyet tabanı.
-            let cert = certify(&bars_n, &inst, &gate_cfg, gate_cash, dca_math::sessions::SessionType::Crypto24_7, 100, &funding, gate_attempts);
+            let cert = certify(
+                &bars_n,
+                &inst,
+                &gate_cfg,
+                gate_cash,
+                dca_math::sessions::SessionType::Crypto24_7,
+                100,
+                &funding,
+                gate_attempts,
+            );
             (cert, base)
         })
         .await
         .map_err(|e| err422(format!("LIVE sertifika kapısı çalışamadı: {e}")))?;
         let gate_cert = match gate_cert {
             Ok(c) => c,
-            Err(e) => return Err(err422(format!("LIVE sertifika kapısı: sertifika üretilemedi ({e}) — KALDI"))),
+            Err(e) => {
+                return Err(err422(format!(
+                    "LIVE sertifika kapısı: sertifika üretilemedi ({e}) — KALDI"
+                )))
+            }
         };
         let deals = gate_base.as_ref().map(|b| b.metrics.deals).unwrap_or(0);
         let gate = certify_verdict(&gate_cert, deals, funding_ok, is_fut);
         if gate.verdict != "GECTI" {
-            let failed: Vec<String> = gate.gates.iter().filter(|g| !g.pass).map(|g| format!("{} (eşik {}, değer {})", g.label, g.threshold, g.value)).collect();
+            let failed: Vec<String> = gate
+                .gates
+                .iter()
+                .filter(|g| !g.pass)
+                .map(|g| format!("{} (eşik {}, değer {})", g.label, g.threshold, g.value))
+                .collect();
             // ÜRÜN-1: bilinçli-onay istisnası — kapı felsefesi korunur (onay
             // şart + kalıcı WARN), Demo/uzman kullanımı için kanal açılır.
             // Faz 28 (P1-4): onay gerekçesiz kabul edilmez — audit zinciri
@@ -2066,7 +2545,14 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
                 .map(|s| s.chars().take(300).collect::<String>());
             if req.cert_acknowledged {
                 let Some(cert_reason) = cert_reason else {
-                    state::persist_event(&app, &id, "WARN", "CERT_GATE", "cert_acknowledged=true ancak cert_reason yok — istisna reddedildi").await;
+                    state::persist_event(
+                        &app,
+                        &id,
+                        "WARN",
+                        "CERT_GATE",
+                        "cert_acknowledged=true ancak cert_reason yok — istisna reddedildi",
+                    )
+                    .await;
                     return Err((
                         StatusCode::UNPROCESSABLE_ENTITY,
                         Json(json!({
@@ -2085,14 +2571,21 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
                     event: "RISK".into(),
                     data: json!({"botId": id, "code": "CERT_GATE_ACK", "message": format!("LIVE sertifika kapısı bilinçli onayla aşıldı (gerekçe: {cert_reason}) — kalan kapılar: {failed_list}"), "ts": state::now_ms()}).to_string(),
                 });
-                state::persist_event(&app, &id, "INFO", "CERT_GATE", "bilinçli onaylı istisna ile kuruluma devam ediliyor").await;
+                state::persist_event(
+                    &app,
+                    &id,
+                    "INFO",
+                    "CERT_GATE",
+                    "bilinçli onaylı istisna ile kuruluma devam ediliyor",
+                )
+                .await;
             } else {
-            let mut reason = format!("LIVE sertifika kapısı: KALDI — sertifikasız strateji canlıya eklenemez. Kalan kapılar: {}", failed.join(" · "));
-            if let Some(e) = funding_err {
-                reason.push_str(&format!(" [funding geçmişi alınamadı: {e}]"));
-            }
-            state::persist_event(&app, &id, "WARN", "CERT_GATE", &reason).await;
-            return Err((
+                let mut reason = format!("LIVE sertifika kapısı: KALDI — sertifikasız strateji canlıya eklenemez. Kalan kapılar: {}", failed.join(" · "));
+                if let Some(e) = funding_err {
+                    reason.push_str(&format!(" [funding geçmişi alınamadı: {e}]"));
+                }
+                state::persist_event(&app, &id, "WARN", "CERT_GATE", &reason).await;
+                return Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(json!({
                     "error": reason,
@@ -2105,15 +2598,41 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
                 .into_response());
             }
         }
-        state::persist_event(&app, &id, "INFO", "CERT_GATE", &format!("LIVE sertifika kapısı: GECTI ({}/{} kapı, {} deal, {})", gate.passed, gate.total, deals, venue_uc)).await;
+        state::persist_event(
+            &app,
+            &id,
+            "INFO",
+            "CERT_GATE",
+            &format!(
+                "LIVE sertifika kapısı: GECTI ({}/{} kapı, {} deal, {})",
+                gate.passed, gate.total, deals, venue_uc
+            ),
+        )
+        .await;
     }
 
-    if let Err(e) = state::create_runtime(&app, &id, &req.name, &mode, &req.venue.to_uppercase(), status, cfg.clone(), &req.interval, start_cash.clone(), credentials).await {
+    if let Err(e) = state::create_runtime(
+        &app,
+        &id,
+        &req.name,
+        &mode,
+        &req.venue.to_uppercase(),
+        status,
+        cfg.clone(),
+        &req.interval,
+        start_cash.clone(),
+        credentials,
+    )
+    .await
+    {
         return Err(err422(e));
     }
 
     {
-        let conn = match app.db.conn.lock() { Ok(c) => c, Err(e) => return Err(err422(e.to_string())) };
+        let conn = match app.db.conn.lock() {
+            Ok(c) => c,
+            Err(e) => return Err(err422(e.to_string())),
+        };
         conn.execute(
             "INSERT INTO bots(id, name, kind, venue, mode, symbol, status, config, stats, interval, start_cash, created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'{}',?9,?10,?11)",
             rusqlite::params![
@@ -2147,7 +2666,14 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
     }
     if !warnings.is_empty() {
         let codes: Vec<&str> = warnings.iter().map(|w| w.code.as_str()).collect();
-        state::persist_event(&app, &id, "WARN", "RISK_POLICY", &format!("advisory warnings acknowledged: {}", codes.join(", "))).await;
+        state::persist_event(
+            &app,
+            &id,
+            "WARN",
+            "RISK_POLICY",
+            &format!("advisory warnings acknowledged: {}", codes.join(", ")),
+        )
+        .await;
         let _ = app.sse.send(SseEvent {
             event: "RISK".into(),
             data: json!({"botId": id, "code": "RISK_POLICY_ACK", "message": format!("Kullanıcı riskleri onayladı: {}", codes.join(", ")), "ts": state::now_ms()}).to_string(),
@@ -2170,7 +2696,10 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
         .into_response())
 }
 
-async fn get_bot(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, axum::response::Response> {
+async fn get_bot(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, axum::response::Response> {
     let rts = app.runtimes.lock().await;
     let rt = rts.get(&id).ok_or_else(|| err422("bot not found"))?;
     let mut v = rt.snapshot_json();
@@ -2184,7 +2713,12 @@ async fn get_bot(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Re
             .collect();
         v["ladder"] = json!(ladder);
     } else if let dca_strategy::EngineTag::Grid(g) = &rt.engine_kind {
-        let mesh: Vec<Value> = g.mesh.iter().enumerate().map(|(i, p)| json!({"level": i, "price": p.to_string(), "armed": g.level_armed[i]})).collect();
+        let mesh: Vec<Value> = g
+            .mesh
+            .iter()
+            .enumerate()
+            .map(|(i, p)| json!({"level": i, "price": p.to_string(), "armed": g.level_armed[i]}))
+            .collect();
         v["ladder"] = json!(mesh);
     } else if let dca_strategy::EngineTag::Hedge(h) = &rt.engine_kind {
         let ladder: Vec<Value> = h
@@ -2209,15 +2743,29 @@ struct PatchBotReq {
     webhook_secret: Option<String>,
 }
 
-async fn patch_bot(State(app): State<Arc<AppState>>, Path(id): Path<String>, Json(req): Json<PatchBotReq>) -> Result<Json<Value>, axum::response::Response> {
-    let _live_ownership_guard = if req.status.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("RUNNING")) {
+async fn patch_bot(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<PatchBotReq>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let _live_ownership_guard = if req
+        .status
+        .as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case("RUNNING"))
+    {
         let identity = {
             let runtimes = app.runtimes.lock().await;
-            runtimes.get(&id).filter(|rt| rt.mode.eq_ignore_ascii_case("LIVE"))
+            runtimes
+                .get(&id)
+                .filter(|rt| rt.mode.eq_ignore_ascii_case("LIVE"))
                 .map(|rt| (rt.venue.clone(), rt.cfg.symbol.clone()))
         };
         if let Some((venue, symbol)) = identity {
-            Some(lock_live_ownership(&app, &id, &venue, &symbol).await.map_err(err422)?)
+            Some(
+                lock_live_ownership(&app, &id, &venue, &symbol)
+                    .await
+                    .map_err(err422)?,
+            )
         } else {
             None
         }
@@ -2231,14 +2779,23 @@ async fn patch_bot(State(app): State<Arc<AppState>>, Path(id): Path<String>, Jso
         // H-10: status tek enum kümesidir — "FOO" gibi değerler kalıcılaşarak
         // botu supervisor/restore filtrelerinin dışına düşürürdü.
         if !matches!(s.as_str(), "RUNNING" | "PAUSED" | "STOPPED" | "FROZEN") {
-            return Err(err422(format!("geçersiz status '{s}' — geçerli küme: RUNNING | PAUSED | STOPPED | FROZEN")));
+            return Err(err422(format!(
+                "geçersiz status '{s}' — geçerli küme: RUNNING | PAUSED | STOPPED | FROZEN"
+            )));
         }
         rt.status = s.clone();
         state::persist_status(&app, &id, &s);
-        let _ = app.sse.send(SseEvent { event: "BOT_STATE".into(), data: json!({"botId": id, "status": s}).to_string() });
+        let _ = app.sse.send(SseEvent {
+            event: "BOT_STATE".into(),
+            data: json!({"botId": id, "status": s}).to_string(),
+        });
     } else if let dca_strategy::EngineTag::Dca(e) = &mut rt.engine_kind {
-        e.patch(req.target_profit_pct.clone(), req.stop_loss_pct.clone(), req.trailing_enabled)
-            .map_err(|e| err422(e))?;
+        e.patch(
+            req.target_profit_pct.clone(),
+            req.stop_loss_pct.clone(),
+            req.trailing_enabled,
+        )
+        .map_err(|e| err422(e))?;
         // Arena 1.10 Düzeltmesi: rt.cfg alanlarını da güncelle ki DB'ye ve snapshot'a güncel config yazılsın.
         if let Some(tp) = &req.target_profit_pct {
             rt.cfg.target_profit_pct = tp.clone();
@@ -2254,7 +2811,10 @@ async fn patch_bot(State(app): State<Arc<AppState>>, Path(id): Path<String>, Jso
             let conn = app.db.conn.lock().map_err(|e| err422(e.to_string()))?;
             conn.execute(
                 "UPDATE bots SET config=?1 WHERE id=?2",
-                rusqlite::params![serde_json::to_string(&rt.cfg).map_err(|e| err422(e.to_string()))?, id],
+                rusqlite::params![
+                    serde_json::to_string(&rt.cfg).map_err(|e| err422(e.to_string()))?,
+                    id
+                ],
             )
             .map_err(|e| err422(e.to_string()))?;
         }
@@ -2266,10 +2826,27 @@ async fn patch_bot(State(app): State<Arc<AppState>>, Path(id): Path<String>, Jso
             }
             rt.webhook_secret = t.to_string();
             crate::state::save_runtime_state(&app, &id, rt);
-            state::persist_event(&app, &id, "INFO", "WEBHOOK", "webhook secret rotasyonu yapıldı (yeni secret snapshot'a yazıldı)").await;
+            state::persist_event(
+                &app,
+                &id,
+                "INFO",
+                "WEBHOOK",
+                "webhook secret rotasyonu yapıldı (yeni secret snapshot'a yazıldı)",
+            )
+            .await;
         }
-        state::persist_event(&app, &id, "INFO", "PATCH", "dynamic config patch applied & persisted").await;
-        let _ = app.sse.send(SseEvent { event: "BOT_STATE".into(), data: json!({"botId": id, "action": "PATCHED"}).to_string() });
+        state::persist_event(
+            &app,
+            &id,
+            "INFO",
+            "PATCH",
+            "dynamic config patch applied & persisted",
+        )
+        .await;
+        let _ = app.sse.send(SseEvent {
+            event: "BOT_STATE".into(),
+            data: json!({"botId": id, "action": "PATCHED"}).to_string(),
+        });
         // Faz 13 dilim 2: patch sonrası cache taze (status/faz hemen yansır).
         {
             let snap_v = rt.snapshot_json();
@@ -2277,14 +2854,18 @@ async fn patch_bot(State(app): State<Arc<AppState>>, Path(id): Path<String>, Jso
         }
     } else if matches!(rt.engine_kind, dca_strategy::EngineTag::Grid(_)) {
         // Grid engines have no TP/SL deal lifecycle — a silent no-op would fake success.
-        let wants_tpsl_patch = req.target_profit_pct.is_some() || req.stop_loss_pct.is_some() || req.trailing_enabled.is_some();
+        let wants_tpsl_patch = req.target_profit_pct.is_some()
+            || req.stop_loss_pct.is_some()
+            || req.trailing_enabled.is_some();
         if wants_tpsl_patch {
             return Err(err422("Grid stratejisi TP/SL yaması desteklenmez — grid botlar mesh seviyeleriyle yönetilir"));
         }
     } else if matches!(rt.engine_kind, dca_strategy::EngineTag::Hedge(_)) {
         // Hedge engines manage TP via the combined-exit target; per-leg TP/SL
         // patches would desynchronize the legs — refuse honestly instead.
-        let wants_tpsl_patch = req.target_profit_pct.is_some() || req.stop_loss_pct.is_some() || req.trailing_enabled.is_some();
+        let wants_tpsl_patch = req.target_profit_pct.is_some()
+            || req.stop_loss_pct.is_some()
+            || req.trailing_enabled.is_some();
         if wants_tpsl_patch {
             return Err(err422("Hedge stratejisinde TP/SL yaması desteklenmez — çıkış birleşik kâr hedefiyle (combined_target_profit) yönetilir"));
         }
@@ -2293,7 +2874,10 @@ async fn patch_bot(State(app): State<Arc<AppState>>, Path(id): Path<String>, Jso
 }
 
 /// BOT-07: silmeden önce açık venue emirleri iptal edilir (sahipsiz bırakılmaz).
-async fn delete_bot(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, axum::response::Response> {
+async fn delete_bot(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, axum::response::Response> {
     // Serialize deletion with the bot's in-flight poll/order cascade. The
     // guard is per bot, so unrelated bots continue while venue cancellations
     // run without holding the shared runtime map lock.
@@ -2308,7 +2892,10 @@ async fn delete_bot(State(app): State<Arc<AppState>>, Path(id): Path<String>) ->
         };
         // Arena 1.10 Düzeltmesi: LIVE açık pozisyonu varken bot silinemez (sahipsiz pozisyon kalmaması için fail-closed)
         let live_exposure = !rt.stepper.position.qty.is_zero()
-            || rt.hedge_stepper.as_ref().is_some_and(|stepper| !stepper.position.qty.is_zero());
+            || rt
+                .hedge_stepper
+                .as_ref()
+                .is_some_and(|stepper| !stepper.position.qty.is_zero());
         if rt.mode == "LIVE" && live_exposure {
             return Err(err422(format!(
                 "Açık pozisyonu olan LIVE bot silinemez (ana miktar: {}, hedge miktarı: {}). Önce tüm bacakları kapatıp pozisyon uzlaşmasını bekleyin.",
@@ -2323,7 +2910,11 @@ async fn delete_bot(State(app): State<Arc<AppState>>, Path(id): Path<String>) ->
             rt.mode == "LIVE",
             rt.credentials.clone(),
             rt.venue.clone(),
-            if rt.cfg.kind.is_futures() { "linear".to_string() } else { "spot".to_string() },
+            if rt.cfg.kind.is_futures() {
+                "linear".to_string()
+            } else {
+                "spot".to_string()
+            },
             rt.cfg.symbol.clone(),
             snapshot,
         )
@@ -2334,28 +2925,61 @@ async fn delete_bot(State(app): State<Arc<AppState>>, Path(id): Path<String>) ->
         data: json!({"botId": id, "status": "STOPPED", "action": "DELETING"}).to_string(),
     });
     if is_live {
-        let creds = creds_opt.ok_or_else(|| err422("LIVE bot silinmedi: aktif kasa anahtarı olmadan açık emir güvenle uzlaştırılamaz"))?;
-        let adapter = app.adapter(&venue_str).ok_or_else(|| err422("LIVE bot silinmedi: venue adapter bulunamadı"))?;
-        let orders = match adapter.open_orders(&creds, &category_str, &symbol_str).await {
+        let creds = creds_opt.ok_or_else(|| {
+            err422(
+                "LIVE bot silinmedi: aktif kasa anahtarı olmadan açık emir güvenle uzlaştırılamaz",
+            )
+        })?;
+        let adapter = app
+            .adapter(&venue_str)
+            .ok_or_else(|| err422("LIVE bot silinmedi: venue adapter bulunamadı"))?;
+        let orders = match adapter
+            .open_orders(&creds, &category_str, &symbol_str)
+            .await
+        {
             Ok(orders) => orders,
             Err(e) => {
-                state::persist_event(&*app, &id, "WARN", "DELETE", &format!("open order listesi alınamadı; bot silinmedi: {e}")).await;
-                return Err(err422(format!("LIVE bot silinmedi: açık emirler doğrulanamadı ({e})")));
+                state::persist_event(
+                    &*app,
+                    &id,
+                    "WARN",
+                    "DELETE",
+                    &format!("open order listesi alınamadı; bot silinmedi: {e}"),
+                )
+                .await;
+                return Err(err422(format!(
+                    "LIVE bot silinmedi: açık emirler doğrulanamadı ({e})"
+                )));
             }
         };
         // Only this bot's order ids are canceled. Any failed cancellation keeps
         // the runtime available for fill reconciliation and a safe retry.
         let prefix = format!("{id}-");
         let mut failed = Vec::new();
-        for order in orders.iter().filter(|order| order.order_link_id.starts_with(&prefix)) {
-            if let Err(e) = adapter.cancel_order(&creds, &category_str, &symbol_str, &order.order_link_id).await {
+        for order in orders
+            .iter()
+            .filter(|order| order.order_link_id.starts_with(&prefix))
+        {
+            if let Err(e) = adapter
+                .cancel_order(&creds, &category_str, &symbol_str, &order.order_link_id)
+                .await
+            {
                 failed.push(format!("{}: {e}", order.order_link_id));
             }
         }
         if !failed.is_empty() {
             let detail = failed.join("; ");
-            state::persist_event(&*app, &id, "CRITICAL", "DELETE", &format!("emir iptali başarısız; bot silinmedi: {detail}")).await;
-            return Err(err422(format!("LIVE bot silinmedi; bazı emirler iptal edilemedi: {detail}")));
+            state::persist_event(
+                &*app,
+                &id,
+                "CRITICAL",
+                "DELETE",
+                &format!("emir iptali başarısız; bot silinmedi: {detail}"),
+            )
+            .await;
+            return Err(err422(format!(
+                "LIVE bot silinmedi; bazı emirler iptal edilemedi: {detail}"
+            )));
         }
     }
     app.runtimes.lock().await.remove(&id);
@@ -2366,11 +2990,27 @@ async fn delete_bot(State(app): State<Arc<AppState>>, Path(id): Path<String>) ->
     // Fill/event/equity geçmişi analiz için korunur (bot_id artık bots'ta yok).
     if let Ok(conn) = app.db.conn.lock() {
         let _ = conn.execute("DELETE FROM bots WHERE id=?1", rusqlite::params![id]);
-        let _ = conn.execute("DELETE FROM live_orders WHERE bot_id=?1", rusqlite::params![id]);
-        let _ = conn.execute("DELETE FROM runtime_state WHERE bot_id=?1", rusqlite::params![id]);
+        let _ = conn.execute(
+            "DELETE FROM live_orders WHERE bot_id=?1",
+            rusqlite::params![id],
+        );
+        let _ = conn.execute(
+            "DELETE FROM runtime_state WHERE bot_id=?1",
+            rusqlite::params![id],
+        );
     }
-    state::persist_event(&*app, &id, "INFO", "LIFECYCLE", "bot silindi (DB kaydı temizlendi; fill/equity geçmişi korundu)").await;
-    let _ = app.sse.send(SseEvent { event: "BOT_STATE".into(), data: json!({"botId": id, "status": "STOPPED", "action": "DELETED"}).to_string() });
+    state::persist_event(
+        &*app,
+        &id,
+        "INFO",
+        "LIFECYCLE",
+        "bot silindi (DB kaydı temizlendi; fill/equity geçmişi korundu)",
+    )
+    .await;
+    let _ = app.sse.send(SseEvent {
+        event: "BOT_STATE".into(),
+        data: json!({"botId": id, "status": "STOPPED", "action": "DELETED"}).to_string(),
+    });
     Ok(Json(json!({"ok": true})))
 }
 
@@ -2381,18 +3021,36 @@ struct ActionReq {
     amount: Option<String>,
 }
 
-async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, Json(req): Json<ActionReq>) -> Result<Json<Value>, axum::response::Response> {
+async fn bot_actions(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ActionReq>,
+) -> Result<Json<Value>, axum::response::Response> {
     // Faz 13A (IEA, handler ölçeği): LIVE ADD_FUNDS — plan kısa kilitte, AĞ
     // ÇAĞRISI kilit dışında, uygulama yeni kilitte. PAPER normal akışa düşer.
     if req.action == "ADD_FUNDS" {
         // Faz 17 (P0-7): ADD_FUNDS da yürütme şalterlerine saygılı — şalter
         // devredeyken borsaya emir gitmez (şalterin anlamı korunur).
         if app.kill_engaged().await {
-            state::persist_event(&*app, &id, "WARN", "KILL_SWITCH", "ADD_FUNDS reddedildi — KILL_SWITCH devrede").await;
+            state::persist_event(
+                &*app,
+                &id,
+                "WARN",
+                "KILL_SWITCH",
+                "ADD_FUNDS reddedildi — KILL_SWITCH devrede",
+            )
+            .await;
             return Err(err422("KILL_SWITCH devrede — ADD_FUNDS reddedildi"));
         }
         if app.freeze_engaged().await {
-            state::persist_event(&*app, &id, "WARN", "FREEZE", "ADD_FUNDS reddedildi — FREEZE devrede").await;
+            state::persist_event(
+                &*app,
+                &id,
+                "WARN",
+                "FREEZE",
+                "ADD_FUNDS reddedildi — FREEZE devrede",
+            )
+            .await;
             return Err(err422("FREEZE devrede — ADD_FUNDS reddedildi"));
         }
         let (mode, venue, mark, step_size, planned) = {
@@ -2404,15 +3062,21 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
                 .as_deref()
                 .and_then(|s| Fraction::from_any_str(s).ok());
             let plan = if rt.mode == "LIVE" {
-                let amount = req.amount.clone().ok_or_else(|| err422("amount required"))?;
+                let amount = req
+                    .amount
+                    .clone()
+                    .ok_or_else(|| err422("amount required"))?;
                 let quote = Fraction::from_decimal_str(&amount).map_err(|e| err422(e))?;
                 // Faz 26 (KAPSAMLI_DENETİM P1): pozitiflik değişmezi — LIVE yolu.
                 if !quote.is_positive() {
                     return Err(err422("ADD_FUNDS amount must be > 0"));
                 }
                 let mark_v = mark.clone().ok_or_else(|| err422("no mark price yet"))?;
-                let qty = dca_math::m02::qty_down(&quote.div(&mark_v).map_err(|e| err422(e.to_string()))?, &rt.stepper.instrument.step_size)
-                    .map_err(|e| err422(e.to_string()))?;
+                let qty = dca_math::m02::qty_down(
+                    &quote.div(&mark_v).map_err(|e| err422(e.to_string()))?,
+                    &rt.stepper.instrument.step_size,
+                )
+                .map_err(|e| err422(e.to_string()))?;
                 if qty.is_zero() {
                     return Err(err422("amount too small for one unit"));
                 }
@@ -2420,9 +3084,17 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
                 // Faz 17 (P0-7): yön POZİSYON yönünden — short bot fon eklerken
                 // Sell gider (short derinleşir); eski sabit Buy, short pozisyonu
                 // azaltıp ters pozisyon açıyordu.
-                let add_side = if rt.stepper.position.direction == -1 { dca_math::Side::Sell } else { dca_math::Side::Buy };
+                let add_side = if rt.stepper.position.direction == -1 {
+                    dca_math::Side::Sell
+                } else {
+                    dca_math::Side::Buy
+                };
                 let req_o = dca_exchange::OrderRequest {
-                    category: if rt.cfg.kind.is_futures() { "linear".to_string() } else { "spot".to_string() },
+                    category: if rt.cfg.kind.is_futures() {
+                        "linear".to_string()
+                    } else {
+                        "spot".to_string()
+                    },
                     symbol: rt.cfg.symbol.clone(),
                     side: add_side,
                     is_market: true,
@@ -2431,18 +3103,32 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
                     reduce_only: false,
                     order_link_id: order_id.clone(),
                     position_idx: if rt.cfg.kind.is_futures() && rt.pos_mode_hedge {
-                        if rt.stepper.position.direction == 1 { 1 } else { 2 }
-                    } else { 0 },
+                        if rt.stepper.position.direction == 1 {
+                            1
+                        } else {
+                            2
+                        }
+                    } else {
+                        0
+                    },
                 };
                 Some((req_o, order_id, qty, mark_v))
             } else {
                 None
             };
-            (rt.mode.clone(), rt.venue.clone(), mark, rt.stepper.instrument.step_size.clone(), plan)
+            (
+                rt.mode.clone(),
+                rt.venue.clone(),
+                mark,
+                rt.stepper.instrument.step_size.clone(),
+                plan,
+            )
         };
         if let Some((req_o, order_id, qty, mark_v)) = planned {
             // --- kilit yok; ağ serbest ---
-            let adapter = app.adapter(&venue).ok_or_else(|| err422("venue desteklenmiyor"))?;
+            let adapter = app
+                .adapter(&venue)
+                .ok_or_else(|| err422("venue desteklenmiyor"))?;
             let creds = store::load_active_key(&app.db, &app.vault, &venue)
                 .map_err(err422)?
                 .ok_or_else(|| err422("live mode requires vault credentials"))?;
@@ -2467,8 +3153,18 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
                 }
             }
             state::persist_status(&app, &id, &mode);
-            state::persist_event(&app, &id, "INFO", "ACTION", "action=ADD_FUNDS (LIVE market, kilit-dışı ağ)").await;
-            let _ = app.sse.send(SseEvent { event: "BOT_STATE".into(), data: json!({"botId": id, "action": "ADD_FUNDS"}).to_string() });
+            state::persist_event(
+                &app,
+                &id,
+                "INFO",
+                "ACTION",
+                "action=ADD_FUNDS (LIVE market, kilit-dışı ağ)",
+            )
+            .await;
+            let _ = app.sse.send(SseEvent {
+                event: "BOT_STATE".into(),
+                data: json!({"botId": id, "action": "ADD_FUNDS"}).to_string(),
+            });
             return Ok(Json(json!({"ok": true})));
         }
         let _ = (mark, step_size); // PAPER: normal akışa düş
@@ -2476,11 +3172,16 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
     let _live_ownership_guard = if matches!(req.action.as_str(), "START" | "UNFREEZE") {
         let live_identity = {
             let rts = app.runtimes.lock().await;
-            rts.get(&id).filter(|rt| rt.mode.eq_ignore_ascii_case("LIVE"))
+            rts.get(&id)
+                .filter(|rt| rt.mode.eq_ignore_ascii_case("LIVE"))
                 .map(|rt| (rt.venue.to_uppercase(), rt.cfg.symbol.clone()))
         };
         if let Some((venue, symbol)) = live_identity {
-            Some(lock_live_ownership(&app, &id, &venue, &symbol).await.map_err(err422)?)
+            Some(
+                lock_live_ownership(&app, &id, &venue, &symbol)
+                    .await
+                    .map_err(err422)?,
+            )
         } else {
             None
         }
@@ -2490,7 +3191,9 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
     let (_start_poll_guard, mut start_credentials) = if req.action == "START" {
         let live_venue = {
             let rts = app.runtimes.lock().await;
-            rts.get(&id).filter(|rt| rt.mode.eq_ignore_ascii_case("LIVE")).map(|rt| rt.venue.to_uppercase())
+            rts.get(&id)
+                .filter(|rt| rt.mode.eq_ignore_ascii_case("LIVE"))
+                .map(|rt| rt.venue.to_uppercase())
         };
         if let Some(venue) = live_venue {
             let guard = acquire_bot_poll_guard(&app, &id).await;
@@ -2509,7 +3212,9 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
     match req.action.as_str() {
         "START" => {
             if rt.mode == "LIVE" {
-                rt.credentials = Some(start_credentials.take().ok_or_else(|| err422("LIVE bot başlatılamadı: aktif kasa anahtarı bulunamadı"))?);
+                rt.credentials = Some(start_credentials.take().ok_or_else(|| {
+                    err422("LIVE bot başlatılamadı: aktif kasa anahtarı bulunamadı")
+                })?);
             }
             rt.status = "RUNNING".into();
         }
@@ -2557,24 +3262,33 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
                 rt.pending_engine_actions.extend(grid_close_acts);
                 let qty = rt.stepper.position.qty.clone();
                 if !qty.is_zero() {
-                    rt.pending_engine_actions.push(dca_strategy::Action::PlaceMarket {
-                        id: format!("{}-closeall-{}", rt.bot_id, crate::state::now_ms()),
-                        side: if rt.stepper.position.direction == 1 { dca_math::Side::Sell } else { dca_math::Side::Buy },
-                        qty,
-                        role: "MANUAL",
-                        quote_notional: None,
-                    });
+                    rt.pending_engine_actions
+                        .push(dca_strategy::Action::PlaceMarket {
+                            id: format!("{}-closeall-{}", rt.bot_id, crate::state::now_ms()),
+                            side: if rt.stepper.position.direction == 1 {
+                                dca_math::Side::Sell
+                            } else {
+                                dca_math::Side::Buy
+                            },
+                            qty,
+                            role: "MANUAL",
+                            quote_notional: None,
+                        });
                 }
                 let msg = format!(
                     "grid CLOSE_ALL: {} mesh emri iptal edildi{} — eylemler bir sonraki barda dispatch edilir",
                     rt.pending_engine_actions.iter().filter(|a| matches!(a, dca_strategy::Action::CancelResting { .. })).count(),
                     if rt.stepper.position.qty.is_zero() { ", açık pozisyon yok" } else { " + market kapanış niyeti" }
                 );
-                crate::state::persist_event(app.as_ref(), &rt.bot_id, "INFO", "CLOSE_ALL", &msg).await;
+                crate::state::persist_event(app.as_ref(), &rt.bot_id, "INFO", "CLOSE_ALL", &msg)
+                    .await;
             }
         }
         "ADD_FUNDS" => {
-            let amount = req.amount.clone().ok_or_else(|| err422("amount required"))?;
+            let amount = req
+                .amount
+                .clone()
+                .ok_or_else(|| err422("amount required"))?;
             let quote = Fraction::from_decimal_str(&amount).map_err(|e| err422(e))?;
             // Faz 26 (KAPSAMLI_DENETİM P1): negatif/sıfır tutar reddi — eski
             // kod yalnız parse ediyordu; "-100" PAPER'da NAHİT DÜŞÜRÜYORDU
@@ -2593,7 +3307,11 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
                 "PAPER" => {
                     // BOT-05: PAPER'da ADD_FUNDS yalnız nakit ekler (serbest sermaye),
                     // pozisyonu büyültmez — kullanıcı kastı "sermaye ekleme"dir.
-                    rt.stepper.cash = rt.stepper.cash.add(&quote).map_err(|e| err422(e.to_string()))?;
+                    rt.stepper.cash = rt
+                        .stepper
+                        .cash
+                        .add(&quote)
+                        .map_err(|e| err422(e.to_string()))?;
                 }
                 _ => {
                     // Faz 13A: LIVE ADD_FUNDS handler başındaki pre-flow'da
@@ -2656,17 +3374,34 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
     }
     // Task 18 N-4: kritik status yazımı retry + stderr ile (sessiz yutma yok).
     state::persist_status(&app, &id, &rt.status);
-    state::persist_event(&app, &id, "INFO", "ACTION", &format!("action={}", req.action)).await;
+    state::persist_event(
+        &app,
+        &id,
+        "INFO",
+        "ACTION",
+        &format!("action={}", req.action),
+    )
+    .await;
     {
         let snap_v = rt.snapshot_json();
         app.ui_cache.lock().await.insert(id.clone(), snap_v);
     }
-    let _ = app.sse.send(SseEvent { event: "BOT_STATE".into(), data: json!({"botId": id, "action": req.action}).to_string() });
+    let _ = app.sse.send(SseEvent {
+        event: "BOT_STATE".into(),
+        data: json!({"botId": id, "action": req.action}).to_string(),
+    });
     Ok(Json(json!({"ok": true})))
 }
 
-async fn bot_fills(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, axum::response::Response> {
-    let conn = app.db.conn.lock().map_err(|_| err422("db kilitli — fills okunamadı"))?;
+async fn bot_fills(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let conn = app
+        .db
+        .conn
+        .lock()
+        .map_err(|_| err422("db kilitli — fills okunamadı"))?;
     let mut stmt = conn
         .prepare("SELECT fill_key, order_id, role, side, kind, price, qty, fee, fee_role, realism, ts FROM fills WHERE bot_id=?1 ORDER BY ts DESC LIMIT 200")
         .map_err(|e| err422(format!("fills sorgusu hazırlanamadı: {e}")))?;
@@ -2692,8 +3427,15 @@ async fn bot_fills(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> 
     Ok(Json(json!({"fills": rows})))
 }
 
-async fn bot_events(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, axum::response::Response> {
-    let conn = app.db.conn.lock().map_err(|_| err422("db kilitli — events okunamadı"))?;
+async fn bot_events(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let conn = app
+        .db
+        .conn
+        .lock()
+        .map_err(|_| err422("db kilitli — events okunamadı"))?;
     let mut stmt = conn
         .prepare("SELECT level, gate, message, ts, trace_id FROM events WHERE bot_id=?1 ORDER BY id DESC LIMIT 200")
         .map_err(|e| err422(format!("events sorgusu hazırlanamadı: {e}")))?;
@@ -2720,7 +3462,9 @@ struct PineValidateReq {
     code: String,
 }
 
-async fn pine_validate(Json(req): Json<PineValidateReq>) -> Result<axum::response::Response, axum::response::Response> {
+async fn pine_validate(
+    Json(req): Json<PineValidateReq>,
+) -> Result<axum::response::Response, axum::response::Response> {
     match dca_pine::validate_source(&req.code) {
         Ok(prog) => Ok(axum::Json(json!({
             "ok": true,
@@ -2791,7 +3535,11 @@ async fn pine_backtest(
     let kind = match req.kind.as_deref() {
         None | Some("DCA_LONG") => StrategyKind::DcaLong,
         Some("DCA_SHORT") => StrategyKind::DcaShort,
-        Some(other) => return Err(err422(format!("pine backtest kind '{other}' desteklenmiyor (DCA_LONG / DCA_SHORT)"))),
+        Some(other) => {
+            return Err(err422(format!(
+                "pine backtest kind '{other}' desteklenmiyor (DCA_LONG / DCA_SHORT)"
+            )))
+        }
     };
     let category = if kind.is_futures() { "linear" } else { "spot" };
     let iv = engine::bybit_interval(&req.interval).map_err(err422)?;
@@ -2805,7 +3553,14 @@ async fn pine_backtest(
     }
     let bars: Vec<dca_kernel::Bar> = kl
         .iter()
-        .map(|k| dca_kernel::Bar { t: k.t, o: k.o.clone(), h: k.h.clone(), l: k.l.clone(), c: k.c.clone(), v: k.v.clone() })
+        .map(|k| dca_kernel::Bar {
+            t: k.t,
+            o: k.o.clone(),
+            h: k.h.clone(),
+            l: k.l.clone(),
+            c: k.c.clone(),
+            v: k.v.clone(),
+        })
         .collect();
     // Pine tamamen çıkışı yönetir: bot TP'si devre dışı (çok yüksek), SL yok.
     // Task 20: istekte targetProfitPct/stopLossPct verilirse motor TP/SL'i de
@@ -2834,7 +3589,11 @@ async fn pine_backtest(
     cfg.base_order_size = "100".into();
     cfg.safety_order_size = "0".into();
     let inst = {
-        let insts = app.bybit.instruments(category, Some(&req.symbol)).await.unwrap_or_default();
+        let insts = app
+            .bybit
+            .instruments(category, Some(&req.symbol))
+            .await
+            .unwrap_or_default();
         insts.into_iter().next().unwrap_or_else(|| {
             let mut i = Instrument::default();
             i.symbol = req.symbol.clone();
@@ -2843,15 +3602,12 @@ async fn pine_backtest(
     };
     let start = Fraction::from_decimal_str(&req.start_cash).map_err(err422)?;
     let session = dca_math::sessions::SessionType::Crypto24_7;
-    let result = tokio::task::spawn_blocking(move || run_backtest(&bars, &inst, &cfg, start, session, &[]))
-        .await
-        .map_err(|e| err422(e.to_string()))?
-        .map_err(err422)?;
-    let entries = result
-        .fills
-        .iter()
-        .filter(|f| f.role == "BASE")
-        .count();
+    let result =
+        tokio::task::spawn_blocking(move || run_backtest(&bars, &inst, &cfg, start, session, &[]))
+            .await
+            .map_err(|e| err422(e.to_string()))?
+            .map_err(err422)?;
+    let entries = result.fills.iter().filter(|f| f.role == "BASE").count();
     let fill_marks = fill_marks_json(&result.fills);
     let step = (result.equity_curve.len() / 300).max(1);
     let curve: Vec<Value> = result
@@ -3024,7 +3780,10 @@ async fn patch_pine_script(
     Ok(Json(json!({"ok": true})))
 }
 
-async fn delete_pine_script(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Json<Value> {
+async fn delete_pine_script(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<Value> {
     let conn = app.db.conn.lock().unwrap_or_else(|p| p.into_inner());
     if let Err(e) = conn.execute("DELETE FROM pine_scripts WHERE id=?1", [&id]) {
         tracing::warn!("pine_script delete failed: {e}");
@@ -3088,11 +3847,20 @@ async fn backtest_cert(
     let category = if kind.is_futures() { "linear" } else { "spot" };
     // P4-3d: sertifikasyon market verisi seçili venue'den.
     let venue = req.venue.unwrap_or_else(|| "BYBIT".into()).to_uppercase();
-    let adapter = app.adapter(&venue).ok_or_else(|| err422("venue desteklenmiyor"))?;
+    let adapter = app
+        .adapter(&venue)
+        .ok_or_else(|| err422("venue desteklenmiyor"))?;
     let iv = engine::bybit_interval(&req.interval).map_err(|e| err422(e))?;
-    let bars = routes_backtest::fetch_backtest_klines(adapter, &venue, category, &req.symbol, &iv, req.bars.min(1000))
-        .await
-        .map_err(|e| err422(e))?;
+    let bars = routes_backtest::fetch_backtest_klines(
+        adapter,
+        &venue,
+        category,
+        &req.symbol,
+        &iv,
+        req.bars.min(1000),
+    )
+    .await
+    .map_err(|e| err422(e))?;
     if bars.is_empty() {
         return Err(err422("no market data"));
     }
@@ -3116,7 +3884,9 @@ async fn backtest_cert(
             Ok(v) => (v, None),
             Err(e) => (
                 Vec::new(),
-                Some(format!("Funding geçmişi alınamadı ({e}) — sertifikasyon base run funding=0 varsaydı")),
+                Some(format!(
+                    "Funding geçmişi alınamadı ({e}) — sertifikasyon base run funding=0 varsaydı"
+                )),
             ),
         }
     } else {
@@ -3127,12 +3897,28 @@ async fn backtest_cert(
     }
     let bars_n: Vec<dca_kernel::Bar> = bars
         .into_iter()
-        .map(|k| dca_kernel::Bar { t: k.t, o: k.o, h: k.h, l: k.l, c: k.c, v: k.v })
+        .map(|k| dca_kernel::Bar {
+            t: k.t,
+            o: k.o,
+            h: k.h,
+            l: k.l,
+            c: k.c,
+            v: k.v,
+        })
         .collect();
     let (cert, base_metrics) = tokio::task::spawn_blocking(move || {
         let base = run_backtest(&bars_n, &inst, &cfg, start.clone(), session, &funding).ok();
         // Faz 18 (P0-10): denemeler de base ile aynı funding takviminde.
-        let cert = certify(&bars_n, &inst, &cfg, start, session, req.mc_runs, &funding, req.attempts);
+        let cert = certify(
+            &bars_n,
+            &inst,
+            &cfg,
+            start,
+            session,
+            req.mc_runs,
+            &funding,
+            req.attempts,
+        );
         (cert, base)
     })
     .await
@@ -3140,7 +3926,12 @@ async fn backtest_cert(
     let cert = cert.map_err(|e| err422(e))?;
     // Faz 0.1 — sertifika hükmü (Lab rozet eşikleriyle aynı kapılar; UI + LIVE
     // kapısı tek kaynaktan beslenir). funding kapısı yalnız vadeli türde uygulanır.
-    let gate = certify_verdict(&cert, base_metrics.as_ref().map(|b| b.metrics.deals).unwrap_or(0), funding_warning.is_none(), kind.is_futures());
+    let gate = certify_verdict(
+        &cert,
+        base_metrics.as_ref().map(|b| b.metrics.deals).unwrap_or(0),
+        funding_warning.is_none(),
+        kind.is_futures(),
+    );
     Ok(axum::Json(json!({
         "cert": cert,
         "verdict": gate.verdict,
@@ -3170,7 +3961,10 @@ struct MarketsQuery {
 async fn markets(State(app): State<Arc<AppState>>, Query(q): Query<MarketsQuery>) -> Json<Value> {
     let category = q.category.unwrap_or_else(|| "spot".into());
     let venue = q.venue.unwrap_or_else(|| "BYBIT".into());
-    let key = format!("{venue}:{category}:{}", q.symbol.clone().unwrap_or_default());
+    let key = format!(
+        "{venue}:{category}:{}",
+        q.symbol.clone().unwrap_or_default()
+    );
     {
         let cache = app.instruments_cache.lock().await;
         if let Some((at, list)) = cache.get(&key) {
@@ -3181,14 +3975,29 @@ async fn markets(State(app): State<Arc<AppState>>, Query(q): Query<MarketsQuery>
         }
     }
     let list = match venue.as_str() {
-        "BINANCE" => app.binance.instruments(&category, q.symbol.as_deref()).await.unwrap_or_default(),
-        "OKX" => app.okx.instruments(&category, q.symbol.as_deref()).await.unwrap_or_default(),
-        _ => app.bybit.instruments(&category, q.symbol.as_deref()).await.unwrap_or_default(),
+        "BINANCE" => app
+            .binance
+            .instruments(&category, q.symbol.as_deref())
+            .await
+            .unwrap_or_default(),
+        "OKX" => app
+            .okx
+            .instruments(&category, q.symbol.as_deref())
+            .await
+            .unwrap_or_default(),
+        _ => app
+            .bybit
+            .instruments(&category, q.symbol.as_deref())
+            .await
+            .unwrap_or_default(),
     };
     // M-3: yalnız dolu yanıtlar cache'lenir — hatadan gelen boş liste TTL
     // boyunca "gerçek boş piyasa" gibi servis edilmez.
     if !list.is_empty() {
-        app.instruments_cache.lock().await.insert(key, (state::now_ms(), list.clone()));
+        app.instruments_cache
+            .lock()
+            .await
+            .insert(key, (state::now_ms(), list.clone()));
     }
     Json(json!({"instruments": list, "cached": false}))
 }
@@ -3222,7 +4031,10 @@ async fn tickers(State(app): State<Arc<AppState>>, Query(q): Query<MarketsQuery>
         "PAPER" => Vec::new(),
         _ => app.bybit.tickers_24h(&category).await.unwrap_or_default(),
     };
-    app.tickers_cache.lock().await.insert(key, (state::now_ms(), rows.clone()));
+    app.tickers_cache
+        .lock()
+        .await
+        .insert(key, (state::now_ms(), rows.clone()));
     Json(json!({"tickers": rows, "cached": false}))
 }
 
@@ -3273,13 +4085,26 @@ struct ParityReq {
 }
 
 fn frac_match_pct(a: &Fraction, b: &Fraction) -> f64 {
-    let denom = a.to_f64_display().abs().max(b.to_f64_display().abs()).max(1e-12);
+    let denom = a
+        .to_f64_display()
+        .abs()
+        .max(b.to_f64_display().abs())
+        .max(1e-12);
     (1.0 - (a.to_f64_display() - b.to_f64_display()).abs() / denom).max(0.0)
 }
 
-async fn parity(State(app): State<Arc<AppState>>, Json(req): Json<ParityReq>) -> Result<Json<Value>, axum::response::Response> {
+async fn parity(
+    State(app): State<Arc<AppState>>,
+    Json(req): Json<ParityReq>,
+) -> Result<Json<Value>, axum::response::Response> {
     let bars_req = req.bars.min(1000).max(1);
-    let (kind_s, symbol, start_cash, cfg_json, interval_row): (String, String, String, String, Option<String>) = {
+    let (kind_s, symbol, start_cash, cfg_json, interval_row): (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+    ) = {
         let conn = app.db.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.query_row(
             "SELECT kind, symbol, start_cash, config, interval FROM bots WHERE id=?1",
@@ -3289,14 +4114,24 @@ async fn parity(State(app): State<Arc<AppState>>, Json(req): Json<ParityReq>) ->
         .map_err(|_| err422("bot not found"))?
     };
     let kind = parse_kind(&kind_s).map_err(err422)?;
-    let mut cfg: BotConfig = serde_json::from_str(&cfg_json).map_err(|e| err422(format!("config: {e}")))?;
+    let mut cfg: BotConfig =
+        serde_json::from_str(&cfg_json).map_err(|e| err422(format!("config: {e}")))?;
     cfg.kind = kind;
     cfg.symbol = symbol.clone();
-    let iv = req.interval.clone().or(interval_row).unwrap_or_else(|| "1h".into());
+    let iv = req
+        .interval
+        .clone()
+        .or(interval_row)
+        .unwrap_or_else(|| "1h".into());
     let category = if kind.is_futures() { "linear" } else { "spot" };
     let kl = app
         .bybit
-        .klines(category, &symbol, &engine::bybit_interval(&iv).map_err(err422)?, bars_req)
+        .klines(
+            category,
+            &symbol,
+            &engine::bybit_interval(&iv).map_err(err422)?,
+            bars_req,
+        )
         .await
         .map_err(err422)?;
     if kl.len() < 5 {
@@ -3324,25 +4159,47 @@ async fn parity(State(app): State<Arc<AppState>>, Json(req): Json<ParityReq>) ->
     };
     // Backtest tarafı: aynı config, aynı barlar, tek gerçekçi geçiş.
     let inst = {
-        let insts = app.bybit.instruments(category, Some(&symbol)).await.unwrap_or_default();
+        let insts = app
+            .bybit
+            .instruments(category, Some(&symbol))
+            .await
+            .unwrap_or_default();
         insts.into_iter().next().unwrap_or_else(|| {
             let mut i = Instrument::default();
             i.symbol = symbol.clone();
             i
         })
     };
-    let start = Fraction::from_decimal_str(&start_cash).unwrap_or_else(|_| Fraction::from_u64(100_000));
+    let start =
+        Fraction::from_decimal_str(&start_cash).unwrap_or_else(|_| Fraction::from_u64(100_000));
     let session = dca_math::sessions::SessionType::Crypto24_7;
     let bars_n: Vec<dca_kernel::Bar> = kl
         .iter()
-        .map(|k| dca_kernel::Bar { t: k.t, o: k.o.clone(), h: k.h.clone(), l: k.l.clone(), c: k.c.clone(), v: k.v.clone() })
+        .map(|k| dca_kernel::Bar {
+            t: k.t,
+            o: k.o.clone(),
+            h: k.h.clone(),
+            l: k.l.clone(),
+            c: k.c.clone(),
+            v: k.v.clone(),
+        })
         .collect();
     let result = run_backtest(&bars_n, &inst, &cfg, start, session, &[]).map_err(err422)?;
     let n_bt = result.fills.len() as u64;
-    let fee_bt = Fraction::from_any_str(&result.metrics.total_fees).unwrap_or_else(|_| Fraction::zero());
-    let avg_paper = if n_paper > 0 { fee_paper.to_f64_display() / n_paper as f64 } else { 0.0 };
-    let avg_bt = if n_bt > 0 { fee_bt.to_f64_display() / n_bt as f64 } else { 0.0 };
-    let count_match = 1.0 - (n_bt as f64 - n_paper as f64).abs() / (n_bt.max(n_paper).max(1) as f64);
+    let fee_bt =
+        Fraction::from_any_str(&result.metrics.total_fees).unwrap_or_else(|_| Fraction::zero());
+    let avg_paper = if n_paper > 0 {
+        fee_paper.to_f64_display() / n_paper as f64
+    } else {
+        0.0
+    };
+    let avg_bt = if n_bt > 0 {
+        fee_bt.to_f64_display() / n_bt as f64
+    } else {
+        0.0
+    };
+    let count_match =
+        1.0 - (n_bt as f64 - n_paper as f64).abs() / (n_bt.max(n_paper).max(1) as f64);
     let denom = avg_paper.abs().max(avg_bt.abs()).max(1e-12);
     let fee_match = (1.0 - (avg_bt - avg_paper).abs() / denom).max(0.0);
     let verdict = if n_paper < 10 {
@@ -3389,7 +4246,10 @@ struct ReconcileQuery {
     bot_id: String,
 }
 
-async fn reconcile(State(app): State<Arc<AppState>>, Query(q): Query<ReconcileQuery>) -> Result<Json<Value>, axum::response::Response> {
+async fn reconcile(
+    State(app): State<Arc<AppState>>,
+    Query(q): Query<ReconcileQuery>,
+) -> Result<Json<Value>, axum::response::Response> {
     let (mode, venue, symbol, local_side, local_qty) = {
         let rts = app.runtimes.lock().await;
         let rt = rts.get(&q.bot_id).ok_or_else(|| err422("bot not found"))?;
@@ -3409,7 +4269,13 @@ async fn reconcile(State(app): State<Arc<AppState>>, Query(q): Query<ReconcileQu
                 })));
             }
         };
-        (rt.mode.clone(), rt.venue.clone(), rt.cfg.symbol.clone(), local_side, local_qty)
+        (
+            rt.mode.clone(),
+            rt.venue.clone(),
+            rt.cfg.symbol.clone(),
+            local_side,
+            local_qty,
+        )
     };
     if mode == "PAPER" {
         return Ok(Json(json!({
@@ -3421,7 +4287,9 @@ async fn reconcile(State(app): State<Arc<AppState>>, Query(q): Query<ReconcileQu
     let creds = store::load_active_key(&app.db, &app.vault, &venue)
         .map_err(err422)?
         .ok_or_else(|| err422("bu venue için aktif vault anahtarı yok"))?;
-    let adapter = app.adapter(&venue).ok_or_else(|| err422("venue desteklenmiyor"))?;
+    let adapter = app
+        .adapter(&venue)
+        .ok_or_else(|| err422("venue desteklenmiyor"))?;
     let positions = adapter.positions(&creds, &symbol).await.map_err(err422)?;
     let open: Vec<Value> = positions
         .iter()
@@ -3434,7 +4302,10 @@ async fn reconcile(State(app): State<Arc<AppState>>, Query(q): Query<ReconcileQu
         open.is_empty()
     } else {
         open.len() == 1
-            && open[0]["side"].as_str().map(|s| s.eq_ignore_ascii_case(&local_side)).unwrap_or(false)
+            && open[0]["side"]
+                .as_str()
+                .map(|s| s.eq_ignore_ascii_case(&local_side))
+                .unwrap_or(false)
             && open[0]["size"]
                 .as_str()
                 .and_then(|s| Fraction::from_any_str(s).ok())
@@ -3469,13 +4340,25 @@ struct SelfCheckReq {
 }
 
 fn active_keypair(app: &Arc<AppState>, venue: &str) -> Option<VenueCreds> {
-    store::load_active_key(&app.db, &app.vault, venue).ok().flatten()
+    store::load_active_key(&app.db, &app.vault, venue)
+        .ok()
+        .flatten()
 }
 
-async fn selfcheck(State(app): State<Arc<AppState>>, body: Option<Json<SelfCheckReq>>) -> Json<Value> {
+async fn selfcheck(
+    State(app): State<Arc<AppState>>,
+    body: Option<Json<SelfCheckReq>>,
+) -> Json<Value> {
     let symbol = body
         .and_then(|b| b.symbol.clone())
-        .map(|s| s.trim().to_uppercase().chars().filter(|c| c.is_ascii_alphanumeric()).take(12).collect::<String>())
+        .map(|s| {
+            s.trim()
+                .to_uppercase()
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .take(12)
+                .collect::<String>()
+        })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "BTCUSDT".into());
     let t0 = std::time::Instant::now();
@@ -3502,65 +4385,233 @@ async fn selfcheck(State(app): State<Arc<AppState>>, body: Option<Json<SelfCheck
             .and_then(|a| Fraction::from_decimal_str("0.2").and_then(|b| a.add(&b)))
             .map(|s| s == Fraction::from_decimal_str("0.3").unwrap())
             .unwrap_or(false);
-        push!(1, "Yerel", "Matematik öz-test (0.1+0.2=0.3 exact)", if ok { "PASS" } else { "FAIL" }, if ok { "rasyonel çekirdek sağlam" } else { "KESİR HATASI" }, t.elapsed().as_millis() as u64);
+        push!(
+            1,
+            "Yerel",
+            "Matematik öz-test (0.1+0.2=0.3 exact)",
+            if ok { "PASS" } else { "FAIL" },
+            if ok {
+                "rasyonel çekirdek sağlam"
+            } else {
+                "KESİR HATASI"
+            },
+            t.elapsed().as_millis() as u64
+        );
     }
     {
-        push!(2, "Yerel", "8 fail-closed gate aktif", "PASS", "G1..G8 (veri/fee/slippage/lookahead/realism/sermaye/seans/salvo-gap)", 0);
+        push!(
+            2,
+            "Yerel",
+            "8 fail-closed gate aktif",
+            "PASS",
+            "G1..G8 (veri/fee/slippage/lookahead/realism/sermaye/seans/salvo-gap)",
+            0
+        );
     }
     {
         let t = std::time::Instant::now();
-        let ok = app.db.conn.lock().map(|c| c.query_row::<i64, _, _>("SELECT 1", [], |r| r.get(0))).unwrap_or(Ok(0)).unwrap_or(0) == 1;
-        push!(3, "Yerel", "SQLite WAL okunabilir", if ok { "PASS" } else { "FAIL" }, if ok { "SELECT 1" } else { "DB kilitli/bozuk" }, t.elapsed().as_millis() as u64);
+        let ok = app
+            .db
+            .conn
+            .lock()
+            .map(|c| c.query_row::<i64, _, _>("SELECT 1", [], |r| r.get(0)))
+            .unwrap_or(Ok(0))
+            .unwrap_or(0)
+            == 1;
+        push!(
+            3,
+            "Yerel",
+            "SQLite WAL okunabilir",
+            if ok { "PASS" } else { "FAIL" },
+            if ok { "SELECT 1" } else { "DB kilitli/bozuk" },
+            t.elapsed().as_millis() as u64
+        );
     }
     {
         let (n, ok) = match app.db.conn.lock() {
-            Ok(c) => (c.query_row::<i64, _, _>("SELECT COUNT(*) FROM vault_keys WHERE active=1", [], |r| r.get(0)).unwrap_or(-1), true),
+            Ok(c) => (
+                c.query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM vault_keys WHERE active=1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(-1),
+                true,
+            ),
             Err(_) => (-1, false),
         };
-        push!(4, "Yerel", "Kasa (vault) açılıyor", if ok { "PASS" } else { "FAIL" }, if n >= 0 { format!("{n} aktif anahtar kaydı") } else { "kasa okunamadı".into() }, 0);
+        push!(
+            4,
+            "Yerel",
+            "Kasa (vault) açılıyor",
+            if ok { "PASS" } else { "FAIL" },
+            if n >= 0 {
+                format!("{n} aktif anahtar kaydı")
+            } else {
+                "kasa okunamadı".into()
+            },
+            0
+        );
     }
     {
-        let n = app.db.conn.lock().map(|c| c.query_row::<i64, _, _>("SELECT COUNT(*) FROM bots", [], |r| r.get(0)).unwrap_or(-1)).unwrap_or(-1);
-        push!(5, "Yerel", "Bot kayıtları okunabilir", if n >= 0 { "PASS" } else { "FAIL" }, if n >= 0 { format!("{n} bot kaydı") } else { "bots okunamadı".into() }, 0);
+        let n = app
+            .db
+            .conn
+            .lock()
+            .map(|c| {
+                c.query_row::<i64, _, _>("SELECT COUNT(*) FROM bots", [], |r| r.get(0))
+                    .unwrap_or(-1)
+            })
+            .unwrap_or(-1);
+        push!(
+            5,
+            "Yerel",
+            "Bot kayıtları okunabilir",
+            if n >= 0 { "PASS" } else { "FAIL" },
+            if n >= 0 {
+                format!("{n} bot kaydı")
+            } else {
+                "bots okunamadı".into()
+            },
+            0
+        );
     }
     {
-        let n = app.db.conn.lock().map(|c| c.query_row::<i64, _, _>("SELECT COUNT(*) FROM parity_checks", [], |r| r.get(0)).unwrap_or(-1)).unwrap_or(-1);
-        push!(6, "Yerel", "Parite arşivi okunabilir", if n >= 0 { "PASS" } else { "FAIL" }, if n >= 0 { format!("{n} parite kaydı") } else { "parity okunamadı".into() }, 0);
+        let n = app
+            .db
+            .conn
+            .lock()
+            .map(|c| {
+                c.query_row::<i64, _, _>("SELECT COUNT(*) FROM parity_checks", [], |r| r.get(0))
+                    .unwrap_or(-1)
+            })
+            .unwrap_or(-1);
+        push!(
+            6,
+            "Yerel",
+            "Parite arşivi okunabilir",
+            if n >= 0 { "PASS" } else { "FAIL" },
+            if n >= 0 {
+                format!("{n} parite kaydı")
+            } else {
+                "parity okunamadı".into()
+            },
+            0
+        );
     }
     // ---- Ortam (halka açık ağ) ----
     {
         let t = std::time::Instant::now();
         match app.bybit.server_time_ms().await {
-            Ok(ts) if ts > 0 => push!(7, "Ortam", "Bybit saat", "PASS", format!("server_time_ms={ts}"), t.elapsed().as_millis() as u64),
-            _ => push!(7, "Ortam", "Bybit saat", "FAIL", "Bybit'e erişilemiyor", t.elapsed().as_millis() as u64),
+            Ok(ts) if ts > 0 => push!(
+                7,
+                "Ortam",
+                "Bybit saat",
+                "PASS",
+                format!("server_time_ms={ts}"),
+                t.elapsed().as_millis() as u64
+            ),
+            _ => push!(
+                7,
+                "Ortam",
+                "Bybit saat",
+                "FAIL",
+                "Bybit'e erişilemiyor",
+                t.elapsed().as_millis() as u64
+            ),
         }
     }
     {
         let t = std::time::Instant::now();
-        match app.bybit.klines("linear", &symbol, &engine::bybit_interval("1h").unwrap_or("60".into()), 5).await {
-            Ok(b) if !b.is_empty() => push!(8, "Ortam", "Bybit klines (linear)", "PASS", format!("{}: {} bar", symbol, b.len()), t.elapsed().as_millis() as u64),
-            _ => push!(8, "Ortam", "Bybit klines (linear)", "FAIL", format!("{symbol} bar alınamadı"), t.elapsed().as_millis() as u64),
+        match app
+            .bybit
+            .klines(
+                "linear",
+                &symbol,
+                &engine::bybit_interval("1h").unwrap_or("60".into()),
+                5,
+            )
+            .await
+        {
+            Ok(b) if !b.is_empty() => push!(
+                8,
+                "Ortam",
+                "Bybit klines (linear)",
+                "PASS",
+                format!("{}: {} bar", symbol, b.len()),
+                t.elapsed().as_millis() as u64
+            ),
+            _ => push!(
+                8,
+                "Ortam",
+                "Bybit klines (linear)",
+                "FAIL",
+                format!("{symbol} bar alınamadı"),
+                t.elapsed().as_millis() as u64
+            ),
         }
     }
     {
         let t = std::time::Instant::now();
         match app.bybit.instruments("linear", None).await {
-            Ok(list) if !list.is_empty() => push!(9, "Ortam", "Bybit enstrüman listesi", "PASS", format!("{} linear çift", list.len()), t.elapsed().as_millis() as u64),
-            _ => push!(9, "Ortam", "Bybit enstrüman listesi", "FAIL", "liste boş", t.elapsed().as_millis() as u64),
+            Ok(list) if !list.is_empty() => push!(
+                9,
+                "Ortam",
+                "Bybit enstrüman listesi",
+                "PASS",
+                format!("{} linear çift", list.len()),
+                t.elapsed().as_millis() as u64
+            ),
+            _ => push!(
+                9,
+                "Ortam",
+                "Bybit enstrüman listesi",
+                "FAIL",
+                "liste boş",
+                t.elapsed().as_millis() as u64
+            ),
         }
     }
     {
         let t = std::time::Instant::now();
         match app.bybit.tickers_24h("linear").await {
-            Ok(list) if !list.is_empty() => push!(10, "Ortam", "Bybit 24s ticker akışı", "PASS", format!("{} satır", list.len()), t.elapsed().as_millis() as u64),
-            _ => push!(10, "Ortam", "Bybit 24s ticker akışı", "FAIL", "ticker boş", t.elapsed().as_millis() as u64),
+            Ok(list) if !list.is_empty() => push!(
+                10,
+                "Ortam",
+                "Bybit 24s ticker akışı",
+                "PASS",
+                format!("{} satır", list.len()),
+                t.elapsed().as_millis() as u64
+            ),
+            _ => push!(
+                10,
+                "Ortam",
+                "Bybit 24s ticker akışı",
+                "FAIL",
+                "ticker boş",
+                t.elapsed().as_millis() as u64
+            ),
         }
     }
     {
         let t = std::time::Instant::now();
         match app.binance.server_time_ms().await {
-            Ok(ts) if ts > 0 => push!(11, "Ortam", "Binance saat", "PASS", format!("server_time_ms={ts}"), t.elapsed().as_millis() as u64),
-            _ => push!(11, "Ortam", "Binance saat", "ABSTAIN", "Binance'e erişilemiyor — atlandı (dürüst abstention)", t.elapsed().as_millis() as u64),
+            Ok(ts) if ts > 0 => push!(
+                11,
+                "Ortam",
+                "Binance saat",
+                "PASS",
+                format!("server_time_ms={ts}"),
+                t.elapsed().as_millis() as u64
+            ),
+            _ => push!(
+                11,
+                "Ortam",
+                "Binance saat",
+                "ABSTAIN",
+                "Binance'e erişilemiyor — atlandı (dürüst abstention)",
+                t.elapsed().as_millis() as u64
+            ),
         }
     }
     // ---- İmza: Bybit (anahtarlı) ----
@@ -3570,39 +4621,151 @@ async fn selfcheck(State(app): State<Arc<AppState>>, body: Option<Json<SelfCheck
         let t = std::time::Instant::now();
         match app.bybit.key_permissions(&creds).await {
             Ok(p) => {
-                push!(12, "İmza/Bybit", "Anahtar geçerli", "PASS", p.note.chars().take(120).collect::<String>(), t.elapsed().as_millis() as u64);
-                push!(13, "İmza/Bybit", "Trade yetkisi", if p.spot_trade || p.contract_trade { "PASS" } else { "FAIL" }, format!("spot={} contract={}", p.spot_trade, p.contract_trade), 0);
+                push!(
+                    12,
+                    "İmza/Bybit",
+                    "Anahtar geçerli",
+                    "PASS",
+                    p.note.chars().take(120).collect::<String>(),
+                    t.elapsed().as_millis() as u64
+                );
+                push!(
+                    13,
+                    "İmza/Bybit",
+                    "Trade yetkisi",
+                    if p.spot_trade || p.contract_trade {
+                        "PASS"
+                    } else {
+                        "FAIL"
+                    },
+                    format!("spot={} contract={}", p.spot_trade, p.contract_trade),
+                    0
+                );
                 if p.can_withdraw {
                     hard_fail = true;
-                    push!(14, "İmza/Bybit", "Çekim yasağı (HARD-FAIL)", "FAIL", "canWithdraw AÇIK — anahtarı derhal değiştirin", 0);
+                    push!(
+                        14,
+                        "İmza/Bybit",
+                        "Çekim yasağı (HARD-FAIL)",
+                        "FAIL",
+                        "canWithdraw AÇIK — anahtarı derhal değiştirin",
+                        0
+                    );
                 } else {
-                    push!(14, "İmza/Bybit", "Çekim yasağı (HARD-FAIL)", "PASS", "withdraw kapalı", 0);
+                    push!(
+                        14,
+                        "İmza/Bybit",
+                        "Çekim yasağı (HARD-FAIL)",
+                        "PASS",
+                        "withdraw kapalı",
+                        0
+                    );
                 }
                 if p.read_only {
-                    push!(15, "İmza/Bybit", "Salt-okunur değil", "FAIL", "anahtar read-only — trade yetkisi yok", 0);
+                    push!(
+                        15,
+                        "İmza/Bybit",
+                        "Salt-okunur değil",
+                        "FAIL",
+                        "anahtar read-only — trade yetkisi yok",
+                        0
+                    );
                 } else {
-                    push!(15, "İmza/Bybit", "Salt-okunur değil", "PASS", "trade yetkisi var", 0);
+                    push!(
+                        15,
+                        "İmza/Bybit",
+                        "Salt-okunur değil",
+                        "PASS",
+                        "trade yetkisi var",
+                        0
+                    );
                 }
             }
             Err(e) => {
                 for id in 12..=15 {
-                    push!(id, "İmza/Bybit", if id == 12 { "Anahtar geçerli" } else if id == 13 { "Trade yetkisi" } else if id == 14 { "Çekim yasağı (HARD-FAIL)" } else { "Salt-okunur değil" }, "FAIL", format!("izin sondası başarısız: {}", e.chars().take(100).collect::<String>()), 0);
+                    push!(
+                        id,
+                        "İmza/Bybit",
+                        if id == 12 {
+                            "Anahtar geçerli"
+                        } else if id == 13 {
+                            "Trade yetkisi"
+                        } else if id == 14 {
+                            "Çekim yasağı (HARD-FAIL)"
+                        } else {
+                            "Salt-okunur değil"
+                        },
+                        "FAIL",
+                        format!(
+                            "izin sondası başarısız: {}",
+                            e.chars().take(100).collect::<String>()
+                        ),
+                        0
+                    );
                 }
             }
         }
         let t = std::time::Instant::now();
         match app.bybit.wallet(&creds, "USDT").await {
-            Ok(w) => push!(16, "İmza/Bybit", "Cüzdan okuma (USDT)", "PASS", format!("bakiye {}", w.wallet_balance.to_half_even_display(4)), t.elapsed().as_millis() as u64),
-            Err(e) => push!(16, "İmza/Bybit", "Cüzdan okuma (USDT)", "FAIL", format!("cüzdan okunamadı: {}", e.chars().take(100).collect::<String>()), t.elapsed().as_millis() as u64),
+            Ok(w) => push!(
+                16,
+                "İmza/Bybit",
+                "Cüzdan okuma (USDT)",
+                "PASS",
+                format!("bakiye {}", w.wallet_balance.to_half_even_display(4)),
+                t.elapsed().as_millis() as u64
+            ),
+            Err(e) => push!(
+                16,
+                "İmza/Bybit",
+                "Cüzdan okuma (USDT)",
+                "FAIL",
+                format!(
+                    "cüzdan okunamadı: {}",
+                    e.chars().take(100).collect::<String>()
+                ),
+                t.elapsed().as_millis() as u64
+            ),
         }
         let t = std::time::Instant::now();
         match app.bybit.positions(&creds, &symbol).await {
-            Ok(pos) => push!(17, "İmza/Bybit", "Pozisyon okuma", "PASS", format!("{}: {} kayıt", symbol, pos.len()), t.elapsed().as_millis() as u64),
-            Err(e) => push!(17, "İmza/Bybit", "Pozisyon okuma", "FAIL", format!("pozisyon okunamadı: {}", e.chars().take(100).collect::<String>()), t.elapsed().as_millis() as u64),
+            Ok(pos) => push!(
+                17,
+                "İmza/Bybit",
+                "Pozisyon okuma",
+                "PASS",
+                format!("{}: {} kayıt", symbol, pos.len()),
+                t.elapsed().as_millis() as u64
+            ),
+            Err(e) => push!(
+                17,
+                "İmza/Bybit",
+                "Pozisyon okuma",
+                "FAIL",
+                format!(
+                    "pozisyon okunamadı: {}",
+                    e.chars().take(100).collect::<String>()
+                ),
+                t.elapsed().as_millis() as u64
+            ),
         }
     } else {
-        for (id, name) in [(12, "Anahtar geçerli"), (13, "Trade yetkisi"), (14, "Çekim yasağı (HARD-FAIL)"), (15, "Salt-okunur değil"), (16, "Cüzdan okuma (USDT)"), (17, "Pozisyon okuma")] {
-            push!(id, "İmza/Bybit", name, "ABSTAIN", "Bybit anahtarı yok — atlandı", 0);
+        for (id, name) in [
+            (12, "Anahtar geçerli"),
+            (13, "Trade yetkisi"),
+            (14, "Çekim yasağı (HARD-FAIL)"),
+            (15, "Salt-okunur değil"),
+            (16, "Cüzdan okuma (USDT)"),
+            (17, "Pozisyon okuma"),
+        ] {
+            push!(
+                id,
+                "İmza/Bybit",
+                name,
+                "ABSTAIN",
+                "Bybit anahtarı yok — atlandı",
+                0
+            );
         }
     }
     // ---- İmza: Binance (anahtarlı) ----
@@ -3610,60 +4773,215 @@ async fn selfcheck(State(app): State<Arc<AppState>>, body: Option<Json<SelfCheck
         let t = std::time::Instant::now();
         match app.binance.key_permissions(&creds).await {
             Ok(p) => {
-                push!(18, "İmza/Binance", "Anahtar geçerli", "PASS", p.note.chars().take(120).collect::<String>(), t.elapsed().as_millis() as u64);
-                push!(19, "İmza/Binance", "Trade yetkisi + çekim yasağı", if (p.spot_trade || p.contract_trade) && !p.can_withdraw { "PASS" } else { "FAIL" }, format!("trade={}/{}, withdraw={}", p.spot_trade, p.contract_trade, p.can_withdraw), 0);
+                push!(
+                    18,
+                    "İmza/Binance",
+                    "Anahtar geçerli",
+                    "PASS",
+                    p.note.chars().take(120).collect::<String>(),
+                    t.elapsed().as_millis() as u64
+                );
+                push!(
+                    19,
+                    "İmza/Binance",
+                    "Trade yetkisi + çekim yasağı",
+                    if (p.spot_trade || p.contract_trade) && !p.can_withdraw {
+                        "PASS"
+                    } else {
+                        "FAIL"
+                    },
+                    format!(
+                        "trade={}/{}, withdraw={}",
+                        p.spot_trade, p.contract_trade, p.can_withdraw
+                    ),
+                    0
+                );
                 if p.can_withdraw {
                     hard_fail = true;
                 }
             }
             Err(e) => {
-                push!(18, "İmza/Binance", "Anahtar geçerli", "FAIL", format!("izin sondası başarısız: {}", e.chars().take(100).collect::<String>()), 0);
-                push!(19, "İmza/Binance", "Trade yetkisi + çekim yasağı", "ABSTAIN", "anahtar doğrulanamadı", 0);
+                push!(
+                    18,
+                    "İmza/Binance",
+                    "Anahtar geçerli",
+                    "FAIL",
+                    format!(
+                        "izin sondası başarısız: {}",
+                        e.chars().take(100).collect::<String>()
+                    ),
+                    0
+                );
+                push!(
+                    19,
+                    "İmza/Binance",
+                    "Trade yetkisi + çekim yasağı",
+                    "ABSTAIN",
+                    "anahtar doğrulanamadı",
+                    0
+                );
             }
         }
     } else {
-        push!(18, "İmza/Binance", "Anahtar geçerli", "ABSTAIN", "Binance anahtarı yok — atlandı", 0);
-        push!(19, "İmza/Binance", "Trade yetkisi + çekim yasağı", "ABSTAIN", "Binance anahtarı yok — atlandı", 0);
+        push!(
+            18,
+            "İmza/Binance",
+            "Anahtar geçerli",
+            "ABSTAIN",
+            "Binance anahtarı yok — atlandı",
+            0
+        );
+        push!(
+            19,
+            "İmza/Binance",
+            "Trade yetkisi + çekim yasağı",
+            "ABSTAIN",
+            "Binance anahtarı yok — atlandı",
+            0
+        );
     }
     // ---- İmza: OKX (anahtarlı) ----
     // 20 halka-açık saat, 21 halka-açık klines, 22-23 imzalı sondalar.
     {
         let t = std::time::Instant::now();
         match app.okx.server_time_ms().await {
-            Ok(ts) if ts > 0 => push!(20, "Ortam", "OKX saat", "PASS", format!("server_time_ms={ts}"), t.elapsed().as_millis() as u64),
-            _ => push!(20, "Ortam", "OKX saat", "ABSTAIN", "OKX'e erişilemiyor — atlandı (dürüst abstention)", t.elapsed().as_millis() as u64),
+            Ok(ts) if ts > 0 => push!(
+                20,
+                "Ortam",
+                "OKX saat",
+                "PASS",
+                format!("server_time_ms={ts}"),
+                t.elapsed().as_millis() as u64
+            ),
+            _ => push!(
+                20,
+                "Ortam",
+                "OKX saat",
+                "ABSTAIN",
+                "OKX'e erişilemiyor — atlandı (dürüst abstention)",
+                t.elapsed().as_millis() as u64
+            ),
         }
     }
     {
         let t = std::time::Instant::now();
         match app.okx.klines("spot", &symbol, "1H", 5).await {
-            Ok(b) if !b.is_empty() => push!(21, "Ortam", "OKX klines (spot)", "PASS", format!("{}: {} bar", symbol, b.len()), t.elapsed().as_millis() as u64),
-            _ => push!(21, "Ortam", "OKX klines (spot)", "ABSTAIN", format!("{symbol} bar alınamadı — atlandı"), t.elapsed().as_millis() as u64),
+            Ok(b) if !b.is_empty() => push!(
+                21,
+                "Ortam",
+                "OKX klines (spot)",
+                "PASS",
+                format!("{}: {} bar", symbol, b.len()),
+                t.elapsed().as_millis() as u64
+            ),
+            _ => push!(
+                21,
+                "Ortam",
+                "OKX klines (spot)",
+                "ABSTAIN",
+                format!("{symbol} bar alınamadı — atlandı"),
+                t.elapsed().as_millis() as u64
+            ),
         }
     }
     let okx_keys = active_keypair(&app, "OKX");
     if let Some(creds) = okx_keys {
-        if creds.passphrase.as_deref().map(|p| p.trim().is_empty()).unwrap_or(true) {
-            push!(22, "İmza/OKX", "Anahtar + passphrase", "FAIL", "passphrase yok — anahtarı passphrase ile yeniden ekleyin", 0);
-            push!(23, "İmza/OKX", "Cüzdan okuma (USDT)", "ABSTAIN", "passphrase yok", 0);
+        if creds
+            .passphrase
+            .as_deref()
+            .map(|p| p.trim().is_empty())
+            .unwrap_or(true)
+        {
+            push!(
+                22,
+                "İmza/OKX",
+                "Anahtar + passphrase",
+                "FAIL",
+                "passphrase yok — anahtarı passphrase ile yeniden ekleyin",
+                0
+            );
+            push!(
+                23,
+                "İmza/OKX",
+                "Cüzdan okuma (USDT)",
+                "ABSTAIN",
+                "passphrase yok",
+                0
+            );
         } else {
             let t = std::time::Instant::now();
             match app.okx.key_permissions(&creds).await {
-                Ok(p) => push!(22, "İmza/OKX", "Anahtar + passphrase", "PASS", p.note.chars().take(120).collect::<String>(), t.elapsed().as_millis() as u64),
-                Err(e) => push!(22, "İmza/OKX", "Anahtar + passphrase", "FAIL", format!("izin sondası başarısız: {}", e.chars().take(100).collect::<String>()), t.elapsed().as_millis() as u64),
+                Ok(p) => push!(
+                    22,
+                    "İmza/OKX",
+                    "Anahtar + passphrase",
+                    "PASS",
+                    p.note.chars().take(120).collect::<String>(),
+                    t.elapsed().as_millis() as u64
+                ),
+                Err(e) => push!(
+                    22,
+                    "İmza/OKX",
+                    "Anahtar + passphrase",
+                    "FAIL",
+                    format!(
+                        "izin sondası başarısız: {}",
+                        e.chars().take(100).collect::<String>()
+                    ),
+                    t.elapsed().as_millis() as u64
+                ),
             }
             let t = std::time::Instant::now();
             match app.okx.wallet(&creds, "USDT").await {
-                Ok(w) => push!(23, "İmza/OKX", "Cüzdan okuma (USDT)", "PASS", format!("bakiye {}", w.wallet_balance.to_half_even_display(4)), t.elapsed().as_millis() as u64),
-                Err(e) => push!(23, "İmza/OKX", "Cüzdan okuma (USDT)", "FAIL", format!("cüzdan okunamadı: {}", e.chars().take(100).collect::<String>()), t.elapsed().as_millis() as u64),
+                Ok(w) => push!(
+                    23,
+                    "İmza/OKX",
+                    "Cüzdan okuma (USDT)",
+                    "PASS",
+                    format!("bakiye {}", w.wallet_balance.to_half_even_display(4)),
+                    t.elapsed().as_millis() as u64
+                ),
+                Err(e) => push!(
+                    23,
+                    "İmza/OKX",
+                    "Cüzdan okuma (USDT)",
+                    "FAIL",
+                    format!(
+                        "cüzdan okunamadı: {}",
+                        e.chars().take(100).collect::<String>()
+                    ),
+                    t.elapsed().as_millis() as u64
+                ),
             }
         }
     } else {
-        push!(22, "İmza/OKX", "Anahtar + passphrase", "ABSTAIN", "OKX anahtarı yok — atlandı", 0);
-        push!(23, "İmza/OKX", "Cüzdan okuma (USDT)", "ABSTAIN", "OKX anahtarı yok — atlandı", 0);
+        push!(
+            22,
+            "İmza/OKX",
+            "Anahtar + passphrase",
+            "ABSTAIN",
+            "OKX anahtarı yok — atlandı",
+            0
+        );
+        push!(
+            23,
+            "İmza/OKX",
+            "Cüzdan okuma (USDT)",
+            "ABSTAIN",
+            "OKX anahtarı yok — atlandı",
+            0
+        );
     }
-    let has_keys = has_any_key || active_keypair(&app, "BINANCE").is_some() || active_keypair(&app, "OKX").is_some();
-    let verdict = if hard_fail || failed > 0 { "KALDI" } else if has_keys { "GECTI" } else { "YETERSIZ_ORTAM" };
+    let has_keys = has_any_key
+        || active_keypair(&app, "BINANCE").is_some()
+        || active_keypair(&app, "OKX").is_some();
+    let verdict = if hard_fail || failed > 0 {
+        "KALDI"
+    } else if has_keys {
+        "GECTI"
+    } else {
+        "YETERSIZ_ORTAM"
+    };
     let _ran = passed + failed;
     let note = if hard_fail {
         "HARD-FAIL: çekim yetkisi açık anahtar var — canlı hat derhal kilitlenmeli. Withdraw yetkisini kaldırın."
@@ -3675,7 +4993,14 @@ async fn selfcheck(State(app): State<Arc<AppState>>, body: Option<Json<SelfCheck
         "Anahtar yok: ortam kontrolleri geçti, imzalılar atlandı. Anahtarlar Ayarlar > Kasa'ya eklenir."
     };
     let elapsed = t0.elapsed().as_millis() as u64;
-    state::persist_event(&app, "SYSTEM", "INFO", "SELF_CHECK", &format!("verdict={verdict} passed={passed} failed={failed} abstained={abstained}")).await;
+    state::persist_event(
+        &app,
+        "SYSTEM",
+        "INFO",
+        "SELF_CHECK",
+        &format!("verdict={verdict} passed={passed} failed={failed} abstained={abstained}"),
+    )
+    .await;
     Json(json!({
         "verdict": verdict,
         "passed": passed,
@@ -3697,19 +5022,28 @@ async fn selfcheck(State(app): State<Arc<AppState>>, body: Option<Json<SelfCheck
 // (yardımcı `is_blacklisted` routes_common.rs'tedir — import satır 38.)
 
 async fn list_blacklist(State(app): State<Arc<AppState>>) -> Json<Value> {
-    let rows: Vec<Value> = app.db.conn.lock().map(|c| {
-        let mut stmt = match c.prepare("SELECT pair, reason, created_at FROM pair_blacklist ORDER BY pair") {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        stmt.query_map([], |r| {
-            Ok(json!({
-                "pair": r.get::<_, String>(0)?,
-                "reason": r.get::<_, Option<String>>(1)?,
-                "createdAt": r.get::<_, i64>(2)?,
-            }))
-        }).map(|it| it.filter_map(|r| r.ok()).collect()).unwrap_or_default()
-    }).unwrap_or_default();
+    let rows: Vec<Value> = app
+        .db
+        .conn
+        .lock()
+        .map(|c| {
+            let mut stmt = match c
+                .prepare("SELECT pair, reason, created_at FROM pair_blacklist ORDER BY pair")
+            {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            stmt.query_map([], |r| {
+                Ok(json!({
+                    "pair": r.get::<_, String>(0)?,
+                    "reason": r.get::<_, Option<String>>(1)?,
+                    "createdAt": r.get::<_, i64>(2)?,
+                }))
+            })
+            .map(|it| it.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
     Json(json!({"blacklist": rows}))
 }
 
@@ -3719,12 +5053,18 @@ struct BlacklistReq {
     reason: Option<String>,
 }
 
-async fn add_blacklist(State(app): State<Arc<AppState>>, Json(req): Json<BlacklistReq>) -> Result<Json<Value>, axum::response::Response> {
+async fn add_blacklist(
+    State(app): State<Arc<AppState>>,
+    Json(req): Json<BlacklistReq>,
+) -> Result<Json<Value>, axum::response::Response> {
     let pair = normalize_pair(&req.pair);
     if pair.is_empty() {
         return Err(err422("pair boş — örn. BTCUSDT"));
     }
-    let reason = req.reason.map(|r| r.chars().take(200).collect::<String>()).filter(|r| !r.trim().is_empty());
+    let reason = req
+        .reason
+        .map(|r| r.chars().take(200).collect::<String>())
+        .filter(|r| !r.trim().is_empty());
     let now = state::now_ms();
     {
         let conn = app.db.conn.lock().map_err(|_| err422("kasa kilitli"))?;
@@ -3733,20 +5073,40 @@ async fn add_blacklist(State(app): State<Arc<AppState>>, Json(req): Json<Blackli
             rusqlite::params![pair, reason, now],
         ).map_err(|e| err422(format!("kara liste yazılamadı: {e}")))?;
     }
-    state::persist_event(&app, "SYSTEM", "INFO", "BLACKLIST", &format!("eklendi/güncellendi: {pair}")).await;
-    Ok(Json(json!({"pair": pair, "reason": reason, "createdAt": now})))
+    state::persist_event(
+        &app,
+        "SYSTEM",
+        "INFO",
+        "BLACKLIST",
+        &format!("eklendi/güncellendi: {pair}"),
+    )
+    .await;
+    Ok(Json(
+        json!({"pair": pair, "reason": reason, "createdAt": now}),
+    ))
 }
 
-async fn remove_blacklist(State(app): State<Arc<AppState>>, Path(pair): Path<String>) -> Result<Json<Value>, axum::response::Response> {
+async fn remove_blacklist(
+    State(app): State<Arc<AppState>>,
+    Path(pair): Path<String>,
+) -> Result<Json<Value>, axum::response::Response> {
     let pair = normalize_pair(&pair);
     let n = {
         let conn = app.db.conn.lock().map_err(|_| err422("kasa kilitli"))?;
-        conn.execute("DELETE FROM pair_blacklist WHERE pair=?1", [&pair]).map_err(|e| err422(format!("kara liste silinemedi: {e}")))?
+        conn.execute("DELETE FROM pair_blacklist WHERE pair=?1", [&pair])
+            .map_err(|e| err422(format!("kara liste silinemedi: {e}")))?
     };
     if n == 0 {
         return Err(err404(format!("kara listede yok: {pair}")));
     }
-    state::persist_event(&app, "SYSTEM", "INFO", "BLACKLIST", &format!("kaldırıldı: {pair}")).await;
+    state::persist_event(
+        &app,
+        "SYSTEM",
+        "INFO",
+        "BLACKLIST",
+        &format!("kaldırıldı: {pair}"),
+    )
+    .await;
     Ok(Json(json!({"removed": pair})))
 }
 
@@ -3764,18 +5124,51 @@ struct RegimeQuery {
     category: Option<String>,
 }
 
-async fn analysis_regime(State(app): State<Arc<AppState>>, Query(q): Query<RegimeQuery>) -> Result<Json<Value>, axum::response::Response> {
-    let symbol = q.symbol.map(|s| normalize_pair(&s)).filter(|s| !s.is_empty()).unwrap_or_else(|| "BTCUSDT".into());
+async fn analysis_regime(
+    State(app): State<Arc<AppState>>,
+    Query(q): Query<RegimeQuery>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let symbol = q
+        .symbol
+        .map(|s| normalize_pair(&s))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "BTCUSDT".into());
     let iv = engine::bybit_interval(q.interval.as_deref().unwrap_or("1h")).map_err(err422)?;
     let bars = q.bars.unwrap_or(300).clamp(60, 1500);
     let kl = match q.venue.as_deref().unwrap_or("BYBIT") {
-        "BINANCE" => app.binance.klines(q.category.as_deref().unwrap_or("linear"), &symbol, &iv, bars).await,
+        "BINANCE" => {
+            app.binance
+                .klines(
+                    q.category.as_deref().unwrap_or("linear"),
+                    &symbol,
+                    &iv,
+                    bars,
+                )
+                .await
+        }
         "OKX" => {
             let oiv = dca_exchange::okx::okx_bar(&iv).map_err(err422)?;
-            app.okx.klines(q.category.as_deref().unwrap_or("linear"), &symbol, oiv, bars).await
+            app.okx
+                .klines(
+                    q.category.as_deref().unwrap_or("linear"),
+                    &symbol,
+                    oiv,
+                    bars,
+                )
+                .await
         }
-        _ => app.bybit.klines(q.category.as_deref().unwrap_or("linear"), &symbol, &iv, bars).await,
-    }.map_err(err422)?;
+        _ => {
+            app.bybit
+                .klines(
+                    q.category.as_deref().unwrap_or("linear"),
+                    &symbol,
+                    &iv,
+                    bars,
+                )
+                .await
+        }
+    }
+    .map_err(err422)?;
     if kl.len() < 60 {
         return Err(err422(format!("yetersiz bar: {} (min 60)", kl.len())));
     }
@@ -3805,14 +5198,32 @@ struct CalibrationReq {
     deviation_step_base: Option<String>,
 }
 
-async fn analysis_calibration(State(app): State<Arc<AppState>>, Json(req): Json<CalibrationReq>) -> Result<Json<Value>, axum::response::Response> {
-    let symbol = req.symbol.map(|s| normalize_pair(&s)).filter(|s| !s.is_empty()).unwrap_or_else(|| "BTCUSDT".into());
+async fn analysis_calibration(
+    State(app): State<Arc<AppState>>,
+    Json(req): Json<CalibrationReq>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let symbol = req
+        .symbol
+        .map(|s| normalize_pair(&s))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "BTCUSDT".into());
     let iv = engine::bybit_interval(req.interval.as_deref().unwrap_or("1h")).map_err(err422)?;
     let bars = req.bars.unwrap_or(500).clamp(60, 1000);
-    let kl = app.bybit.klines("linear", &symbol, &iv, bars).await.map_err(err422)?;
-    let closes: Vec<f64> = kl.iter().filter_map(|k| k.c.parse::<f64>().ok()).filter(|c| *c > 0.0).collect();
+    let kl = app
+        .bybit
+        .klines("linear", &symbol, &iv, bars)
+        .await
+        .map_err(err422)?;
+    let closes: Vec<f64> = kl
+        .iter()
+        .filter_map(|k| k.c.parse::<f64>().ok())
+        .filter(|c| *c > 0.0)
+        .collect();
     if closes.len() < 26 {
-        return Err(err422(format!("yetersiz kapanış: {} (min 26)", closes.len())));
+        return Err(err422(format!(
+            "yetersiz kapanış: {} (min 26)",
+            closes.len()
+        )));
     }
     let rets: Vec<f64> = closes.windows(2).map(|w| (w[1] / w[0]).ln()).collect();
     let n = rets.len() as f64;
@@ -3822,7 +5233,12 @@ async fn analysis_calibration(State(app): State<Arc<AppState>>, Json(req): Json<
     let mut sorted = rets.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let q05 = sorted[(0.05 * n).floor() as usize % sorted.len()];
-    let base = req.deviation_step_base.as_deref().and_then(|s| s.parse::<f64>().ok()).filter(|b| *b > 0.0).unwrap_or(0.3);
+    let base = req
+        .deviation_step_base
+        .as_deref()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|b| *b > 0.0)
+        .unwrap_or(0.3);
     let suggested = (2.0 * sigma * 100.0).clamp(base, 8.0);
     Ok(Json(json!({
         "symbol": symbol,
@@ -3845,20 +5261,33 @@ async fn analysis_calibration(State(app): State<Arc<AppState>>, Json(req): Json<
 // durdurma için Kill-switch/Freeze kullanılır).
 fn maint_flag(app: &Arc<AppState>) -> (bool, String) {
     let get = |k: &str| -> String {
-        app.db.conn.lock().ok()
-            .and_then(|c| c.query_row("SELECT v FROM settings WHERE k=?1", [k], |r| r.get::<_, String>(0)).ok())
+        app.db
+            .conn
+            .lock()
+            .ok()
+            .and_then(|c| {
+                c.query_row("SELECT v FROM settings WHERE k=?1", [k], |r| {
+                    r.get::<_, String>(0)
+                })
+                .ok()
+            })
             .unwrap_or_default()
     };
     (get("maint_quiet") == "1", get("maint_note"))
 }
 
-async fn venue_probe(name: &str, fut: impl std::future::Future<Output = Result<i64, String>>) -> Value {
+async fn venue_probe(
+    name: &str,
+    fut: impl std::future::Future<Output = Result<i64, String>>,
+) -> Value {
     let t = std::time::Instant::now();
     let ms = || t.elapsed().as_millis() as u64;
     match fut.await {
         Ok(ts) if ts > 0 => json!({"venue": name, "ok": true, "serverTimeMs": ts, "ms": ms()}),
         Ok(_) => json!({"venue": name, "ok": false, "error": "sıfır zaman", "ms": ms()}),
-        Err(e) => json!({"venue": name, "ok": false, "error": e.chars().take(120).collect::<String>(), "ms": ms()}),
+        Err(e) => {
+            json!({"venue": name, "ok": false, "error": e.chars().take(120).collect::<String>(), "ms": ms()})
+        }
     }
 }
 
@@ -3870,7 +5299,13 @@ async fn get_maintenance(State(app): State<Arc<AppState>>) -> Json<Value> {
     let degraded = !bybit.get("ok").and_then(|v| v.as_bool()).unwrap_or(false)
         || !binance.get("ok").and_then(|v| v.as_bool()).unwrap_or(false)
         || !okx.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-    let computed = if quiet { "QUIET" } else if degraded { "DEGRADED" } else { "NORMAL" };
+    let computed = if quiet {
+        "QUIET"
+    } else if degraded {
+        "DEGRADED"
+    } else {
+        "NORMAL"
+    };
     // Faz 1.5: bellek-ici simulasyon ust-yazimi (suresi dolmussa yok sayilir).
     let now = state::now_ms();
     let simulated = crate::thin::sim_active(&*app.maint_sim.lock().await, now);
@@ -3894,16 +5329,32 @@ struct MaintenanceReq {
     note: Option<String>,
 }
 
-async fn set_maintenance(State(app): State<Arc<AppState>>, Json(req): Json<MaintenanceReq>) -> Result<Json<Value>, axum::response::Response> {
-    let note: String = req.note.map(|n| n.chars().take(200).collect()).unwrap_or_default();
+async fn set_maintenance(
+    State(app): State<Arc<AppState>>,
+    Json(req): Json<MaintenanceReq>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let note: String = req
+        .note
+        .map(|n| n.chars().take(200).collect())
+        .unwrap_or_default();
     {
         let conn = app.db.conn.lock().map_err(|_| err422("kasa kilitli"))?;
-        for (k, v) in [("maint_quiet", if req.quiet { "1" } else { "0" }), ("maint_note", note.as_str())] {
+        for (k, v) in [
+            ("maint_quiet", if req.quiet { "1" } else { "0" }),
+            ("maint_note", note.as_str()),
+        ] {
             conn.execute("INSERT INTO settings(k, v) VALUES(?1,?2) ON CONFLICT(k) DO UPDATE SET v=excluded.v", [k, v])
                 .map_err(|e| err422(format!("bakım bayrağı yazılamadı: {e}")))?;
         }
     }
-    state::persist_event(&app, "SYSTEM", "INFO", "MAINTENANCE", &format!("quiet={} note={}", req.quiet, note)).await;
+    state::persist_event(
+        &app,
+        "SYSTEM",
+        "INFO",
+        "MAINTENANCE",
+        &format!("quiet={} note={}", req.quiet, note),
+    )
+    .await;
     Ok(Json(json!({"quiet": req.quiet, "note": note})))
 }
 
@@ -3922,23 +5373,41 @@ struct OrderbookQuery {
     limit: Option<usize>,
 }
 
-async fn orderbook(State(app): State<Arc<AppState>>, Query(q): Query<OrderbookQuery>) -> Result<Json<Value>, axum::response::Response> {
-    let symbol = q.symbol.map(|s| normalize_pair(&s)).filter(|s| !s.is_empty()).unwrap_or_else(|| "BTCUSDT".into());
+async fn orderbook(
+    State(app): State<Arc<AppState>>,
+    Query(q): Query<OrderbookQuery>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let symbol = q
+        .symbol
+        .map(|s| normalize_pair(&s))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "BTCUSDT".into());
     let category = q.category.unwrap_or_else(|| "linear".into());
     let limit = q.limit.unwrap_or(25).clamp(1, 100);
     let book = match q.venue.as_deref().unwrap_or("BYBIT") {
         "BINANCE" => app.binance.orderbook(&category, &symbol, limit).await,
         "OKX" => app.okx.orderbook(&category, &symbol, limit).await,
-        "PAPER" => return Err(err422("PAPER venue'de orderbook yok — Bybit/Binance/OKX seçin")),
+        "PAPER" => {
+            return Err(err422(
+                "PAPER venue'de orderbook yok — Bybit/Binance/OKX seçin",
+            ))
+        }
         _ => app.bybit.orderbook(&category, &symbol, limit).await,
-    }.map_err(err422)?;
+    }
+    .map_err(err422)?;
     if book.bids.is_empty() || book.asks.is_empty() {
-        return Err(err422(format!("{symbol}: derinlik boş — senkron değil (fail-closed)")));
+        return Err(err422(format!(
+            "{symbol}: derinlik boş — senkron değil (fail-closed)"
+        )));
     }
     let f = |s: &str| s.parse::<f64>().unwrap_or(0.0);
     let (mut bv, mut av) = (0.0, 0.0);
-    for l in &book.bids { bv += f(&l.qty); }
-    for l in &book.asks { av += f(&l.qty); }
+    for l in &book.bids {
+        bv += f(&l.qty);
+    }
+    for l in &book.asks {
+        av += f(&l.qty);
+    }
     let (bb, ba) = (f(&book.bids[0].price), f(&book.asks[0].price));
     let mid = (bb + ba) / 2.0;
     Ok(Json(json!({
@@ -3968,17 +5437,31 @@ struct FuturesStateQuery {
     venue: Option<String>,
 }
 
-async fn futures_state(State(app): State<Arc<AppState>>, Query(q): Query<FuturesStateQuery>) -> Result<Json<Value>, axum::response::Response> {
+async fn futures_state(
+    State(app): State<Arc<AppState>>,
+    Query(q): Query<FuturesStateQuery>,
+) -> Result<Json<Value>, axum::response::Response> {
     let venue = q.venue.unwrap_or_else(|| "BYBIT".into());
     if venue == "BINANCE" {
-        return Err(err422("Binance vadeli kanalı yok (adaptör spot) — Bybit seçin"));
+        return Err(err422(
+            "Binance vadeli kanalı yok (adaptör spot) — Bybit seçin",
+        ));
     }
     if venue == "PAPER" {
         return Err(err422("Paper'da vadeli durum yok"));
     }
-    let symbol = q.symbol.map(|s| normalize_pair(&s)).filter(|s| !s.is_empty()).unwrap_or_else(|| "BTCUSDT".into());
-    let adapter = app.adapter(&venue).ok_or_else(|| err422("venue desteklenmiyor"))?;
-    let inst = adapter.instruments("linear", Some(&symbol)).await.map_err(err422)?;
+    let symbol = q
+        .symbol
+        .map(|s| normalize_pair(&s))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "BTCUSDT".into());
+    let adapter = app
+        .adapter(&venue)
+        .ok_or_else(|| err422("venue desteklenmiyor"))?;
+    let inst = adapter
+        .instruments("linear", Some(&symbol))
+        .await
+        .map_err(err422)?;
     let rule = inst.iter().find(|i| i.symbol == symbol);
     let live = match active_keypair(&app, &venue) {
         Some(creds) => {
@@ -4008,9 +5491,14 @@ async fn futures_state(State(app): State<Arc<AppState>>, Query(q): Query<Futures
 // POST /api/bots/:id/tick → botun olağan poll turunu HEMEN koşturur
 //   (v3 deals/tick karşılığı; motor zaten periyodik poll yapar, bu uç manuel
 //   tetikler) → { newBars, snapshot }.
-async fn bot_grid(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, axum::response::Response> {
+async fn bot_grid(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, axum::response::Response> {
     let rts = app.runtimes.lock().await;
-    let rt = rts.get(&id).ok_or_else(|| err404(format!("bot yok: {id}")))?;
+    let rt = rts
+        .get(&id)
+        .ok_or_else(|| err404(format!("bot yok: {id}")))?;
     match &rt.engine_kind {
         dca_strategy::EngineTag::Grid(g) => {
             let mesh: Vec<String> = g.mesh.iter().map(|m| m.to_half_even_display(8)).collect();
@@ -4024,24 +5512,38 @@ async fn bot_grid(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> R
                 "note": "armed=true: o seviyede bekleyen grid emri var.",
             })))
         }
-        _ => Err(err422("grid botu değil — mesh yalnız Spot/Futures/Infinity Grid'de var")),
+        _ => Err(err422(
+            "grid botu değil — mesh yalnız Spot/Futures/Infinity Grid'de var",
+        )),
     }
 }
 
-async fn bot_tick(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, axum::response::Response> {
+async fn bot_tick(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, axum::response::Response> {
     // BOT-08: STOPPED/PAUSED botta manuel tetikle yeni emir üretilemez.
     let status = {
         let rts = app.runtimes.lock().await;
         rts.get(&id).map(|rt| rt.status.clone()).unwrap_or_default()
     };
     if status == "STOPPED" || status == "PAUSED" {
-        return Err(err422(format!("bot {status} — manuel tick yeni emir üretemez")));
+        return Err(err422(format!(
+            "bot {status} — manuel tick yeni emir üretemez"
+        )));
     }
     let sse = app.sse.clone();
-    let new_bars = engine::poll_and_advance(&app, &id, &sse).await.map_err(err422)?;
+    let new_bars = engine::poll_and_advance(&app, &id, &sse)
+        .await
+        .map_err(err422)?;
     let rts = app.runtimes.lock().await;
-    let snap = rts.get(&id).map(|rt| rt.snapshot_json()).unwrap_or(Value::Null);
-    Ok(Json(json!({"id": id, "newBars": new_bars, "snapshot": snap})))
+    let snap = rts
+        .get(&id)
+        .map(|rt| rt.snapshot_json())
+        .unwrap_or(Value::Null);
+    Ok(Json(
+        json!({"id": id, "newBars": new_bars, "snapshot": snap}),
+    ))
 }
 
 // ---------------- Haber motoru (v3 /api/market/news karşılığı) ------------
@@ -4054,38 +5556,109 @@ async fn bot_tick(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> R
 // v3 \b sınırlarına yaklaşım — belgelenmiş fark). Ham HTML istemciye gitmez:
 // yalnız başlık/kaynak/URL/zaman taşınır.
 const NEWS_BULLISH: &[(&str, f64)] = &[
-    ("surge", 0.6), ("surged", 0.6), ("surges", 0.6), ("soar", 0.6), ("rally", 0.6), ("rallies", 0.6),
-    ("partnership", 0.5), ("collaboration", 0.5), ("integration", 0.5),
-    ("adoption", 0.5), ("onboard", 0.5), ("approval", 0.7), ("approved", 0.7), ("green-light", 0.7), ("greenlight", 0.7),
-    ("inflow", 0.5), ("upgrade", 0.4), ("halving", 0.4), ("burn", 0.4), ("burned", 0.4),
-    ("launch", 0.35), ("lists", 0.35), ("listing", 0.35), ("institutional", 0.4), ("treasury", 0.4), ("reserve", 0.4),
-    ("bullish", 0.45), ("accumulate", 0.45), ("record", 0.5), ("all-time high", 0.5), ("ath", 0.5),
+    ("surge", 0.6),
+    ("surged", 0.6),
+    ("surges", 0.6),
+    ("soar", 0.6),
+    ("rally", 0.6),
+    ("rallies", 0.6),
+    ("partnership", 0.5),
+    ("collaboration", 0.5),
+    ("integration", 0.5),
+    ("adoption", 0.5),
+    ("onboard", 0.5),
+    ("approval", 0.7),
+    ("approved", 0.7),
+    ("green-light", 0.7),
+    ("greenlight", 0.7),
+    ("inflow", 0.5),
+    ("upgrade", 0.4),
+    ("halving", 0.4),
+    ("burn", 0.4),
+    ("burned", 0.4),
+    ("launch", 0.35),
+    ("lists", 0.35),
+    ("listing", 0.35),
+    ("institutional", 0.4),
+    ("treasury", 0.4),
+    ("reserve", 0.4),
+    ("bullish", 0.45),
+    ("accumulate", 0.45),
+    ("record", 0.5),
+    ("all-time high", 0.5),
+    ("ath", 0.5),
 ];
 const NEWS_BEARISH: &[(&str, f64)] = &[
-    ("delisting", 1.0), ("delist", 1.0), ("trading suspension", 0.8), ("suspend", 0.8),
-    ("removal of trading pairs", 1.0), ("hack", 0.9), ("exploit", 0.9), ("breach", 0.9), ("drain", 0.9),
-    ("lawsuit", 0.6), ("litigation", 0.6), ("ban", 0.7), ("banned", 0.7), ("crackdown", 0.7),
-    ("crash", 0.6), ("plunge", 0.6), ("dump", 0.6), ("tank", 0.6),
-    ("liquidat", 0.5), ("outage", 0.5), ("downtime", 0.5),
-    ("fraud", 0.8), ("laundering", 0.8), ("scam", 0.8), ("rug pull", 0.8), ("rugpull", 0.8),
-    ("bearish", 0.35), ("correction", 0.35), ("rate hike", 0.4),
+    ("delisting", 1.0),
+    ("delist", 1.0),
+    ("trading suspension", 0.8),
+    ("suspend", 0.8),
+    ("removal of trading pairs", 1.0),
+    ("hack", 0.9),
+    ("exploit", 0.9),
+    ("breach", 0.9),
+    ("drain", 0.9),
+    ("lawsuit", 0.6),
+    ("litigation", 0.6),
+    ("ban", 0.7),
+    ("banned", 0.7),
+    ("crackdown", 0.7),
+    ("crash", 0.6),
+    ("plunge", 0.6),
+    ("dump", 0.6),
+    ("tank", 0.6),
+    ("liquidat", 0.5),
+    ("outage", 0.5),
+    ("downtime", 0.5),
+    ("fraud", 0.8),
+    ("laundering", 0.8),
+    ("scam", 0.8),
+    ("rug pull", 0.8),
+    ("rugpull", 0.8),
+    ("bearish", 0.35),
+    ("correction", 0.35),
+    ("rate hike", 0.4),
 ];
-const NEWS_DELISTING_KW: &[&str] = &["delisting", "delist", "removal of trading pairs", "trading suspension", "will be delisted", "spot trading halt"];
+const NEWS_DELISTING_KW: &[&str] = &[
+    "delisting",
+    "delist",
+    "removal of trading pairs",
+    "trading suspension",
+    "will be delisted",
+    "spot trading halt",
+];
 
 fn news_sentiment(text: &str) -> (f64, &'static str) {
     let t = text.to_lowercase();
     let mut score = 0.0;
-    for (kw, w) in NEWS_BULLISH { if t.contains(kw) { score += w; } }
-    for (kw, w) in NEWS_BEARISH { if t.contains(kw) { score -= w; } }
+    for (kw, w) in NEWS_BULLISH {
+        if t.contains(kw) {
+            score += w;
+        }
+    }
+    for (kw, w) in NEWS_BEARISH {
+        if t.contains(kw) {
+            score -= w;
+        }
+    }
     let s = (score / 1.2).tanh();
     let a = s.abs();
-    let impact = if a >= 0.75 { "CRITICAL" } else if a >= 0.5 { "HIGH" } else if a >= 0.25 { "MEDIUM" } else { "LOW" };
+    let impact = if a >= 0.75 {
+        "CRITICAL"
+    } else if a >= 0.5 {
+        "HIGH"
+    } else if a >= 0.25 {
+        "MEDIUM"
+    } else {
+        "LOW"
+    };
     ((s * 1000.0).round() / 1000.0, impact)
 }
 
 fn news_safe_url(u: &str) -> Option<String> {
     let low = u.trim().to_lowercase();
-    if !(low.starts_with("https://cryptopanic.com/") || low.starts_with("https://www.binance.com/")) {
+    if !(low.starts_with("https://cryptopanic.com/") || low.starts_with("https://www.binance.com/"))
+    {
         return None;
     }
     Some(u.trim().chars().take(300).collect())
@@ -4097,7 +5670,11 @@ struct NewsQuery {
 }
 
 async fn market_news(State(app): State<Arc<AppState>>, Query(q): Query<NewsQuery>) -> Json<Value> {
-    let symbol = q.symbol.map(|s| normalize_pair(&s)).filter(|s| s.len() >= 4 && s.len() <= 20).unwrap_or_else(|| "BTCUSDT".into());
+    let symbol = q
+        .symbol
+        .map(|s| normalize_pair(&s))
+        .filter(|s| s.len() >= 4 && s.len() <= 20)
+        .unwrap_or_else(|| "BTCUSDT".into());
     Json(get_market_news(&app, &symbol).await)
 }
 
@@ -4114,7 +5691,10 @@ pub(crate) async fn get_market_news(app: &Arc<AppState>, symbol: &str) -> Value 
             }
         }
     }
-    let asset = symbol.trim_end_matches("USDT").trim_end_matches("USDC").trim_end_matches("BTC");
+    let asset = symbol
+        .trim_end_matches("USDT")
+        .trim_end_matches("USDC")
+        .trim_end_matches("BTC");
     let asset: &str = if asset.is_empty() { symbol } else { asset };
     let mut raw: Vec<(String, String, i64, String)> = Vec::new(); // title, url, ts, source
     let mut sources: Vec<String> = Vec::new();
@@ -4126,13 +5706,36 @@ pub(crate) async fn get_market_news(app: &Arc<AppState>, symbol: &str) -> Value 
                 if let Ok(v) = resp.json::<Value>().await {
                     if let Some(arr) = v.get("results").and_then(|r| r.as_array()) {
                         for r in arr.iter().take(20) {
-                            let (Some(title), Some(link)) = (r.get("title").and_then(|x| x.as_str()), r.get("url").and_then(|x| x.as_str())) else { continue };
-                            let Some(su) = news_safe_url(link) else { continue };
-                            let ts = r.get("published_at").and_then(|x| x.as_str()).and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map(|d| d.timestamp_millis()).unwrap_or_else(state::now_ms);
-                            let src = r.get("source").and_then(|x| x.get("title")).and_then(|x| x.as_str()).unwrap_or("CryptoPanic");
-                            raw.push((title.chars().take(200).collect(), su, ts, src.chars().take(60).collect()));
+                            let (Some(title), Some(link)) = (
+                                r.get("title").and_then(|x| x.as_str()),
+                                r.get("url").and_then(|x| x.as_str()),
+                            ) else {
+                                continue;
+                            };
+                            let Some(su) = news_safe_url(link) else {
+                                continue;
+                            };
+                            let ts = r
+                                .get("published_at")
+                                .and_then(|x| x.as_str())
+                                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                                .map(|d| d.timestamp_millis())
+                                .unwrap_or_else(state::now_ms);
+                            let src = r
+                                .get("source")
+                                .and_then(|x| x.get("title"))
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("CryptoPanic");
+                            raw.push((
+                                title.chars().take(200).collect(),
+                                su,
+                                ts,
+                                src.chars().take(60).collect(),
+                            ));
                         }
-                        if !raw.is_empty() { sources.push("CryptoPanic".into()); }
+                        if !raw.is_empty() {
+                            sources.push("CryptoPanic".into());
+                        }
                     }
                 }
             }
@@ -4171,24 +5774,50 @@ pub(crate) async fn get_market_news(app: &Arc<AppState>, symbol: &str) -> Value 
         let (s, impact) = news_sentiment(&title);
         json!({"id": format!("{symbol}-{i}-{ts}"), "title": title, "url": url, "publishedAt": ts, "source": source, "sentiment": s, "impact": impact})
     }).collect();
-    items.sort_by(|a, b| b.get("publishedAt").and_then(|x| x.as_i64()).unwrap_or(0).cmp(&a.get("publishedAt").and_then(|x| x.as_i64()).unwrap_or(0)));
+    items.sort_by(|a, b| {
+        b.get("publishedAt")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0)
+            .cmp(&a.get("publishedAt").and_then(|x| x.as_i64()).unwrap_or(0))
+    });
     items.truncate(20);
-    let mut delisting: Value = json!({"active": false, "headline": Value::Null, "url": Value::Null});
+    let mut delisting: Value =
+        json!({"active": false, "headline": Value::Null, "url": Value::Null});
     for n in items.iter_mut() {
-        let text = format!("{} {}", n.get("title").and_then(|x| x.as_str()).unwrap_or(""), "").to_lowercase();
+        let text = format!(
+            "{} {}",
+            n.get("title").and_then(|x| x.as_str()).unwrap_or(""),
+            ""
+        )
+        .to_lowercase();
         if let Some(kw) = NEWS_DELISTING_KW.iter().find(|k| text.contains(**k)) {
             if text.contains(&asset.to_lowercase()) {
                 n["impact"] = json!("CRITICAL");
-                n["sentiment"] = json!(n.get("sentiment").and_then(|x| x.as_f64()).unwrap_or(0.0).min(-0.8));
+                n["sentiment"] = json!(n
+                    .get("sentiment")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(0.0)
+                    .min(-0.8));
                 delisting = json!({"active": true, "headline": n.get("title").cloned().unwrap_or(Value::Null), "url": n.get("url").cloned().unwrap_or(Value::Null), "keyword": kw});
                 break;
             }
         }
     }
-    let (mean, bull, bear) = if items.is_empty() { (0.0, 0, 0) } else {
-        let sum: f64 = items.iter().filter_map(|n| n.get("sentiment").and_then(|x| x.as_f64())).sum();
-        let b = items.iter().filter(|n| n.get("sentiment").and_then(|x| x.as_f64()).unwrap_or(0.0) > 0.2).count();
-        let d = items.iter().filter(|n| n.get("sentiment").and_then(|x| x.as_f64()).unwrap_or(0.0) < -0.2).count();
+    let (mean, bull, bear) = if items.is_empty() {
+        (0.0, 0, 0)
+    } else {
+        let sum: f64 = items
+            .iter()
+            .filter_map(|n| n.get("sentiment").and_then(|x| x.as_f64()))
+            .sum();
+        let b = items
+            .iter()
+            .filter(|n| n.get("sentiment").and_then(|x| x.as_f64()).unwrap_or(0.0) > 0.2)
+            .count();
+        let d = items
+            .iter()
+            .filter(|n| n.get("sentiment").and_then(|x| x.as_f64()).unwrap_or(0.0) < -0.2)
+            .count();
         ((sum / items.len() as f64 * 1000.0).round() / 1000.0, b, d)
     };
     let out = json!({
@@ -4204,15 +5833,21 @@ pub(crate) async fn get_market_news(app: &Arc<AppState>, symbol: &str) -> Value 
         "cached": false,
         "note": if sources.is_empty() { "Haber alınamadı (token yoksa CRYPTOPANIC_AUTH_TOKEN ekleyin; Binance bacağı da erişilemedi)." } else { "Başlıklar düz metindir; ham HTML taşınmaz." },
     });
-    app.news_cache.lock().await.insert(symbol.to_string(), (state::now_ms(), out.clone()));
+    app.news_cache
+        .lock()
+        .await
+        .insert(symbol.to_string(), (state::now_ms(), out.clone()));
     out
 }
 
 fn urlencoding(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { o.push(b as char); }
-        else { o.push_str(&format!("%{b:02X}")); }
+        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+            o.push(b as char);
+        } else {
+            o.push_str(&format!("%{b:02X}"));
+        }
     }
     o
 }
@@ -4236,7 +5871,16 @@ async fn signals_preview(
     if let Err(e) = dca_signals::validate_signal_node(&req.node) {
         return Err(err422(format!("node: {e}")));
     }
-    match engine::signal_preview(&app, &req.symbol, &req.interval, req.venue.as_deref(), req.category.as_deref(), &req.node).await {
+    match engine::signal_preview(
+        &app,
+        &req.symbol,
+        &req.interval,
+        req.venue.as_deref(),
+        req.category.as_deref(),
+        &req.node,
+    )
+    .await
+    {
         Ok(v) => Ok(Json(v).into_response()),
         Err(e) => Err(err422(e)),
     }
@@ -4260,6 +5904,24 @@ struct TradingViewWebhookReq {
     timestamp: i64,
 }
 
+fn webhook_deal_is_active(rt: &state::BotRuntime) -> bool {
+    rt.webhook_start_requested
+        || !rt.stepper.position.qty.is_zero()
+        || rt
+            .hedge_stepper
+            .as_ref()
+            .is_some_and(|stepper| !stepper.position.qty.is_zero())
+        || match &rt.engine_kind {
+            dca_strategy::EngineTag::Dca(engine) => {
+                engine.phase != DcaPhase::Idle && engine.phase != DcaPhase::Cooldown
+            }
+            dca_strategy::EngineTag::Grid(_) => rt.grid_bootstrapped,
+            dca_strategy::EngineTag::Hedge(engine) => {
+                engine.main.phase != DcaPhase::Idle && engine.main.phase != DcaPhase::Cooldown
+            }
+        }
+}
+
 async fn tradingview_webhook(
     State(app): State<Arc<AppState>>,
     connect_info: Option<axum::extract::ConnectInfo<SocketAddr>>,
@@ -4279,7 +5941,11 @@ async fn tradingview_webhook(
         let mut rate = app.webhook_rate.lock().await;
         rate.retain(|_, (started, _)| now.saturating_sub(*started) < WINDOW_MS);
         if !rate.contains_key(&ip) && rate.len() >= MAX_BUCKETS {
-            return (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": "rate limit capacity exceeded"}))).into_response();
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error": "rate limit capacity exceeded"})),
+            )
+                .into_response();
         }
         let entry = rate.entry(ip).or_insert((now, 0u32));
         if now.saturating_sub(entry.0) >= WINDOW_MS {
@@ -4288,84 +5954,224 @@ async fn tradingview_webhook(
         entry.1 = entry.1.saturating_add(1);
         if entry.1 > WINDOW_MAX {
             drop(rate);
-            return (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": "rate limit exceeded"}))).into_response();
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error": "rate limit exceeded"})),
+            )
+                .into_response();
         }
     }
-    let mut rts = app.runtimes.lock().await;
-    // SEC-07: Anti-enumeration & Constant-time secret comparison (unknown bot ve wrong secret aynı yanıtı verir).
-    let expected_secret = rts.get(&req.bot_id).map(|r| r.webhook_secret.clone()).unwrap_or_default();
-    let is_valid = !expected_secret.is_empty() && constant_time_eq_str(&req.secret, &expected_secret);
-    if !is_valid {
-        drop(rts);
-        tracing::warn!("TradingView webhook rejected: invalid secret or unknown bot");
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "UNAUTHORIZED"}))).into_response();
+    // Bound identifiers before composing keys or logging. The route also has
+    // a 16 KiB body limit; these field caps keep in-memory state bounded.
+    if req.bot_id.is_empty()
+        || req.bot_id.len() > 128
+        || req.secret.len() > 512
+        || req.action.len() > 64
+        || req.pair.as_ref().is_some_and(|pair| pair.len() > 64)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "INVALID_PAYLOAD"})),
+        )
+            .into_response();
     }
-    let Some(rt) = rts.get_mut(&req.bot_id) else {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "UNAUTHORIZED"}))).into_response();
+
+    let (expected_secret, expected_symbol, mode, running, initially_active) = {
+        let rts = app.runtimes.lock().await;
+        let Some(rt) = rts.get(&req.bot_id) else {
+            tracing::warn!("TradingView webhook rejected: invalid secret or unknown bot");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "UNAUTHORIZED"})),
+            )
+                .into_response();
+        };
+        (
+            rt.webhook_secret.clone(),
+            rt.cfg.symbol.clone(),
+            rt.mode.clone(),
+            rt.status == "RUNNING",
+            webhook_deal_is_active(rt),
+        )
     };
+    // SEC-07: Anti-enumeration & constant-time secret comparison (unknown bot
+    // and wrong secret return the same response). No runtime lock crosses I/O.
+    let is_valid =
+        !expected_secret.is_empty() && constant_time_eq_str(&req.secret, &expected_secret);
+    if !is_valid {
+        tracing::warn!("TradingView webhook rejected: invalid secret or unknown bot");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "UNAUTHORIZED"})),
+        )
+            .into_response();
+    }
     // Replay protection: accept epoch seconds or milliseconds, reject stale alerts.
     let now = state::now_ms();
-    let ts_ms = if req.timestamp < 1_000_000_000_000 { req.timestamp.saturating_mul(1000) } else { req.timestamp };
-    if (now - ts_ms).abs() > 60_000 {
-        crate::state::persist_event(&app, &req.bot_id, "WARN", "WEBHOOK", "rejected: expired alert (>60s)").await;
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "EXPIRED_ALERT"}))).into_response();
-    }
-    // H-7 ince iş: alert-id dedup — aynı (bot, action, timestamp) ikinci kez
-    // işlenmez (deal kapandıktan sonra pencere içinde tekrar gelirse çift deal yok).
-    {
-        let key = format!("{}|{}|{}", req.bot_id, req.action, ts_ms);
-        let mut seen = app.webhook_seen.lock().await;
-        seen.retain(|_, t| now - *t < 600_000); // 10 dk pencere dışını temizle
-        if seen.contains_key(&key) {
-            drop(seen);
-            crate::state::persist_event(&app, &req.bot_id, "WARN", "WEBHOOK", "rejected: duplicate alert (already processed)").await;
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": "DUPLICATE_ALERT"}))).into_response();
-        }
-        seen.insert(key, now);
+    let ts_ms = if req.timestamp < 1_000_000_000_000 {
+        req.timestamp.saturating_mul(1000)
+    } else {
+        req.timestamp
+    };
+    if now.abs_diff(ts_ms) > 60_000 {
+        crate::state::persist_event(
+            &app,
+            &req.bot_id,
+            "WARN",
+            "WEBHOOK",
+            "rejected: expired alert (>60s)",
+        )
+        .await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "EXPIRED_ALERT"})),
+        )
+            .into_response();
     }
     // Task 18 N-3: pair sözleşmesi — secret doğrulamasından SONRA denetlenir
     // (bilinmeyen arayanlara sembol bilgisi sızmaz); uyuşmazlık 400 + WARN.
     if let Some(p) = req.pair.as_deref() {
-        if !p.is_empty() && p != rt.cfg.symbol {
-            let msg = format!("webhook pair uyuşmazlığı: alert '{p}', bot '{}'", rt.cfg.symbol);
+        if !p.is_empty() && p != expected_symbol {
+            let msg = format!(
+                "webhook pair uyuşmazlığı: alert '{p}', bot '{}'",
+                expected_symbol
+            );
             crate::state::persist_event(&app, &req.bot_id, "WARN", "WEBHOOK", &msg).await;
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "PAIR_MISMATCH", "expected": rt.cfg.symbol, "got": p})),
+                Json(json!({"error": "PAIR_MISMATCH", "expected": expected_symbol, "got": p})),
             )
                 .into_response();
         }
     }
     if req.action != "START_DEAL" {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "unknown action — expected START_DEAL"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "unknown action — expected START_DEAL"})),
+        )
+            .into_response();
     }
-    if rt.status != "RUNNING" {
+
+    // H-7: bounded alert dedup. Refuse new entries at capacity until old keys
+    // expire instead of evicting live replay records under an authenticated flood.
+    {
+        const DEDUP_TTL_MS: i64 = 600_000;
+        const MAX_SEEN_ALERTS: usize = 10_000;
+        let key = format!("{}|{}|{}", req.bot_id, req.action, ts_ms);
+        let mut seen = app.webhook_seen.lock().await;
+        seen.retain(|_, seen_at| now.saturating_sub(*seen_at) < DEDUP_TTL_MS);
+        if seen.contains_key(&key) {
+            drop(seen);
+            crate::state::persist_event(
+                &app,
+                &req.bot_id,
+                "WARN",
+                "WEBHOOK",
+                "rejected: duplicate alert (already processed)",
+            )
+            .await;
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "DUPLICATE_ALERT"})),
+            )
+                .into_response();
+        }
+        if seen.len() >= MAX_SEEN_ALERTS {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error": "dedup capacity exceeded"})),
+            )
+                .into_response();
+        }
+        seen.insert(key, now);
+    }
+
+    if !running {
         return Json(json!({"status": "BOT_NOT_RUNNING"})).into_response();
     }
     // Faz 0.2/0.3 — TV ENTRY kapısı (v3: kill tüm modlarda reddeder, freeze yalnız LIVE'da).
     if app.kill_engaged().await {
-        crate::state::persist_event(&app, &req.bot_id, "WARN", crate::state::GATE_KILL, "START_DEAL reddedildi — KILL_SWITCH devrede").await;
+        crate::state::persist_event(
+            &app,
+            &req.bot_id,
+            "WARN",
+            crate::state::GATE_KILL,
+            "START_DEAL reddedildi — KILL_SWITCH devrede",
+        )
+        .await;
         return Json(json!({"status": "KILL_SWITCH_ENGAGED"})).into_response();
     }
-    if rt.mode == "LIVE" && app.freeze_engaged().await {
-        crate::state::persist_event(&app, &req.bot_id, "WARN", crate::state::GATE_FREEZE, "START_DEAL reddedildi — FREEZE devrede (LIVE hat)").await;
+    if mode == "LIVE" && app.freeze_engaged().await {
+        crate::state::persist_event(
+            &app,
+            &req.bot_id,
+            "WARN",
+            crate::state::GATE_FREEZE,
+            "START_DEAL reddedildi — FREEZE devrede (LIVE hat)",
+        )
+        .await;
         return Json(json!({"status": "FREEZE_ENGAGED"})).into_response();
     }
     // Fail-closed: an already-active deal must never be doubled by a signal.
-    let deal_active = match &rt.engine_kind {
-        dca_strategy::EngineTag::Dca(e) => !rt.stepper.position.qty.is_zero() || (e.phase != DcaPhase::Idle && e.phase != DcaPhase::Cooldown),
-        dca_strategy::EngineTag::Grid(_) => rt.grid_bootstrapped,
-        dca_strategy::EngineTag::Hedge(h) => {
-            !rt.stepper.position.qty.is_zero() || (h.main.phase != DcaPhase::Idle && h.main.phase != DcaPhase::Cooldown)
-        }
+    if initially_active {
+        crate::state::persist_event(
+            &app,
+            &req.bot_id,
+            "WARN",
+            "WEBHOOK",
+            "START_DEAL ignored — DEAL_ALREADY_ACTIVE",
+        )
+        .await;
+        return Json(json!({"status": "DEAL_ALREADY_ACTIVE"})).into_response();
+    }
+
+    // Recheck mutable bot state after gate I/O, then perform a short in-memory
+    // update. No database or venue await occurs while runtimes is locked.
+    let mut rts = app.runtimes.lock().await;
+    let Some(rt) = rts.get_mut(&req.bot_id) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "UNAUTHORIZED"})),
+        )
+            .into_response();
     };
-    if deal_active {
-        crate::state::persist_event(&app, &req.bot_id, "WARN", "WEBHOOK", "START_DEAL ignored — DEAL_ALREADY_ACTIVE").await;
+    if !constant_time_eq_str(&rt.webhook_secret, &expected_secret) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "UNAUTHORIZED"})),
+        )
+            .into_response();
+    }
+    if rt.status != "RUNNING" {
+        return Json(json!({"status": "BOT_NOT_RUNNING"})).into_response();
+    }
+    if rt.cfg.symbol != expected_symbol || rt.mode != mode || webhook_deal_is_active(rt) {
+        drop(rts);
+        crate::state::persist_event(
+            &app,
+            &req.bot_id,
+            "WARN",
+            "WEBHOOK",
+            "START_DEAL ignored — bot state changed during signal validation",
+        )
+        .await;
         return Json(json!({"status": "DEAL_ALREADY_ACTIVE"})).into_response();
     }
     rt.webhook_start_requested = true;
-    crate::state::persist_event(&app, &req.bot_id, "INFO", "WEBHOOK", "TradingView START_DEAL queued (opens at next bar evaluation)").await;
-    (StatusCode::OK, Json(json!({"status": "SIGNAL_QUEUED", "botId": req.bot_id}))).into_response()
+    drop(rts);
+    crate::state::persist_event(
+        &app,
+        &req.bot_id,
+        "INFO",
+        "WEBHOOK",
+        "TradingView START_DEAL queued (opens at next bar evaluation)",
+    )
+    .await;
+    (
+        StatusCode::OK,
+        Json(json!({"status": "SIGNAL_QUEUED", "botId": req.bot_id})),
+    )
+        .into_response()
 }
 
 // ---------------- Yürütme şalterleri (Faz 0.2 kill-switch + Faz 0.3 freeze) ---
@@ -4394,20 +6200,38 @@ struct HaltSetBody {
 }
 
 fn halt_actor(by: &Option<String>) -> String {
-    by.as_deref().map(|s| s.chars().take(120).collect()).unwrap_or_else(|| "UI".into())
+    by.as_deref()
+        .map(|s| s.chars().take(120).collect())
+        .unwrap_or_else(|| "UI".into())
 }
 
-async fn set_killswitch(State(app): State<Arc<AppState>>, Json(req): Json<HaltSetBody>) -> axum::response::Response {
+async fn set_killswitch(
+    State(app): State<Arc<AppState>>,
+    Json(req): Json<HaltSetBody>,
+) -> axum::response::Response {
     let Some(engaged) = req.engaged else {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "engaged (boolean) zorunlu"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "engaged (boolean) zorunlu"})),
+        )
+            .into_response();
     };
     let now = state::now_ms();
     let actor = halt_actor(&req.by);
     if engaged {
-        let reason = req.reason.map(|s| s.chars().take(300).collect::<String>()).unwrap_or_else(|| "Elle devreye alındı (UI)".into());
-        *app.kill.lock().await =
-            crate::state::HaltState { active: true, reason: Some(reason.clone()), by: Some(actor.clone()), at_ms: now, auto: false };
-        let msg = crate::state::halt_event_message("engaged", Some(&reason), Some(&actor), now, false);
+        let reason = req
+            .reason
+            .map(|s| s.chars().take(300).collect::<String>())
+            .unwrap_or_else(|| "Elle devreye alındı (UI)".into());
+        *app.kill.lock().await = crate::state::HaltState {
+            active: true,
+            reason: Some(reason.clone()),
+            by: Some(actor.clone()),
+            at_ms: now,
+            auto: false,
+        };
+        let msg =
+            crate::state::halt_event_message("engaged", Some(&reason), Some(&actor), now, false);
         crate::state::persist_event(&app, "SYSTEM", "WARN", crate::state::GATE_KILL, &msg).await;
         let _ = app.sse.send(crate::state::SseEvent {
             event: "KILL_SWITCH".into(),
@@ -4436,13 +6260,24 @@ async fn set_killswitch(State(app): State<Arc<AppState>>, Json(req): Json<HaltSe
                     if links.is_empty() {
                         continue;
                     }
-                    rt.pending_live_intents.push(crate::state::LiveIntent::Cancel {
-                        links: links.clone(),
-                        venue: rt.venue.clone(),
-                        category: if rt.cfg.kind.is_futures() { "linear".to_string() } else { "spot".to_string() },
-                        symbol: rt.cfg.symbol.clone(),
-                    });
-                    msgs.push((bot_id.clone(), format!("şalter devrede — {} bekleyen GİRİŞ emri iptal kuyruğuna alındı", links.len())));
+                    rt.pending_live_intents
+                        .push(crate::state::LiveIntent::Cancel {
+                            links: links.clone(),
+                            venue: rt.venue.clone(),
+                            category: if rt.cfg.kind.is_futures() {
+                                "linear".to_string()
+                            } else {
+                                "spot".to_string()
+                            },
+                            symbol: rt.cfg.symbol.clone(),
+                        });
+                    msgs.push((
+                        bot_id.clone(),
+                        format!(
+                            "şalter devrede — {} bekleyen GİRİŞ emri iptal kuyruğuna alındı",
+                            links.len()
+                        ),
+                    ));
                 }
                 msgs
             };
@@ -4462,7 +6297,10 @@ async fn set_killswitch(State(app): State<Arc<AppState>>, Json(req): Json<HaltSe
     Json(app.kill_json().await).into_response()
 }
 
-async fn set_freeze(State(app): State<Arc<AppState>>, Json(req): Json<HaltSetBody>) -> axum::response::Response {
+async fn set_freeze(
+    State(app): State<Arc<AppState>>,
+    Json(req): Json<HaltSetBody>,
+) -> axum::response::Response {
     let now = state::now_ms();
     let actor = halt_actor(&req.by);
     // v3 POST gövdesiz toggle eder; açık `frozen` verilirse onu uygula.
@@ -4471,10 +6309,19 @@ async fn set_freeze(State(app): State<Arc<AppState>>, Json(req): Json<HaltSetBod
         None => !app.freeze_engaged().await,
     };
     if target {
-        let reason = req.reason.map(|s| s.chars().take(300).collect::<String>()).unwrap_or_else(|| "Elle donduruldu (UI)".into());
-        *app.freeze.lock().await =
-            crate::state::HaltState { active: true, reason: Some(reason.clone()), by: Some(actor.clone()), at_ms: now, auto: false };
-        let msg = crate::state::halt_event_message("engaged", Some(&reason), Some(&actor), now, false);
+        let reason = req
+            .reason
+            .map(|s| s.chars().take(300).collect::<String>())
+            .unwrap_or_else(|| "Elle donduruldu (UI)".into());
+        *app.freeze.lock().await = crate::state::HaltState {
+            active: true,
+            reason: Some(reason.clone()),
+            by: Some(actor.clone()),
+            at_ms: now,
+            auto: false,
+        };
+        let msg =
+            crate::state::halt_event_message("engaged", Some(&reason), Some(&actor), now, false);
         crate::state::persist_event(&app, "SYSTEM", "WARN", crate::state::GATE_FREEZE, &msg).await;
         let _ = app.sse.send(crate::state::SseEvent {
             event: "FREEZE".into(),
@@ -4504,7 +6351,10 @@ struct AddKeyReq {
     passphrase: Option<String>,
 }
 
-async fn add_key(State(app): State<Arc<AppState>>, Json(req): Json<AddKeyReq>) -> Result<Json<Value>, axum::response::Response> {
+async fn add_key(
+    State(app): State<Arc<AppState>>,
+    Json(req): Json<AddKeyReq>,
+) -> Result<Json<Value>, axum::response::Response> {
     let venue = req.venue.to_uppercase();
     let adapter: &dyn VenueAdapter = match venue.as_str() {
         "BYBIT" => &app.bybit,
@@ -4514,8 +6364,16 @@ async fn add_key(State(app): State<Arc<AppState>>, Json(req): Json<AddKeyReq>) -
         other => return Err(err422(format!("unknown venue {other}"))),
     };
     // P4-3: OKX imza passphrase'siz çalışmaz — kasa girişinde zorunlu.
-    if venue == "OKX" && req.passphrase.as_deref().map(|p| p.trim().is_empty()).unwrap_or(true) {
-        return Err(err422("OKX anahtarı passphrase gerektirir — API oluştururken verilen parolayı girin"));
+    if venue == "OKX"
+        && req
+            .passphrase
+            .as_deref()
+            .map(|p| p.trim().is_empty())
+            .unwrap_or(true)
+    {
+        return Err(err422(
+            "OKX anahtarı passphrase gerektirir — API oluştururken verilen parolayı girin",
+        ));
     }
     let creds = VenueCreds {
         key: req.api_key.clone(),
@@ -4652,7 +6510,10 @@ async fn list_keys(State(app): State<Arc<AppState>>) -> Json<Value> {
 async fn remove_key(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Json<Value> {
     let venue: Option<String> = {
         let conn = app.db.conn.lock().unwrap_or_else(|p| p.into_inner());
-        conn.query_row("SELECT venue FROM vault_keys WHERE id=?1", [&id], |r| r.get::<_, String>(0)).ok()
+        conn.query_row("SELECT venue FROM vault_keys WHERE id=?1", [&id], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()
     };
     let mut poll_guards: Vec<tokio::sync::OwnedMutexGuard<()>> = Vec::new();
     if let Some(venue) = venue {
@@ -4676,6 +6537,7 @@ async fn remove_key(State(app): State<Arc<AppState>>, Path(id): Path<String>) ->
                     existing.status = "STOPPED".into();
                     existing.credentials = None;
                     existing.pending_engine_actions.clear();
+                    existing.pending_live_intents.clear();
                     existing.webhook_start_requested = false;
                 }
             }
@@ -4690,8 +6552,11 @@ async fn remove_key(State(app): State<Arc<AppState>>, Path(id): Path<String>) ->
                 &bot_id,
                 "WARN",
                 "SEC_KEY_REMOVED",
-                &format!("vault anahtarı kaldırıldı ({venue}) — bot durduruldu, yeni emir engellendi"),
-            ).await;
+                &format!(
+                    "vault anahtarı kaldırıldı ({venue}) — bot durduruldu, yeni emir engellendi"
+                ),
+            )
+            .await;
         }
     }
     let conn = app.db.conn.lock().unwrap_or_else(|p| p.into_inner());
@@ -4741,16 +6606,13 @@ async fn sse_handler(
             };
         }
         for (id, bot_id, level, gate, message, ts) in rows_raw {
-            replay.push(Ok(Event::default()
-                .id(id.to_string())
-                .event("LOG")
-                .data(
-                    serde_json::json!({
-                        "botId": bot_id, "level": level, "gate": gate,
-                        "message": message, "ts": ts, "replayed": true
-                    })
-                    .to_string(),
-                )));
+            replay.push(Ok(Event::default().id(id.to_string()).event("LOG").data(
+                serde_json::json!({
+                    "botId": bot_id, "level": level, "gate": gate,
+                    "message": message, "ts": ts, "replayed": true
+                })
+                .to_string(),
+            )));
         }
     }
     let stream = async_stream_wrapper(rx, app.clone(), last_event_id);
@@ -4768,7 +6630,12 @@ fn async_stream_wrapper(
     // spam üretmez.
     let seq_start = last_event_id.unwrap_or(0);
     futures_util::stream::unfold(
-        (rx, app, seq_start as u64, std::time::Instant::now() - std::time::Duration::from_secs(15)),
+        (
+            rx,
+            app,
+            seq_start as u64,
+            std::time::Instant::now() - std::time::Duration::from_secs(15),
+        ),
         |(mut rx, app, mut n, mut last_ping)| async move {
             loop {
                 if last_ping.elapsed() >= std::time::Duration::from_secs(15) {
@@ -4780,25 +6647,28 @@ fn async_stream_wrapper(
                     ));
                 }
                 n += 1;
-            match rx.recv().await {
-                Ok(ev) => {
-                    let e = Event::default().id(n.to_string()).event(ev.event).data(ev.data);
-                    return Some((Ok(e), (rx, app, n, last_ping)));
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    // Faz 21 (P2-8): Lagged artık SESSİZ değil — istemciye açık
-                    // LOG olayı düşer; UI "veri tazeliği" rozetinde fark edilir
-                    // ve istemci kendi polling'iyle telafi eder.
-                    let msg = format!("SSE akışı {skipped} olay kaçırdı (yavaş tüketici) — polling telafi eder");
-                    return Some((
+                match rx.recv().await {
+                    Ok(ev) => {
+                        let e = Event::default()
+                            .id(n.to_string())
+                            .event(ev.event)
+                            .data(ev.data);
+                        return Some((Ok(e), (rx, app, n, last_ping)));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        // Faz 21 (P2-8): Lagged artık SESSİZ değil — istemciye açık
+                        // LOG olayı düşer; UI "veri tazeliği" rozetinde fark edilir
+                        // ve istemci kendi polling'iyle telafi eder.
+                        let msg = format!("SSE akışı {skipped} olay kaçırdı (yavaş tüketici) — polling telafi eder");
+                        return Some((
                         Ok(Event::default()
                             .event("LOG")
                             .data(serde_json::json!({"level": "WARN", "message": msg, "ts": crate::state::now_ms()}).to_string())),
                         (rx, app, n, last_ping),
                     ));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-            }
             }
         },
     )
@@ -4815,17 +6685,15 @@ mod rate_limit_tests {
     fn rate_limit_identity_ignores_client_supplied_forwarded_headers() {
         let peer = SocketAddr::from(([127, 0, 0, 1], 45_000));
         let mut first = Request::new(Body::empty());
-        first.headers_mut().insert(
-            "x-forwarded-for",
-            HeaderValue::from_static("198.51.100.1"),
-        );
+        first
+            .headers_mut()
+            .insert("x-forwarded-for", HeaderValue::from_static("198.51.100.1"));
         first.extensions_mut().insert(ConnectInfo(peer));
 
         let mut second = Request::new(Body::empty());
-        second.headers_mut().insert(
-            "x-forwarded-for",
-            HeaderValue::from_static("198.51.100.2"),
-        );
+        second
+            .headers_mut()
+            .insert("x-forwarded-for", HeaderValue::from_static("198.51.100.2"));
         second.extensions_mut().insert(ConnectInfo(peer));
 
         assert_eq!(rate_limit_key(&first), rate_limit_key(&second));
@@ -4846,11 +6714,26 @@ mod rate_limit_tests {
     #[test]
     fn restored_order_roles_keep_reduce_semantics_and_bot_ownership() {
         use dca_kernel::OrderKind;
-        assert_eq!(restored_order_semantics("b-1234abcd", "b-1234abcd-7-TPL-0"), Some(("TP", OrderKind::Reduce)));
-        assert_eq!(restored_order_semantics("b-1234abcd", "b-1234abcd-7-GRID_CLOSE-4294967296"), Some(("GRID_CLOSE", OrderKind::Reduce)));
-        assert_eq!(restored_order_semantics("b-1234abcd", "b-1234abcd-7-SAFETY-2"), Some(("SAFETY", OrderKind::Add)));
-        assert_eq!(restored_order_semantics("b-1234abcd", "b-9876abcd-7-TPL-0"), None);
-        assert_eq!(restored_order_semantics("b-1234abcd", "b-1234abcd-7-UNKNOWN-0"), None);
+        assert_eq!(
+            restored_order_semantics("b-1234abcd", "b-1234abcd-7-TPL-0"),
+            Some(("TP", OrderKind::Reduce))
+        );
+        assert_eq!(
+            restored_order_semantics("b-1234abcd", "b-1234abcd-7-GRID_CLOSE-4294967296"),
+            Some(("GRID_CLOSE", OrderKind::Reduce))
+        );
+        assert_eq!(
+            restored_order_semantics("b-1234abcd", "b-1234abcd-7-SAFETY-2"),
+            Some(("SAFETY", OrderKind::Add))
+        );
+        assert_eq!(
+            restored_order_semantics("b-1234abcd", "b-9876abcd-7-TPL-0"),
+            None
+        );
+        assert_eq!(
+            restored_order_semantics("b-1234abcd", "b-1234abcd-7-UNKNOWN-0"),
+            None
+        );
     }
 
     #[test]
@@ -4870,14 +6753,25 @@ mod rate_limit_tests {
             ("BYBIT", "PAPER", "BTCUSDT", "RUNNING"),
             ("BINANCE", "LIVE", "ETHUSDT", "STOPPED"),
         ]);
-        assert_eq!(duplicates, HashSet::from([("BYBIT".into(), "BTCUSDT".into())]));
+        assert_eq!(
+            duplicates,
+            HashSet::from([("BYBIT".into(), "BTCUSDT".into())])
+        );
     }
 
     #[test]
     fn stopped_live_bot_keeps_ownership_while_it_has_exposure_or_orders() {
-        assert!(!live_status_requires_ownership("STOPPED", false, false, false));
-        assert!(live_status_requires_ownership("STOPPED", true, false, false));
-        assert!(live_status_requires_ownership("STOPPED", false, true, false));
-        assert!(live_status_requires_ownership("PAUSED", false, false, false));
+        assert!(!live_status_requires_ownership(
+            "STOPPED", false, false, false
+        ));
+        assert!(live_status_requires_ownership(
+            "STOPPED", true, false, false
+        ));
+        assert!(live_status_requires_ownership(
+            "STOPPED", false, true, false
+        ));
+        assert!(live_status_requires_ownership(
+            "PAUSED", false, false, false
+        ));
     }
 }

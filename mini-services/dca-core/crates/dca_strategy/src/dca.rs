@@ -4,7 +4,7 @@
 use crate::{order_id, Action, BarContext, BotConfig, EngineSnapshot, StrategyKind};
 use dca_kernel::{FillRecord, OrderKind};
 use dca_math::fraction::Fraction;
-use dca_math::m02::{build_dca_plan, Direction, SizingMode, DcaLevel};
+use dca_math::m02::{build_dca_plan, DcaLevel, Direction, SizingMode};
 use dca_math::m03_m07::{calculate_net_take_profit, gross_take_profit_price};
 use dca_math::m04::PositionState;
 use dca_math::Instrument;
@@ -133,9 +133,11 @@ impl DcaEngine {
             StrategyKind::DcaShort => Direction::Short,
             _ => return Err("DcaEngine requires DCA_LONG/DCA_SHORT/FUTURES_DCA".into()),
         };
-        let deviation = Fraction::from_decimal_str(&cfg.deviation_pct).map_err(|e| e.to_string())?;
+        let deviation =
+            Fraction::from_decimal_str(&cfg.deviation_pct).map_err(|e| e.to_string())?;
         let step_scale = Fraction::from_decimal_str(&cfg.step_scale).map_err(|e| e.to_string())?;
-        let volume_scale = Fraction::from_decimal_str(&cfg.volume_scale).map_err(|e| e.to_string())?;
+        let volume_scale =
+            Fraction::from_decimal_str(&cfg.volume_scale).map_err(|e| e.to_string())?;
         if deviation.is_zero() || deviation.is_negative() {
             return Err("deviation must be > 0".into());
         }
@@ -215,9 +217,14 @@ impl DcaEngine {
         if qty.is_zero() {
             return Ok(None);
         }
-        let target_pct = Fraction::from_decimal_str(&self.cfg.target_profit_pct).map_err(|e| e.to_string())?;
+        let target_pct =
+            Fraction::from_decimal_str(&self.cfg.target_profit_pct).map_err(|e| e.to_string())?;
         if self.cfg.use_net_tp {
-            let target_quote = qty.mul(avg).map_err(|e| e.to_string())?.mul(&target_pct).map_err(|e| e.to_string())?;
+            let target_quote = qty
+                .mul(avg)
+                .map_err(|e| e.to_string())?
+                .mul(&target_pct)
+                .map_err(|e| e.to_string())?;
             // Faz 19 (P1-4 kalıcı): TP artık dinlenen reduce-only LIMIT olarak
             // icra edilir — çıkış MAKER'dır; net TP hesabı da maker ücretle
             // tutarlıdır. (Faz 18'deki taker düzeltmesi piyasa-çıkış dönemine
@@ -236,21 +243,39 @@ impl DcaEngine {
             .map_err(|e| e.to_string())?;
             Ok(Some(p))
         } else {
-            let p = gross_take_profit_price(self.direction.sign() as i8, avg, &target_pct, &self.inst.tick_size)
-                .map_err(|e| e.to_string())?;
+            let p = gross_take_profit_price(
+                self.direction.sign() as i8,
+                avg,
+                &target_pct,
+                &self.inst.tick_size,
+            )
+            .map_err(|e| e.to_string())?;
             Ok(Some(p))
         }
     }
 
     fn compute_sl(&self) -> Result<Option<Fraction>, String> {
-        let Some(raw_pct) = self.cfg.stop_loss_pct.as_deref().filter(|value| !value.trim().is_empty()) else {
+        self.compute_sl_for(
+            self.cfg.stop_loss_pct.as_deref(),
+            self.mirror.avg_price.as_ref(),
+        )
+    }
+
+    fn compute_sl_for(
+        &self,
+        raw_pct: Option<&str>,
+        avg: Option<&Fraction>,
+    ) -> Result<Option<Fraction>, String> {
+        let Some(raw_pct) = raw_pct.filter(|value| !value.trim().is_empty()) else {
             return Ok(None);
         };
         let pct = Fraction::from_decimal_str(raw_pct).map_err(|e| e.to_string())?;
         if !pct.is_positive() || (self.direction == Direction::Long && pct >= Fraction::one()) {
             return Err("SL percent is outside the valid range".into());
         }
-        let avg = self.mirror.avg_price.as_ref().ok_or("SL requires an open average price")?;
+        // Idle/cooldown bots can store an SL setting before their first fill.
+        // Validate the setting now and derive a trigger once an average price exists.
+        let Some(avg) = avg else { return Ok(None) };
         if !avg.is_positive() {
             return Err("SL average price must be positive".into());
         }
@@ -322,13 +347,25 @@ impl DcaEngine {
         let forced = std::mem::take(&mut self.force_start_pending);
         // Start condition (entry trigger) evaluation — gates every new deal.
         let rsi_needed = matches!(self.cfg.entry_trigger, crate::EntryTrigger::RsiBelow(_));
-        let rsi_opt = if rsi_needed { crate::rsi_exact(&self.rsi_window, 14) } else { None };
-        let trigger_ok = match crate::evaluate_entry_trigger(&self.cfg.entry_trigger, &ctx.close, ctx.bar.t, rsi_opt.as_ref()) {
+        let rsi_opt = if rsi_needed {
+            crate::rsi_exact(&self.rsi_window, 14)
+        } else {
+            None
+        };
+        let trigger_ok = match crate::evaluate_entry_trigger(
+            &self.cfg.entry_trigger,
+            &ctx.close,
+            ctx.bar.t,
+            rsi_opt.as_ref(),
+        ) {
             Ok(v) => v,
             Err(e) => {
                 // Ulaşılamaz savunma: tüm Err dalları EntryTrigger::validate() ile
                 // construction anında yakalanır (DcaEngine::new + API kapıları).
-                acts.push(Action::Log { level: "ERROR", message: format!("entry trigger invalid: {e}") });
+                acts.push(Action::Log {
+                    level: "ERROR",
+                    message: format!("entry trigger invalid: {e}"),
+                });
                 return acts;
             }
         };
@@ -346,16 +383,25 @@ impl DcaEngine {
                 self.blocked_signal_bars += 1;
             }
             if signal_block {
-                acts.push(Action::Log { level: "INFO", message: "signal condition not met — waiting (fail-closed)".into() });
+                acts.push(Action::Log {
+                    level: "INFO",
+                    message: "signal condition not met — waiting (fail-closed)".into(),
+                });
             }
             return acts;
         }
         if forced {
-            acts.push(Action::Log { level: "INFO", message: "webhook START_DEAL — opening deal (conditions bypassed)".into() });
+            acts.push(Action::Log {
+                level: "INFO",
+                message: "webhook START_DEAL — opening deal (conditions bypassed)".into(),
+            });
         } else if !self.entry_trigger_met {
             acts.push(Action::Log {
                 level: "INFO",
-                message: format!("start condition met ({}) — opening deal", self.cfg.entry_trigger.describe()),
+                message: format!(
+                    "start condition met ({}) — opening deal",
+                    self.cfg.entry_trigger.describe()
+                ),
             });
         }
         self.entry_trigger_met = true;
@@ -423,7 +469,10 @@ impl DcaEngine {
         match ladder {
             Ok(l) => self.ladder = l,
             Err(e) => {
-                acts.push(Action::Log { level: "ERROR", message: format!("ladder rejected: {e}") });
+                acts.push(Action::Log {
+                    level: "ERROR",
+                    message: format!("ladder rejected: {e}"),
+                });
                 return acts;
             }
         }
@@ -432,7 +481,11 @@ impl DcaEngine {
         self.mirror = PositionState::new(self.direction.sign() as i8);
         // M-17: funding kümülatiftir (snapshot `cumulative_funding` sözleşmesi);
         // deal açılışında sıfırlanmaz — yalnızca deal-bazlı WAC mirror sıfırlanır.
-        self.trailing = if self.cfg.trailing_enabled { TrailingState::Idle } else { TrailingState::Off };
+        self.trailing = if self.cfg.trailing_enabled {
+            TrailingState::Idle
+        } else {
+            TrailingState::Off
+        };
         self.trailing_peak = None;
         self.manual_close_requested = false;
         // Faz 22 (P1-21): QuoteNotional'da harcanan QUOTE sabittir — market
@@ -444,8 +497,11 @@ impl DcaEngine {
         };
         let qty = match self.cfg.sizing_mode {
             SizingMode::BaseQty => base_qty,
-            SizingMode::QuoteNotional => dca_math::m02::qty_down(&base_qty.div(&anchor).unwrap_or_else(|_| Fraction::zero()), &self.inst.step_size)
-                .unwrap_or_else(|_| Fraction::zero()),
+            SizingMode::QuoteNotional => dca_math::m02::qty_down(
+                &base_qty.div(&anchor).unwrap_or_else(|_| Fraction::zero()),
+                &self.inst.step_size,
+            )
+            .unwrap_or_else(|_| Fraction::zero()),
         };
         if qty.is_zero() {
             // M-18: base notional adım boyutunun altında (qty→0) — her tick yeniden
@@ -474,12 +530,19 @@ impl DcaEngine {
         self.deal_fees = Fraction::zero();
         acts.push(Action::PlaceMarket {
             id: order_id(&self.bot_id, "BASE", base_seq),
-            side: if self.direction == Direction::Long { dca_math::Side::Buy } else { dca_math::Side::Sell },
+            side: if self.direction == Direction::Long {
+                dca_math::Side::Buy
+            } else {
+                dca_math::Side::Sell
+            },
             qty,
             role: "BASE",
             quote_notional: base_quote,
         });
-        acts.push(Action::Log { level: "INFO", message: format!("deal {deal_id} base order dispatched") });
+        acts.push(Action::Log {
+            level: "INFO",
+            message: format!("deal {deal_id} base order dispatched"),
+        });
         self.phase = DcaPhase::BasePending;
         acts
     }
@@ -546,22 +609,33 @@ impl DcaEngine {
         if let Some(avg) = &self.mirror.avg_price {
             match self.compute_tp(&q, avg) {
                 Ok(tp) => self.tp_price = tp,
-                Err(e) => acts.push(Action::Log { level: "ERROR", message: e }),
+                Err(e) => acts.push(Action::Log {
+                    level: "ERROR",
+                    message: e,
+                }),
             }
             match self.compute_sl() {
                 Ok(sl) => self.sl_price = sl,
-                Err(e) => acts.push(Action::Log { level: "ERROR", message: format!("SL calculation failed: {e}") }),
+                Err(e) => acts.push(Action::Log {
+                    level: "ERROR",
+                    message: format!("SL calculation failed: {e}"),
+                }),
             }
         }
         acts
     }
 
     fn rebuild_ladder_from_anchor(&mut self, anchor: &Fraction) {
-        let base_qty = Fraction::from_decimal_str(&self.cfg.base_order_size).unwrap_or_else(|_| Fraction::one());
-        let safety_size = Fraction::from_decimal_str(&self.cfg.safety_order_size).unwrap_or_else(|_| Fraction::one());
-        let deviation = Fraction::from_decimal_str(&self.cfg.deviation_pct).unwrap_or_else(|_| Fraction::from_decimal_str("0.02").unwrap());
-        let step_scale = Fraction::from_decimal_str(&self.cfg.step_scale).unwrap_or_else(|_| Fraction::one());
-        let volume_scale = Fraction::from_decimal_str(&self.cfg.volume_scale).unwrap_or_else(|_| Fraction::one());
+        let base_qty = Fraction::from_decimal_str(&self.cfg.base_order_size)
+            .unwrap_or_else(|_| Fraction::one());
+        let safety_size = Fraction::from_decimal_str(&self.cfg.safety_order_size)
+            .unwrap_or_else(|_| Fraction::one());
+        let deviation = Fraction::from_decimal_str(&self.cfg.deviation_pct)
+            .unwrap_or_else(|_| Fraction::from_decimal_str("0.02").unwrap());
+        let step_scale =
+            Fraction::from_decimal_str(&self.cfg.step_scale).unwrap_or_else(|_| Fraction::one());
+        let volume_scale =
+            Fraction::from_decimal_str(&self.cfg.volume_scale).unwrap_or_else(|_| Fraction::one());
         if let Ok(l) = build_dca_plan(
             anchor,
             &base_qty,
@@ -595,7 +669,11 @@ impl DcaEngine {
         let safety_seq = self.next_seq();
         Action::PlaceLimit {
             id: order_id(&self.bot_id, "SAFETY", safety_seq),
-            side: if self.direction == Direction::Long { dca_math::Side::Buy } else { dca_math::Side::Sell },
+            side: if self.direction == Direction::Long {
+                dca_math::Side::Buy
+            } else {
+                dca_math::Side::Sell
+            },
             price: level.price.clone(),
             qty: level.qty.clone(),
             role: "SAFETY",
@@ -603,7 +681,12 @@ impl DcaEngine {
     }
 
     /// Dynamic config patch (TP/SL/trailing) on active deal.
-    pub fn patch(&mut self, target_profit_pct: Option<String>, stop_loss_pct: Option<Option<String>>, trailing_enabled: Option<bool>) -> Result<(), String> {
+    pub fn patch(
+        &mut self,
+        target_profit_pct: Option<String>,
+        stop_loss_pct: Option<Option<String>>,
+        trailing_enabled: Option<bool>,
+    ) -> Result<(), String> {
         if let Some(tp) = target_profit_pct {
             // Faz 26 (KAPSAMLI_DENETİM P2): yalnız sıfır değil NEGATİF de reddi —
             // create akışı 422 verirken patch yolu "-0.02" TP'yi kabul edip
@@ -619,34 +702,54 @@ impl DcaEngine {
             }
         }
         if let Some(sl) = stop_loss_pct {
+            // Derive and validate against the candidate value before mutating
+            // configuration, so a rejected patch cannot leave the runtime dirty.
+            let next_sl_price =
+                self.compute_sl_for(sl.as_deref(), self.mirror.avg_price.as_ref())?;
             self.cfg.stop_loss_pct = sl.clone();
-            self.sl_price = self.compute_sl()?;
+            self.sl_price = next_sl_price;
         }
         if let Some(t) = trailing_enabled {
             self.cfg.trailing_enabled = t;
-            self.trailing = if t { TrailingState::Idle } else { TrailingState::Off };
+            self.trailing = if t {
+                TrailingState::Idle
+            } else {
+                TrailingState::Off
+            };
         }
         Ok(())
     }
 
     /// M09 MANUAL_ADD: inject an extra fill at mark price and re-derive TP/ladder.
-    pub fn manual_add_funds(&mut self, price: &Fraction, quote_amount: &Fraction) -> Result<Vec<Action>, String> {
+    pub fn manual_add_funds(
+        &mut self,
+        price: &Fraction,
+        quote_amount: &Fraction,
+    ) -> Result<Vec<Action>, String> {
         if self.phase != DcaPhase::Open {
             return Err("no open deal".into());
         }
-        let qty = dca_math::m02::qty_down(&quote_amount.div(price).map_err(|e| e.to_string())?, &self.inst.step_size)
-            .map_err(|e| e.to_string())?;
+        let qty = dca_math::m02::qty_down(
+            &quote_amount.div(price).map_err(|e| e.to_string())?,
+            &self.inst.step_size,
+        )
+        .map_err(|e| e.to_string())?;
         if qty.is_zero() {
             return Err("amount too small".into());
         }
         let fill_key = format!("manual-{}", self.next_seq());
-        self.mirror.apply_fill(&fill_key, price, &qty, true).map_err(|e| e.to_string())?;
+        self.mirror
+            .apply_fill(&fill_key, price, &qty, true)
+            .map_err(|e| e.to_string())?;
         // TP recompute
         let q = self.mirror.qty.clone();
         if let Some(avg) = &self.mirror.avg_price {
             self.tp_price = self.compute_tp(&q, avg)?;
         }
-        Ok(vec![Action::Log { level: "INFO", message: format!("MANUAL_ADD {} @ {}", qty, price) }])
+        Ok(vec![Action::Log {
+            level: "INFO",
+            message: format!("MANUAL_ADD {} @ {}", qty, price),
+        }])
     }
 
     pub fn request_close_all(&mut self) {
@@ -686,14 +789,20 @@ impl DcaEngine {
                         }
                         acts.push(Action::PlaceMarket {
                             id: order_id(&self.next_seq_id(), "SL", 0),
-                            side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
+                            side: if self.direction == Direction::Long {
+                                dca_math::Side::Sell
+                            } else {
+                                dca_math::Side::Buy
+                            },
                             qty: self.mirror.qty.clone(),
                             role: "SL",
-                        quote_notional: None,
+                            quote_notional: None,
                         });
                         self.phase = DcaPhase::Closing;
                         self.close_orders_out += 1;
-                        acts.push(Action::CancelResting { id: format!("{}-SAFETY-*", self.bot_id) });
+                        acts.push(Action::CancelResting {
+                            id: format!("{}-SAFETY-*", self.bot_id),
+                        });
                         return acts;
                     }
                 }
@@ -707,14 +816,28 @@ impl DcaEngine {
                             match self.trailing {
                                 TrailingState::Idle => {
                                     let activation = if self.direction == Direction::Long {
-                                        avg.mul(&Fraction::one().add(&trigger_pct).unwrap_or_else(|_| avg.clone()))
+                                        avg.mul(
+                                            &Fraction::one()
+                                                .add(&trigger_pct)
+                                                .unwrap_or_else(|_| avg.clone()),
+                                        )
                                     } else {
-                                        avg.mul(&Fraction::one().sub(&trigger_pct).unwrap_or_else(|_| avg.clone()))
+                                        avg.mul(
+                                            &Fraction::one()
+                                                .sub(&trigger_pct)
+                                                .unwrap_or_else(|_| avg.clone()),
+                                        )
                                     };
                                     let armed = if self.direction == Direction::Long {
-                                        dca_math::Fraction::cmp(mark, &activation.unwrap_or_else(|_| avg.clone())) != std::cmp::Ordering::Less
+                                        dca_math::Fraction::cmp(
+                                            mark,
+                                            &activation.unwrap_or_else(|_| avg.clone()),
+                                        ) != std::cmp::Ordering::Less
                                     } else {
-                                        dca_math::Fraction::cmp(mark, &activation.unwrap_or_else(|_| avg.clone())) != std::cmp::Ordering::Greater
+                                        dca_math::Fraction::cmp(
+                                            mark,
+                                            &activation.unwrap_or_else(|_| avg.clone()),
+                                        ) != std::cmp::Ordering::Greater
                                     };
                                     if armed {
                                         self.trailing = TrailingState::Armed;
@@ -722,38 +845,63 @@ impl DcaEngine {
                                     }
                                 }
                                 TrailingState::Armed => {
-                                    let peak = self.trailing_peak.clone().unwrap_or_else(|| mark.clone());
+                                    let peak =
+                                        self.trailing_peak.clone().unwrap_or_else(|| mark.clone());
                                     let better = if self.direction == Direction::Long {
-                                        dca_math::Fraction::cmp(mark, &peak) == std::cmp::Ordering::Greater
+                                        dca_math::Fraction::cmp(mark, &peak)
+                                            == std::cmp::Ordering::Greater
                                     } else {
-                                        dca_math::Fraction::cmp(mark, &peak) == std::cmp::Ordering::Less
+                                        dca_math::Fraction::cmp(mark, &peak)
+                                            == std::cmp::Ordering::Less
                                     };
                                     if better {
                                         self.trailing_peak = Some(mark.clone());
                                     } else {
                                         let drop = if self.direction == Direction::Long {
-                                            peak.mul(&Fraction::one().sub(&dev_pct).unwrap_or_else(|_| peak.clone()))
+                                            peak.mul(
+                                                &Fraction::one()
+                                                    .sub(&dev_pct)
+                                                    .unwrap_or_else(|_| peak.clone()),
+                                            )
                                         } else {
-                                            peak.mul(&Fraction::one().add(&dev_pct).unwrap_or_else(|_| peak.clone()))
+                                            peak.mul(
+                                                &Fraction::one()
+                                                    .add(&dev_pct)
+                                                    .unwrap_or_else(|_| peak.clone()),
+                                            )
                                         };
                                         let exit = if self.direction == Direction::Long {
-                                            dca_math::Fraction::cmp(mark, &drop.unwrap_or_else(|_| peak.clone())) != std::cmp::Ordering::Greater
+                                            dca_math::Fraction::cmp(
+                                                mark,
+                                                &drop.unwrap_or_else(|_| peak.clone()),
+                                            ) != std::cmp::Ordering::Greater
                                         } else {
-                                            dca_math::Fraction::cmp(mark, &drop.unwrap_or_else(|_| peak.clone())) != std::cmp::Ordering::Less
+                                            dca_math::Fraction::cmp(
+                                                mark,
+                                                &drop.unwrap_or_else(|_| peak.clone()),
+                                            ) != std::cmp::Ordering::Less
                                         };
                                         if exit {
                                             // Faz 19 (P1-4): trailing kapanışı — dinlenen TP iptal.
                                             if let Some(rt) = self.resting_tp.take() {
-                                                acts.push(Action::CancelResting { id: rt.order_id });
+                                                acts.push(Action::CancelResting {
+                                                    id: rt.order_id,
+                                                });
                                             }
                                             // P0 SAFETY İptali: Trailing çıkışında açık SAFETY emirleri iptal edilir
-                                            acts.push(Action::CancelResting { id: format!("{}-SAFETY-*", self.bot_id) });
+                                            acts.push(Action::CancelResting {
+                                                id: format!("{}-SAFETY-*", self.bot_id),
+                                            });
                                             acts.push(Action::PlaceMarket {
                                                 id: order_id(&self.next_seq_id(), "TRAIL", 0),
-                                                side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
+                                                side: if self.direction == Direction::Long {
+                                                    dca_math::Side::Sell
+                                                } else {
+                                                    dca_math::Side::Buy
+                                                },
                                                 qty: self.mirror.qty.clone(),
                                                 role: "TP",
-                                            quote_notional: None,
+                                                quote_notional: None,
                                             });
                                             self.phase = DcaPhase::Closing;
                                             self.close_orders_out += 1;
@@ -797,7 +945,11 @@ impl DcaEngine {
                             let id = order_id(&self.next_seq_id(), "TPL", 0);
                             acts.push(Action::PlaceLimit {
                                 id: id.clone(),
-                                side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
+                                side: if self.direction == Direction::Long {
+                                    dca_math::Side::Sell
+                                } else {
+                                    dca_math::Side::Buy
+                                },
                                 price: tp.clone(),
                                 qty: self.mirror.qty.clone(),
                                 role: "TP",
@@ -820,13 +972,19 @@ impl DcaEngine {
                         acts.push(Action::CancelResting { id: rt.order_id });
                     }
                     // P0 SAFETY İptali: Manuel kapanışta açık SAFETY emirleri iptal edilir
-                    acts.push(Action::CancelResting { id: format!("{}-SAFETY-*", self.bot_id) });
+                    acts.push(Action::CancelResting {
+                        id: format!("{}-SAFETY-*", self.bot_id),
+                    });
                     acts.push(Action::PlaceMarket {
                         id: order_id(&self.next_seq_id(), "MANUAL", 0),
-                        side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
+                        side: if self.direction == Direction::Long {
+                            dca_math::Side::Sell
+                        } else {
+                            dca_math::Side::Buy
+                        },
                         qty: self.mirror.qty.clone(),
                         role: "MANUAL",
-                    quote_notional: None,
+                        quote_notional: None,
                     });
                     self.phase = DcaPhase::Closing;
                     self.close_orders_out += 1;
@@ -844,13 +1002,19 @@ impl DcaEngine {
                         acts.push(Action::CancelResting { id: rt.order_id });
                     }
                     // P0 SAFETY İptali: Manuel kapanışta açık SAFETY emirleri iptal edilir
-                    acts.push(Action::CancelResting { id: format!("{}-SAFETY-*", self.bot_id) });
+                    acts.push(Action::CancelResting {
+                        id: format!("{}-SAFETY-*", self.bot_id),
+                    });
                     acts.push(Action::PlaceMarket {
                         id: order_id(&self.next_seq_id(), "MANUAL", 0),
-                        side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
+                        side: if self.direction == Direction::Long {
+                            dca_math::Side::Sell
+                        } else {
+                            dca_math::Side::Buy
+                        },
                         qty: self.mirror.qty.clone(),
                         role: "MANUAL",
-                    quote_notional: None,
+                        quote_notional: None,
                     });
                     self.close_orders_out += 1;
                     self.closing_bars_waited = 0;
@@ -872,10 +1036,14 @@ impl DcaEngine {
                     }
                     acts.push(Action::PlaceMarket {
                         id: order_id(&self.next_seq_id(), "MANUAL", 0),
-                        side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
+                        side: if self.direction == Direction::Long {
+                            dca_math::Side::Sell
+                        } else {
+                            dca_math::Side::Buy
+                        },
                         qty: self.mirror.qty.clone(),
                         role: "MANUAL",
-                    quote_notional: None,
+                        quote_notional: None,
                     });
                     self.close_orders_out += 1;
                     self.closing_bars_waited = 0;
@@ -908,13 +1076,22 @@ impl DcaEngine {
             .add(&fill.fee)
             .unwrap_or_else(|_| self.deal_fees.clone());
         let before_qty = self.mirror.qty.clone();
-        let _ = self.mirror.apply_fill(&fill.fill_key, &fill.price, &fill.qty, is_add);
+        let _ = self
+            .mirror
+            .apply_fill(&fill.fill_key, &fill.price, &fill.qty, is_add);
 
         // Track deal completion via closing fills
         if !is_add {
-            self.closed_qty_accum = self.closed_qty_accum.add(&fill.qty).unwrap_or_else(|_| self.closed_qty_accum.clone());
+            self.closed_qty_accum = self
+                .closed_qty_accum
+                .add(&fill.qty)
+                .unwrap_or_else(|_| self.closed_qty_accum.clone());
         }
-        if before_qty.is_zero() && is_add && fill.role == "BASE" && self.phase == DcaPhase::BasePending {
+        if before_qty.is_zero()
+            && is_add
+            && fill.role == "BASE"
+            && self.phase == DcaPhase::BasePending
+        {
             self.deal_opened_ts = fill.ts;
             acts.extend(self.on_base_filled(&fill.price));
             return acts;
@@ -952,11 +1129,17 @@ impl DcaEngine {
             if let Some(avg) = &self.mirror.avg_price {
                 match self.compute_tp(&q, avg) {
                     Ok(tp) => self.tp_price = tp,
-                    Err(error) => acts.push(Action::Log { level: "ERROR", message: format!("TP recalculation after safety fill failed: {error}") }),
+                    Err(error) => acts.push(Action::Log {
+                        level: "ERROR",
+                        message: format!("TP recalculation after safety fill failed: {error}"),
+                    }),
                 }
                 match self.compute_sl() {
                     Ok(sl) => self.sl_price = sl,
-                    Err(error) => acts.push(Action::Log { level: "ERROR", message: format!("SL recalculation after safety fill failed: {error}") }),
+                    Err(error) => acts.push(Action::Log {
+                        level: "ERROR",
+                        message: format!("SL recalculation after safety fill failed: {error}"),
+                    }),
                 }
             }
             if let Some(old) = self.resting_tp.take() {
@@ -967,26 +1150,39 @@ impl DcaEngine {
                     let id = order_id(&self.next_seq_id(), "TPL", 0);
                     acts.push(Action::PlaceLimit {
                         id: id.clone(),
-                        side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
+                        side: if self.direction == Direction::Long {
+                            dca_math::Side::Sell
+                        } else {
+                            dca_math::Side::Buy
+                        },
                         price: tp.clone(),
                         qty: q.clone(),
                         role: "TP",
                     });
-                    self.resting_tp = Some(RestingTp { order_id: id, price: tp, qty: q });
+                    self.resting_tp = Some(RestingTp {
+                        order_id: id,
+                        price: tp,
+                        qty: q,
+                    });
                 }
             }
         }
         // Deal fully closed?
         // Faz 19 (P1-4): dinlenen TP dolumu fazı Closing'e ALMADAN flat yapar
         // (resting TP iken faz Open kalır) — kapanış tespiti her iki fazı görür.
-        if !is_add && self.mirror.qty.is_zero() && matches!(self.phase, DcaPhase::Closing | DcaPhase::Open) {
+        if !is_add
+            && self.mirror.qty.is_zero()
+            && matches!(self.phase, DcaPhase::Closing | DcaPhase::Open)
+        {
             // Faz 19 (P1-4): pozisyon kapandı — dinlenen TP (kısmi dolum
             // artığı olabilir) mutlaka geri çekilir.
             if let Some(rt) = self.resting_tp.take() {
                 acts.push(Action::CancelResting { id: rt.order_id });
             }
             // P0 SAFETY İptali: Deal kapandığında (TP/SL/Trail/Manual) açık kalan SAFETY emirleri derhal iptal edilir
-            acts.push(Action::CancelResting { id: format!("{}-SAFETY-*", self.bot_id) });
+            acts.push(Action::CancelResting {
+                id: format!("{}-SAFETY-*", self.bot_id),
+            });
             let realized = self.mirror.realized_gross.clone();
             // M-17: mirror bir sonraki deal'da sıfırlanır — kapanış realizasyonunu
             // kümülatif deftere devretmeden kaybedilmez.
@@ -1052,8 +1248,14 @@ impl DcaEngine {
     }
 
     pub fn apply_funding(&mut self, expense: &Fraction) {
-        self.funding = self.funding.add(expense).unwrap_or_else(|_| self.funding.clone());
-        self.funding_deal = self.funding_deal.add(expense).unwrap_or_else(|_| self.funding_deal.clone());
+        self.funding = self
+            .funding
+            .add(expense)
+            .unwrap_or_else(|_| self.funding.clone());
+        self.funding_deal = self
+            .funding_deal
+            .add(expense)
+            .unwrap_or_else(|_| self.funding_deal.clone());
     }
 
     /// Margin call: the position was force-closed at the liquidation boundary.
@@ -1103,7 +1305,10 @@ impl DcaEngine {
                 .ladder
                 .get(self.next_level_to_place)
                 .map(|l| self.close_str(&l.price, 8)),
-            next_safety_level: self.ladder.get(self.next_level_to_place).map(|l| l.level_index),
+            next_safety_level: self
+                .ladder
+                .get(self.next_level_to_place)
+                .map(|l| l.level_index),
             tp_price: self.tp_price.as_ref().map(|p| self.close_str(p, 8)),
             sl_price: self.sl_price.as_ref().map(|p| self.close_str(p, 8)),
             trailing_state: Some(format!("{:?}", self.trailing)),
@@ -1132,7 +1337,14 @@ mod start_condition_tests {
     use dca_math::Instrument;
 
     fn bar(t: i64, c: &str) -> Bar {
-        Bar { t, o: c.into(), h: c.into(), l: c.into(), c: c.into(), v: "10".into() }
+        Bar {
+            t,
+            o: c.into(),
+            h: c.into(),
+            l: c.into(),
+            c: c.into(),
+            v: "10".into(),
+        }
     }
 
     fn ctx<'a>(bar: &'a Bar, close: Fraction) -> BarContext<'a> {
@@ -1177,15 +1389,23 @@ mod start_condition_tests {
         assert!(evaluate_entry_trigger(&pa, &f("100.01"), 0, None).unwrap());
         assert!(!evaluate_entry_trigger(&pa, &f("99.99"), 0, None).unwrap());
         // DROP_FROM_REF: 100000 −10% → 90000 trigger, inclusive
-        let dr = EntryTrigger::DropFromRef { ref_price: "100000".into(), drop_pct: "0.1".into() };
+        let dr = EntryTrigger::DropFromRef {
+            ref_price: "100000".into(),
+            drop_pct: "0.1".into(),
+        };
         assert!(evaluate_entry_trigger(&dr, &f("90000"), 0, None).unwrap());
         assert!(!evaluate_entry_trigger(&dr, &f("90000.000001"), 0, None).unwrap());
         assert!(evaluate_entry_trigger(&dr, &f("89999"), 0, None).unwrap());
         // invalid drop_pct rejected
-        let bad = EntryTrigger::DropFromRef { ref_price: "100".into(), drop_pct: "1".into() };
+        let bad = EntryTrigger::DropFromRef {
+            ref_price: "100".into(),
+            drop_pct: "1".into(),
+        };
         assert!(evaluate_entry_trigger(&bad, &f("50"), 0, None).is_err());
         // SCHEDULED: bar time ≥ start_ms
-        let sc = EntryTrigger::Scheduled { start_ms: 1_700_000_000_000 };
+        let sc = EntryTrigger::Scheduled {
+            start_ms: 1_700_000_000_000,
+        };
         assert!(!evaluate_entry_trigger(&sc, &f("1"), 1_699_999_999_999, None).unwrap());
         assert!(evaluate_entry_trigger(&sc, &f("1"), 1_700_000_000_000, None).unwrap());
         // RSI_BELOW: None window ⇒ false; supplied value compared strictly
@@ -1209,7 +1429,9 @@ mod start_condition_tests {
 
         // price touches the threshold (inclusive) → BASE dispatched
         let acts = e.try_open_deal(&ctx(&b, Fraction::from_decimal_str("50000").unwrap()));
-        assert!(acts.iter().any(|a| matches!(a, Action::PlaceMarket { role: "BASE", .. })));
+        assert!(acts
+            .iter()
+            .any(|a| matches!(a, Action::PlaceMarket { role: "BASE", .. })));
         assert_eq!(e.phase, DcaPhase::BasePending);
         assert!(e.entry_trigger_met);
         assert!(e.snapshot().entry_trigger_met);
@@ -1220,11 +1442,15 @@ mod start_condition_tests {
         let t0 = 1_700_000_000_000i64;
         let mut e = engine_with(EntryTrigger::Scheduled { start_ms: t0 });
         let early = bar(t0 - 3_600_000, "100");
-        assert!(e.try_open_deal(&ctx(&early, Fraction::from_u64(100))).is_empty());
+        assert!(e
+            .try_open_deal(&ctx(&early, Fraction::from_u64(100)))
+            .is_empty());
         assert!(!e.entry_trigger_met);
         let late = bar(t0 + 3_600_000, "100");
         let acts = e.try_open_deal(&ctx(&late, Fraction::from_u64(100)));
-        assert!(acts.iter().any(|a| matches!(a, Action::PlaceMarket { role: "BASE", .. })));
+        assert!(acts
+            .iter()
+            .any(|a| matches!(a, Action::PlaceMarket { role: "BASE", .. })));
         assert!(e.entry_trigger_met);
     }
 
@@ -1245,14 +1471,24 @@ mod start_condition_tests {
         let t: EntryTrigger = serde_json::from_value(v).unwrap();
         assert_eq!(t, EntryTrigger::Instant);
         // SCREAMING names
-        let t: EntryTrigger = serde_json::from_value(serde_json::json!({"PRICE_BELOW": "80000"})).unwrap();
+        let t: EntryTrigger =
+            serde_json::from_value(serde_json::json!({"PRICE_BELOW": "80000"})).unwrap();
         assert_eq!(t, EntryTrigger::PriceBelow("80000".into()));
         let t: EntryTrigger = serde_json::from_value(serde_json::json!({"RSI_BELOW": 30})).unwrap();
         assert_eq!(t, EntryTrigger::RsiBelow(30));
+        let t: EntryTrigger = serde_json::from_value(
+            serde_json::json!({"DROP_FROM_REF": {"ref_price": "90000", "drop_pct": "0.15"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            t,
+            EntryTrigger::DropFromRef {
+                ref_price: "90000".into(),
+                drop_pct: "0.15".into()
+            }
+        );
         let t: EntryTrigger =
-            serde_json::from_value(serde_json::json!({"DROP_FROM_REF": {"ref_price": "90000", "drop_pct": "0.15"}})).unwrap();
-        assert_eq!(t, EntryTrigger::DropFromRef { ref_price: "90000".into(), drop_pct: "0.15".into() });
-        let t: EntryTrigger = serde_json::from_value(serde_json::json!({"SCHEDULED": {"start_ms": 123}})).unwrap();
+            serde_json::from_value(serde_json::json!({"SCHEDULED": {"start_ms": 123}})).unwrap();
         assert_eq!(t, EntryTrigger::Scheduled { start_ms: 123 });
         // serialize → canonical SCREAMING names
         let s = serde_json::to_value(EntryTrigger::PriceAbove("5".into())).unwrap();
@@ -1270,10 +1506,21 @@ mod signal_gate_tests {
     use dca_math::Instrument;
 
     fn bar(t: i64, c: &str) -> Bar {
-        Bar { t, o: c.into(), h: c.into(), l: c.into(), c: c.into(), v: "10".into() }
+        Bar {
+            t,
+            o: c.into(),
+            h: c.into(),
+            l: c.into(),
+            c: c.into(),
+            v: "10".into(),
+        }
     }
 
-    fn ctx_with_signal<'a>(bar: &'a Bar, close: Fraction, signal_ok: Option<bool>) -> BarContext<'a> {
+    fn ctx_with_signal<'a>(
+        bar: &'a Bar,
+        close: Fraction,
+        signal_ok: Option<bool>,
+    ) -> BarContext<'a> {
         let qty: &'static Fraction = Box::leak(Box::new(Fraction::zero()));
         let cash: &'static Fraction = Box::leak(Box::new(Fraction::from_u64(100_000)));
         let mark = close.clone();
@@ -1298,7 +1545,9 @@ mod signal_gate_tests {
         let mut e = DcaEngine::new("sg", BotConfig::default(), Instrument::default()).unwrap();
         let b = bar(1_000, "100");
         let acts = e.try_open_deal(&ctx_with_signal(&b, Fraction::from_u64(100), Some(false)));
-        assert!(acts.iter().all(|a| !matches!(a, Action::PlaceMarket { .. })));
+        assert!(acts
+            .iter()
+            .all(|a| !matches!(a, Action::PlaceMarket { .. })));
         assert_eq!(e.phase, DcaPhase::Idle);
         assert_eq!(e.last_signal_met, Some(false));
         assert_eq!(e.blocked_signal_bars, 1, "no-deal sayacı: sinyal");
@@ -1351,10 +1600,15 @@ mod signal_gate_tests {
         let mut e = DcaEngine::new("ms", cfg, Instrument::default()).unwrap();
         let b = bar(1_000, "100");
         let acts = e.try_open_deal(&ctx_full(&b, Fraction::from_u64(100), None, false));
-        let base = acts.iter().find_map(|a| match a {
-            Action::PlaceMarket { id, role: "BASE", .. } => Some(id.clone()),
-            _ => None,
-        }).expect("base order");
+        let base = acts
+            .iter()
+            .find_map(|a| match a {
+                Action::PlaceMarket {
+                    id, role: "BASE", ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("base order");
         // Base fill simülasyonu.
         let fill = FillRecord {
             fill_key: "f0".into(),
@@ -1370,14 +1624,22 @@ mod signal_gate_tests {
             ts: 1,
         };
         let acts = e.on_fill(&fill);
-        let safety_placed = acts.iter().filter(|a| matches!(a, Action::PlaceLimit { role: "SAFETY", .. })).count();
+        let safety_placed = acts
+            .iter()
+            .filter(|a| matches!(a, Action::PlaceLimit { role: "SAFETY", .. }))
+            .count();
         assert_eq!(safety_placed, 3, "3 aktif güvenlik emri tahtaya yazılmalı");
         assert_eq!(e.resting_safety, 3);
         // L1 dolunca yalnız 1 yeni emir (top-up).
-        let l1_id = acts.iter().find_map(|a| match a {
-            Action::PlaceLimit { id, role: "SAFETY", .. } => Some(id.clone()),
-            _ => None,
-        }).expect("L1 id");
+        let l1_id = acts
+            .iter()
+            .find_map(|a| match a {
+                Action::PlaceLimit {
+                    id, role: "SAFETY", ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("L1 id");
         let fill1 = FillRecord {
             fill_key: "f1".into(),
             order_id: l1_id,
@@ -1392,19 +1654,31 @@ mod signal_gate_tests {
             ts: 2,
         };
         let acts = e.on_fill(&fill1);
-        let new_safety = acts.iter().filter(|a| matches!(a, Action::PlaceLimit { role: "SAFETY", .. })).count();
+        let new_safety = acts
+            .iter()
+            .filter(|a| matches!(a, Action::PlaceLimit { role: "SAFETY", .. }))
+            .count();
         assert_eq!(new_safety, 1, "top-up: bekleyen sayısı 3'e tamamlanmalı");
         assert_eq!(e.resting_safety, 3);
         // Faz 17 (P1-16): filled_safety yalnız DOLUM sayacı; yerleştirme imleci
         // ayrı — L1 dolunca top-up L2'yi TEKRAR yazmaz, L4'ü yazar (fiyat kanıtı).
         assert_eq!(e.filled_safety, 1, "filled_safety yalnız dolum sayacı");
-        assert_eq!(e.next_level_to_place, 4, "yerleştirme imleci L4'ü göstermeli");
+        assert_eq!(
+            e.next_level_to_place, 4,
+            "yerleştirme imleci L4'ü göstermeli"
+        );
         let l4_price = e.ladder[3].price.to_string();
-        let placed_price = acts.iter().find_map(|a| match a {
-            Action::PlaceLimit { price, .. } => Some(price.to_string()),
-            _ => None,
-        }).expect("top-up emri");
-        assert_eq!(placed_price, l4_price, "top-up çift fiyat yerleştirmemeli (eski bug: L2 tekrar)");
+        let placed_price = acts
+            .iter()
+            .find_map(|a| match a {
+                Action::PlaceLimit { price, .. } => Some(price.to_string()),
+                _ => None,
+            })
+            .expect("top-up emri");
+        assert_eq!(
+            placed_price, l4_price,
+            "top-up çift fiyat yerleştirmemeli (eski bug: L2 tekrar)"
+        );
     }
 
     /// spec 2.7: CRASH rejiminde ENFORCE bloklar, PERMISSIVE uyarıyla geçirir.
@@ -1415,17 +1689,39 @@ mod signal_gate_tests {
         let mut cfg = BotConfig::default();
         cfg.risk_policy.regime_filter = dca_kernel::GuardAction::Enforce;
         let mut e = DcaEngine::new("rg", cfg, Instrument::default()).unwrap();
-        let acts = e.try_open_deal(&ctx_full(&b, Fraction::from_u64(100), Some(MarketRegime::Crash), false));
-        assert!(!acts.iter().any(|a| matches!(a, Action::PlaceMarket { role: "BASE", .. })));
-        assert!(acts.iter().any(|a| matches!(a, Action::Log { level: "INFO", .. })));
+        let acts = e.try_open_deal(&ctx_full(
+            &b,
+            Fraction::from_u64(100),
+            Some(MarketRegime::Crash),
+            false,
+        ));
+        assert!(!acts
+            .iter()
+            .any(|a| matches!(a, Action::PlaceMarket { role: "BASE", .. })));
+        assert!(acts
+            .iter()
+            .any(|a| matches!(a, Action::Log { level: "INFO", .. })));
         assert_eq!(e.blocked_regime_bars, 1, "no-deal sayacı: rejim");
         // PERMISSIVE: uyarı + deal açılır.
         let mut cfg = BotConfig::default();
         cfg.risk_policy.regime_filter = dca_kernel::GuardAction::PermissiveWithWarning;
         let mut e = DcaEngine::new("rg2", cfg, Instrument::default()).unwrap();
-        let acts = e.try_open_deal(&ctx_full(&b, Fraction::from_u64(100), Some(MarketRegime::Crash), false));
-        assert!(acts.iter().any(|a| matches!(a, Action::Log { level: "WARN", .. })), "uyarı loglanmalı");
-        assert!(acts.iter().any(|a| matches!(a, Action::PlaceMarket { role: "BASE", .. })), "deal açılmalı");
+        let acts = e.try_open_deal(&ctx_full(
+            &b,
+            Fraction::from_u64(100),
+            Some(MarketRegime::Crash),
+            false,
+        ));
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::Log { level: "WARN", .. })),
+            "uyarı loglanmalı"
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::PlaceMarket { role: "BASE", .. })),
+            "deal açılmalı"
+        );
     }
 
     /// spec 2.9: deal_open_blocked=true iken yeni deal açılmaz.
@@ -1446,7 +1742,10 @@ mod signal_gate_tests {
         let b = bar(1_000, "100");
         let acts = e.try_open_deal(&ctx_with_signal(&b, Fraction::from_u64(100), Some(false)));
         assert!(acts.iter().any(|a| matches!(a, Action::PlaceMarket { .. })));
-        assert!(!e.force_start_pending, "force flag must be consumed exactly once");
+        assert!(
+            !e.force_start_pending,
+            "force flag must be consumed exactly once"
+        );
     }
 
     #[test]
@@ -1520,7 +1819,14 @@ mod m17_realized_ledger_tests {
     use dca_risk::FillRealism;
 
     fn bar(t: i64, c: &str) -> Bar {
-        Bar { t, o: c.into(), h: c.into(), l: c.into(), c: c.into(), v: "10".into() }
+        Bar {
+            t,
+            o: c.into(),
+            h: c.into(),
+            l: c.into(),
+            c: c.into(),
+            v: "10".into(),
+        }
     }
 
     fn ctx<'a>(bar: &'a Bar, close: Fraction) -> BarContext<'a> {
@@ -1542,7 +1848,15 @@ mod m17_realized_ledger_tests {
         }
     }
 
-    fn fill(id: &str, role: &str, side: Side, kind: OrderKind, price: &str, qty: &str, ts: i64) -> FillRecord {
+    fn fill(
+        id: &str,
+        role: &str,
+        side: Side,
+        kind: OrderKind,
+        price: &str,
+        qty: &str,
+        ts: i64,
+    ) -> FillRecord {
         FillRecord {
             fill_key: format!("{id}-{ts}"),
             order_id: id.to_string(),
@@ -1560,11 +1874,16 @@ mod m17_realized_ledger_tests {
 
     /// Bir deal'i uçtan uca yürüt: BASE fill + request_close_all + MANUAL reduce fill.
     fn run_deal(e: &mut DcaEngine, base_px: &str, close_px: &str, qty: &str, t: i64) {
-        let acts = e.on_bar(&ctx(&bar(t, base_px), Fraction::from_decimal_str(base_px).unwrap()));
+        let acts = e.on_bar(&ctx(
+            &bar(t, base_px),
+            Fraction::from_decimal_str(base_px).unwrap(),
+        ));
         let base_id = acts
             .iter()
             .find_map(|a| match a {
-                Action::PlaceMarket { id, role: "BASE", .. } => Some(id.clone()),
+                Action::PlaceMarket {
+                    id, role: "BASE", ..
+                } => Some(id.clone()),
                 _ => None,
             })
             .expect("base order");
@@ -1575,7 +1894,10 @@ mod m17_realized_ledger_tests {
         e.on_fill(&fill(&base_id, "BASE", side, kind, base_px, qty, t));
         assert_eq!(e.phase, DcaPhase::Open);
         e.request_close_all();
-        let acts = e.on_bar(&ctx(&bar(t + 1, close_px), Fraction::from_decimal_str(close_px).unwrap()));
+        let acts = e.on_bar(&ctx(
+            &bar(t + 1, close_px),
+            Fraction::from_decimal_str(close_px).unwrap(),
+        ));
         // close_px TP eşiğinin üstündeyse motor TP, altındaysa MANUAL rolüyle kapatır.
         let (close_id, close_role) = acts
             .iter()
@@ -1590,7 +1912,15 @@ mod m17_realized_ledger_tests {
             Direction::Long => (Side::Sell, OrderKind::Reduce),
             Direction::Short => (Side::Buy, OrderKind::Reduce),
         };
-        e.on_fill(&fill(&close_id, close_role, side, kind, close_px, qty, t + 1));
+        e.on_fill(&fill(
+            &close_id,
+            close_role,
+            side,
+            kind,
+            close_px,
+            qty,
+            t + 1,
+        ));
         assert_eq!(e.phase, DcaPhase::Cooldown);
     }
 
@@ -1616,32 +1946,61 @@ mod m17_realized_ledger_tests {
         // Faz 18 (P1-2): brüt +0.5 ancak komisyon 1.2 + funding 0.1 →
         // NET kayıp. Win/loss kararı brüt PnL'e göre verilemezdi.
         let mut e = DcaEngine::new("p12", BotConfig::default(), Instrument::default()).unwrap();
-        let acts = e.on_bar(&ctx(&bar(1_000, "100"), Fraction::from_decimal_str("100").unwrap()));
+        let acts = e.on_bar(&ctx(
+            &bar(1_000, "100"),
+            Fraction::from_decimal_str("100").unwrap(),
+        ));
         let base_id = acts
             .iter()
             .find_map(|a| match a {
-                Action::PlaceMarket { id, role: "BASE", .. } => Some(id.clone()),
+                Action::PlaceMarket {
+                    id, role: "BASE", ..
+                } => Some(id.clone()),
                 _ => None,
             })
             .expect("base order");
-        let mut bf = fill(&base_id, "BASE", Side::Buy, OrderKind::Add, "100", "1", 1_000);
+        let mut bf = fill(
+            &base_id,
+            "BASE",
+            Side::Buy,
+            OrderKind::Add,
+            "100",
+            "1",
+            1_000,
+        );
         bf.fee = Fraction::from_decimal_str("0.6").unwrap();
         e.on_fill(&bf);
         e.apply_funding(&Fraction::from_decimal_str("0.1").unwrap());
         e.request_close_all();
-        let acts = e.on_bar(&ctx(&bar(1_001, "100.5"), Fraction::from_decimal_str("100.5").unwrap()));
+        let acts = e.on_bar(&ctx(
+            &bar(1_001, "100.5"),
+            Fraction::from_decimal_str("100.5").unwrap(),
+        ));
         let (close_id, close_role) = acts
             .iter()
             .find_map(|a| match a {
-                Action::PlaceMarket { id, role, .. } if matches!(*role, "MANUAL" | "TP") => Some((id.clone(), *role)),
+                Action::PlaceMarket { id, role, .. } if matches!(*role, "MANUAL" | "TP") => {
+                    Some((id.clone(), *role))
+                }
                 _ => None,
             })
             .expect("close order (MANUAL/TP)");
-        let mut cf = fill(&close_id, close_role, Side::Sell, OrderKind::Reduce, "100.5", "1", 1_001);
+        let mut cf = fill(
+            &close_id,
+            close_role,
+            Side::Sell,
+            OrderKind::Reduce,
+            "100.5",
+            "1",
+            1_001,
+        );
         cf.fee = Fraction::from_decimal_str("0.6").unwrap();
         e.on_fill(&cf);
         assert_eq!(e.deals_closed, 1);
-        assert_eq!(e.losses, 1, "net = +0.5 brüt − 1.2 komisyon − 0.1 funding = −0.8 → kayıp");
+        assert_eq!(
+            e.losses, 1,
+            "net = +0.5 brüt − 1.2 komisyon − 0.1 funding = −0.8 → kayıp"
+        );
         assert_eq!(e.wins, 0);
         // Kümülatif realizasyon brüt olarak raporlanmaya devam eder (M-17).
         assert_eq!(e.snapshot().realized_gross, "0.50000000");
@@ -1654,15 +2013,33 @@ mod m17_realized_ledger_tests {
         let base_id = acts
             .iter()
             .find_map(|a| match a {
-                Action::PlaceMarket { id, role: "BASE", .. } => Some(id.clone()),
+                Action::PlaceMarket {
+                    id, role: "BASE", ..
+                } => Some(id.clone()),
                 _ => None,
             })
             .expect("base order");
-        e.on_fill(&fill(&base_id, "BASE", Side::Buy, OrderKind::Add, "100", "1", 1_000));
+        e.on_fill(&fill(
+            &base_id,
+            "BASE",
+            Side::Buy,
+            OrderKind::Add,
+            "100",
+            "1",
+            1_000,
+        ));
         // Faz 19: flat'a indiren reduce artık Open fazında da deal'i kapatır
         // (resting TP dolumu) — force_liquidate'in taşıma sözleşmesi KISMİ
         // realizasyonla test edilir: 0.5 @ 110 → gross 5, pozisyon 0.5 kalır.
-        e.on_fill(&fill("seed-reduce", "TP", Side::Sell, OrderKind::Reduce, "110", "0.5", 1_001));
+        e.on_fill(&fill(
+            "seed-reduce",
+            "TP",
+            Side::Sell,
+            OrderKind::Reduce,
+            "110",
+            "0.5",
+            1_001,
+        ));
         assert_eq!(e.mirror.realized_gross.to_string(), "5");
         assert_eq!(e.mirror.qty.to_half_even_display(8), "0.50000000");
         e.cum_realized_gross = Fraction::zero();
@@ -1677,11 +2054,43 @@ mod m17_realized_ledger_tests {
         // "-0.02" TP'yi kabul edip compute_tp'ye ters-hedef yolluyordu
         // (asla tetiklenmeyen TP → korumasız pozisyon).
         let mut e = DcaEngine::new("ptp", BotConfig::default(), Instrument::default()).unwrap();
-        assert!(e.patch(Some("-0.02".into()), None, None).is_err(), "negatif TP reddedilmeli");
-        assert!(e.patch(Some("0".into()), None, None).is_err(), "sıfır TP reddedilmeli");
-        assert!(e.patch(Some("çöp".into()), None, None).is_err(), "parse edilemeyen TP reddedilmeli");
-        assert!(e.patch(Some("0.02".into()), None, None).is_ok(), "geçerli TP kabul edilmeli");
+        assert!(
+            e.patch(Some("-0.02".into()), None, None).is_err(),
+            "negatif TP reddedilmeli"
+        );
+        assert!(
+            e.patch(Some("0".into()), None, None).is_err(),
+            "sıfır TP reddedilmeli"
+        );
+        assert!(
+            e.patch(Some("çöp".into()), None, None).is_err(),
+            "parse edilemeyen TP reddedilmeli"
+        );
+        assert!(
+            e.patch(Some("0.02".into()), None, None).is_ok(),
+            "geçerli TP kabul edilmeli"
+        );
         assert_eq!(e.cfg.target_profit_pct, "0.02");
+    }
+
+    #[test]
+    fn patch_can_set_sl_while_flat_and_rejected_patch_is_transactional() {
+        let mut e = DcaEngine::new("flat-sl", BotConfig::default(), Instrument::default()).unwrap();
+        e.patch(None, Some(Some("0.05".into())), None)
+            .expect("flat bot can store SL config");
+        assert_eq!(e.cfg.stop_loss_pct.as_deref(), Some("0.05"));
+        assert!(
+            e.sl_price.is_none(),
+            "flat bot has no trigger price until a fill establishes an average"
+        );
+
+        assert!(e.patch(None, Some(Some("1.0".into())), None).is_err());
+        assert_eq!(
+            e.cfg.stop_loss_pct.as_deref(),
+            Some("0.05"),
+            "failed patch must not dirty runtime config"
+        );
+        assert!(e.sl_price.is_none());
     }
 
     #[test]
@@ -1693,23 +2102,44 @@ mod m17_realized_ledger_tests {
         // 3) Yüksek penetrasyonlu barda dolum MAKER rolüyle gelir, deal kapanır
         //    ve dinlenen TP kaydı düşülür.
         let mut e = DcaEngine::new("p114", BotConfig::default(), Instrument::default()).unwrap();
-        let acts = e.on_bar(&ctx(&bar(1_000, "100"), Fraction::from_decimal_str("100").unwrap()));
+        let acts = e.on_bar(&ctx(
+            &bar(1_000, "100"),
+            Fraction::from_decimal_str("100").unwrap(),
+        ));
         let base_id = acts
             .iter()
             .find_map(|a| match a {
-                Action::PlaceMarket { id, role: "BASE", .. } => Some(id.clone()),
+                Action::PlaceMarket {
+                    id, role: "BASE", ..
+                } => Some(id.clone()),
                 _ => None,
             })
             .expect("base order");
-        e.on_fill(&fill(&base_id, "BASE", Side::Buy, OrderKind::Add, "100", "1", 1_000));
+        e.on_fill(&fill(
+            &base_id,
+            "BASE",
+            Side::Buy,
+            OrderKind::Add,
+            "100",
+            "1",
+            1_000,
+        ));
         assert!(e.tp_price.is_some());
 
         // TP üstünde bir bar: piyasa emri YOK, TPL yerleşir (bir sonraki on_bar'da).
-        let acts = e.on_bar(&ctx(&bar(1_001, "105"), Fraction::from_decimal_str("105").unwrap()));
+        let acts = e.on_bar(&ctx(
+            &bar(1_001, "105"),
+            Fraction::from_decimal_str("105").unwrap(),
+        ));
         let tpl = acts
             .iter()
             .find_map(|a| match a {
-                Action::PlaceLimit { id, price, role: "TP", .. } => Some((id.clone(), price.clone())),
+                Action::PlaceLimit {
+                    id,
+                    price,
+                    role: "TP",
+                    ..
+                } => Some((id.clone(), price.clone())),
                 _ => None,
             })
             .expect("TPL reduce-only limit yerleşmeli");
@@ -1717,31 +2147,56 @@ mod m17_realized_ledger_tests {
         let _ = tpl;
 
         // Safety dolumu WAC'ı düşürür → TP değişir → CancelResting + yeni TPL.
-        let acts = e.on_fill(&fill("s1", "SAFETY", Side::Buy, OrderKind::Add, "95", "1", 1_002));
+        let acts = e.on_fill(&fill(
+            "s1",
+            "SAFETY",
+            Side::Buy,
+            OrderKind::Add,
+            "95",
+            "1",
+            1_002,
+        ));
         assert!(
-            acts.iter().any(|a| matches!(a, Action::CancelResting { .. })),
+            acts.iter()
+                .any(|a| matches!(a, Action::CancelResting { .. })),
             "WAC değişince eski TPL aynı fill içinde iptal edilmeli"
         );
         assert!(
-            acts.iter().any(|a| matches!(a, Action::PlaceLimit { role: "TP", .. })),
+            acts.iter()
+                .any(|a| matches!(a, Action::PlaceLimit { role: "TP", .. })),
             "yeni miktarlı TPL aynı fill içinde yazılmalı"
         );
 
         // Yüksek TP'yi 1-tick aşıyor (Maker penetrasyon dolumu) → deal kapanır.
         let tp_now = e.tp_price.clone().expect("tp var");
-        let touch = tp_now.add(&Fraction::from_decimal_str("0.01").unwrap_or_else(|_| Fraction::one())).unwrap_or_else(|_| tp_now.clone());
+        let touch = tp_now
+            .add(&Fraction::from_decimal_str("0.01").unwrap_or_else(|_| Fraction::one()))
+            .unwrap_or_else(|_| tp_now.clone());
         let close_id = e
             .resting_tp
             .as_ref()
             .map(|rt| rt.order_id.clone())
             .expect("resting tp kayıtlı");
-        let cf = fill(&close_id, "TP", Side::Sell, OrderKind::Reduce, &touch.to_half_even_display(8), "2", 1_004);
+        let cf = fill(
+            &close_id,
+            "TP",
+            Side::Sell,
+            OrderKind::Reduce,
+            &touch.to_half_even_display(8),
+            "2",
+            1_004,
+        );
         let acts = e.on_fill(&cf);
-        assert_eq!(e.phase, DcaPhase::Cooldown, "dinlenen TP dolumu deal'i kapatmalı");
+        assert_eq!(
+            e.phase,
+            DcaPhase::Cooldown,
+            "dinlenen TP dolumu deal'i kapatmalı"
+        );
         assert!(e.mirror.qty.is_zero());
         assert!(e.resting_tp.is_none(), "deal kapanınca TP kaydı düşülmeli");
         assert!(
-            acts.iter().any(|a| matches!(a, Action::CancelResting { .. })),
+            acts.iter()
+                .any(|a| matches!(a, Action::CancelResting { .. })),
             "kapanışta artık TPL iptal niyeti yayılmalı"
         );
         assert_eq!(e.wins, 1, "net pozitif deal kazanç");
@@ -1753,20 +2208,47 @@ mod m17_realized_ledger_tests {
         cfg.stop_loss_pct = Some("0.1".into());
         let mut e = DcaEngine::new("sl-safety", cfg, Instrument::default()).unwrap();
         let acts = e.on_bar(&ctx(&bar(1_000, "100"), Fraction::from_u64(100)));
-        let base_id = acts.iter().find_map(|a| match a {
-            Action::PlaceMarket { id, role: "BASE", .. } => Some(id.clone()),
-            _ => None,
-        }).unwrap();
-        e.on_fill(&fill(&base_id, "BASE", Side::Buy, OrderKind::Add, "100", "1", 1_000));
+        let base_id = acts
+            .iter()
+            .find_map(|a| match a {
+                Action::PlaceMarket {
+                    id, role: "BASE", ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        e.on_fill(&fill(
+            &base_id,
+            "BASE",
+            Side::Buy,
+            OrderKind::Add,
+            "100",
+            "1",
+            1_000,
+        ));
         assert_eq!(e.sl_price.as_ref().unwrap().to_string(), "90");
 
         e.on_bar(&ctx(&bar(1_001, "100"), Fraction::from_u64(100)));
         let old_tp = e.resting_tp.as_ref().unwrap().order_id.clone();
         assert_eq!(e.resting_tp.as_ref().unwrap().qty.to_string(), "1");
 
-        let acts = e.on_fill(&fill("safety-1", "SAFETY", Side::Buy, OrderKind::Add, "80", "1", 1_002));
-        assert_eq!(e.sl_price.as_ref().unwrap().to_string(), "81", "SL must follow the safety-adjusted WAC");
-        assert!(acts.iter().any(|a| matches!(a, Action::CancelResting { id } if id == &old_tp)));
+        let acts = e.on_fill(&fill(
+            "safety-1",
+            "SAFETY",
+            Side::Buy,
+            OrderKind::Add,
+            "80",
+            "1",
+            1_002,
+        ));
+        assert_eq!(
+            e.sl_price.as_ref().unwrap().to_string(),
+            "81",
+            "SL must follow the safety-adjusted WAC"
+        );
+        assert!(acts
+            .iter()
+            .any(|a| matches!(a, Action::CancelResting { id } if id == &old_tp)));
         assert!(acts.iter().any(|a| matches!(a, Action::PlaceLimit { role: "TP", qty, .. } if qty == &Fraction::from_u64(2))));
         assert_eq!(e.resting_tp.as_ref().unwrap().qty, Fraction::from_u64(2));
     }
@@ -1777,13 +2259,28 @@ mod m17_realized_ledger_tests {
         cfg.trailing_enabled = true;
         let mut e = DcaEngine::new("trail-no-fixed-tp", cfg, Instrument::default()).unwrap();
         let acts = e.on_bar(&ctx(&bar(1_000, "100"), Fraction::from_u64(100)));
-        let base_id = acts.iter().find_map(|a| match a {
-            Action::PlaceMarket { id, role: "BASE", .. } => Some(id.clone()),
-            _ => None,
-        }).unwrap();
-        e.on_fill(&fill(&base_id, "BASE", Side::Buy, OrderKind::Add, "100", "1", 1_000));
+        let base_id = acts
+            .iter()
+            .find_map(|a| match a {
+                Action::PlaceMarket {
+                    id, role: "BASE", ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        e.on_fill(&fill(
+            &base_id,
+            "BASE",
+            Side::Buy,
+            OrderKind::Add,
+            "100",
+            "1",
+            1_000,
+        ));
         let acts = e.on_bar(&ctx(&bar(1_001, "102"), Fraction::from_u64(102)));
-        assert!(!acts.iter().any(|a| matches!(a, Action::PlaceLimit { role: "TP", .. })));
+        assert!(!acts
+            .iter()
+            .any(|a| matches!(a, Action::PlaceLimit { role: "TP", .. })));
         assert!(e.resting_tp.is_none());
     }
 
@@ -1802,7 +2299,10 @@ mod m17_realized_ledger_tests {
         let mut v = serde_json::to_value(&e).unwrap();
         v.as_object_mut().unwrap().remove("cum_realized_gross");
         let e2: DcaEngine = serde_json::from_value(v).unwrap();
-        assert!(e2.cum_realized_gross.is_zero(), "eski persist kayıtları default 0 ile açılmalı");
+        assert!(
+            e2.cum_realized_gross.is_zero(),
+            "eski persist kayıtları default 0 ile açılmalı"
+        );
     }
 
     /// M-18 regresyon: base notional step altına yuvarlanırsa (qty→0) motor
@@ -1816,11 +2316,25 @@ mod m17_realized_ledger_tests {
         let mut e = DcaEngine::new("m18", BotConfig::default(), inst).unwrap();
 
         // 1. deneme: CRITICAL + cooldown (100 USDT base @ 1000 → qty 0.1 → 0).
-        let acts = e.on_bar(&ctx(&bar(1_000, "1000"), Fraction::from_decimal_str("1000").unwrap()));
+        let acts = e.on_bar(&ctx(
+            &bar(1_000, "1000"),
+            Fraction::from_decimal_str("1000").unwrap(),
+        ));
         assert_eq!(e.blocked_size_bars, 1);
         assert_eq!(e.phase, DcaPhase::Cooldown);
         assert_eq!(e.cooldown_remaining, ABORT_BACKOFF_BARS);
-        assert_eq!(acts.iter().filter(|a| matches!(a, Action::Log { level: "CRITICAL", .. })).count(), 1);
+        assert_eq!(
+            acts.iter()
+                .filter(|a| matches!(
+                    a,
+                    Action::Log {
+                        level: "CRITICAL",
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
         // deal_seq abort'ta geri alınır — gerçek denemeye harcanmaz.
         assert_eq!(e.deal_seq, 0);
 
@@ -1832,28 +2346,65 @@ mod m17_realized_ledger_tests {
         }
 
         // Backoff bitti: yeniden deneme — 2. engel sayılır, CRITICAL BASILMAZ.
-        let acts = e.on_bar(&ctx(&bar(9_999, "1000"), Fraction::from_decimal_str("1000").unwrap()));
+        let acts = e.on_bar(&ctx(
+            &bar(9_999, "1000"),
+            Fraction::from_decimal_str("1000").unwrap(),
+        ));
         assert_eq!(e.blocked_size_bars, 2);
         assert_eq!(e.phase, DcaPhase::Cooldown);
-        assert!(acts.iter().all(|a| !matches!(a, Action::Log { level: "CRITICAL", .. })), "tekrar eden engel CRITICAL spam üretmemeli");
+        assert!(
+            acts.iter().all(|a| !matches!(
+                a,
+                Action::Log {
+                    level: "CRITICAL",
+                    ..
+                }
+            )),
+            "tekrar eden engel CRITICAL spam üretmemeli"
+        );
 
         // İkinci backoff'u boşalt, sonra fiyat düşer (LONG için qty artar) → açılır.
         for i in 0..ABORT_BACKOFF_BARS {
-            assert!(e.on_bar(&ctx(&bar(11_000 + i as i64, "100"), Fraction::from_u64(100))).is_empty());
+            assert!(e
+                .on_bar(&ctx(
+                    &bar(11_000 + i as i64, "100"),
+                    Fraction::from_u64(100)
+                ))
+                .is_empty());
         }
-        let acts = e.on_bar(&ctx(&bar(20_000, "50"), Fraction::from_decimal_str("50").unwrap()));
-        assert!(acts.iter().any(|a| matches!(a, Action::PlaceMarket { role: "BASE", .. })), "backoff sonrası geçerli boyutta deal açılmalı");
+        let acts = e.on_bar(&ctx(
+            &bar(20_000, "50"),
+            Fraction::from_decimal_str("50").unwrap(),
+        ));
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::PlaceMarket { role: "BASE", .. })),
+            "backoff sonrası geçerli boyutta deal açılmalı"
+        );
         assert_eq!(e.phase, DcaPhase::BasePending);
     }
 
     #[test]
     fn tp_or_manual_close_cancels_all_resting_safety_orders() {
-        let mut e = DcaEngine::new("safety-cancel-test", BotConfig::default(), Instrument::default()).unwrap();
+        let mut e = DcaEngine::new(
+            "safety-cancel-test",
+            BotConfig::default(),
+            Instrument::default(),
+        )
+        .unwrap();
         // Base emrini aç
         let _ = e.on_bar(&ctx(&bar(1_000, "100"), Fraction::from_u64(100)));
         assert_eq!(e.phase, DcaPhase::BasePending);
         // Base dolumu
-        let base_fill = fill(&format!("{}-BASE-1", e.bot_id), "BASE", Side::Buy, OrderKind::Add, "100", "1", 1_000);
+        let base_fill = fill(
+            &format!("{}-BASE-1", e.bot_id),
+            "BASE",
+            Side::Buy,
+            OrderKind::Add,
+            "100",
+            "1",
+            1_000,
+        );
         e.on_fill(&base_fill);
         assert_eq!(e.phase, DcaPhase::Open);
 
@@ -1868,10 +2419,21 @@ mod m17_realized_ledger_tests {
                 false
             }
         });
-        assert!(has_safety_cancel, "manuel kapanışta SAFETY emirleri wildcard iptal edilmeli");
+        assert!(
+            has_safety_cancel,
+            "manuel kapanışta SAFETY emirleri wildcard iptal edilmeli"
+        );
 
         // Kapanış dolumu geldiğinde de on_fill SAFETY iptali üretmeli
-        let close_fill = fill(&format!("{}-MANUAL-1", e.bot_id), "MANUAL", Side::Sell, OrderKind::Reduce, "100", "1", 2_000);
+        let close_fill = fill(
+            &format!("{}-MANUAL-1", e.bot_id),
+            "MANUAL",
+            Side::Sell,
+            OrderKind::Reduce,
+            "100",
+            "1",
+            2_000,
+        );
         let fill_acts = e.on_fill(&close_fill);
         assert_eq!(e.phase, DcaPhase::Cooldown);
         let has_fill_safety_cancel = fill_acts.iter().any(|a| {
@@ -1881,19 +2443,43 @@ mod m17_realized_ledger_tests {
                 false
             }
         });
-        assert!(has_fill_safety_cancel, "deal kapandığında on_fill SAFETY emirlerini iptal etmeli");
+        assert!(
+            has_fill_safety_cancel,
+            "deal kapandığında on_fill SAFETY emirlerini iptal etmeli"
+        );
     }
 
     #[test]
     fn liquidated_close_then_force_liquidate_does_not_double_count() {
-        let mut e = DcaEngine::new("liq-double-test", BotConfig::default(), Instrument::default()).unwrap();
+        let mut e = DcaEngine::new(
+            "liq-double-test",
+            BotConfig::default(),
+            Instrument::default(),
+        )
+        .unwrap();
         let _ = e.on_bar(&ctx(&bar(1_000, "100"), Fraction::from_u64(100)));
-        let base_fill = fill(&format!("{}-BASE-1", e.bot_id), "BASE", Side::Buy, OrderKind::Add, "100", "1", 1_000);
+        let base_fill = fill(
+            &format!("{}-BASE-1", e.bot_id),
+            "BASE",
+            Side::Buy,
+            OrderKind::Add,
+            "100",
+            "1",
+            1_000,
+        );
         e.on_fill(&base_fill);
         assert_eq!(e.phase, DcaPhase::Open);
 
         // Likidasyon kapanış dolumu (LIQ)
-        let liq_fill = fill(&format!("{}-LIQ-1", e.bot_id), "LIQ", Side::Sell, OrderKind::Reduce, "80", "1", 2_000);
+        let liq_fill = fill(
+            &format!("{}-LIQ-1", e.bot_id),
+            "LIQ",
+            Side::Sell,
+            OrderKind::Reduce,
+            "80",
+            "1",
+            2_000,
+        );
         e.on_fill(&liq_fill);
         assert_eq!(e.phase, DcaPhase::Cooldown);
         assert_eq!(e.losses, 1);
@@ -1901,7 +2487,13 @@ mod m17_realized_ledger_tests {
 
         // Runner hemen ardından force_liquidate() çağırır
         e.force_liquidate();
-        assert_eq!(e.losses, 1, "force_liquidate on_fill sonrası losses'ı ikinci kez artırmamalı");
-        assert_eq!(e.deals_closed, 1, "force_liquidate on_fill sonrası deals_closed'ı ikinci kez artırmamalı");
+        assert_eq!(
+            e.losses, 1,
+            "force_liquidate on_fill sonrası losses'ı ikinci kez artırmamalı"
+        );
+        assert_eq!(
+            e.deals_closed, 1,
+            "force_liquidate on_fill sonrası deals_closed'ı ikinci kez artırmamalı"
+        );
     }
 }

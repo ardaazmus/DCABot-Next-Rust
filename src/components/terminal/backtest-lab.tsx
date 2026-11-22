@@ -341,8 +341,13 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
                 <button
                   key={k}
                   onClick={() => {
+                    if (k === kind) return;
                     setKind(k);
                     setCategory(k === "DCA_SHORT" || k === "FUTURES_DCA" ? "linear" : "spot");
+                    setError(null);
+                    setCertError(null);
+                    setResult(null);
+                    setCert(null);
                   }}
                   className={cn(
                     "min-h-11 flex-1 rounded-lg border px-2 py-2 text-[11px] font-bold",

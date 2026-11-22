@@ -65,8 +65,8 @@ RUN chmod +x /app/dca_server
 
 # Copy Next.js Standalone Distribution
 COPY --from=node-builder /app/.next/standalone /app/
-COPY --from=node-builder /app/.next/static /app/.next/standalone/.next/static
-COPY --from=node-builder /app/public /app/.next/standalone/public
+COPY --from=node-builder /app/.next/static /app/.next/static
+COPY --from=node-builder /app/public /app/public
 
 # Copy Supervisor Entrypoint
 COPY scripts/docker-entrypoint.sh /app/entrypoint.sh

@@ -70,7 +70,10 @@ pub fn parse_tick_root(message: &str) -> (Option<String>, Option<String>) {
     (symbol, kind)
 }
 
-fn read_rows(stmt: &mut rusqlite::Statement, params: &[&dyn rusqlite::ToSql]) -> Result<Vec<EventRow>, String> {
+fn read_rows(
+    stmt: &mut rusqlite::Statement,
+    params: &[&dyn rusqlite::ToSql],
+) -> Result<Vec<EventRow>, String> {
     let rows = stmt
         .query_map(params, |r| {
             Ok(EventRow {
@@ -106,7 +109,7 @@ pub fn query_trace(conn: &Connection, trace_id: &str) -> Result<(Value, Vec<Even
     let summary = json!({
         "traceId": trace_id,
         "rootTs": root_ts,
-        "totalMs": (last_ts - root_ts).max(0),
+        "totalMs": last_ts.saturating_sub(root_ts).max(0),
         "eventCount": events.len(),
         "errorCount": error_count,
         "spanCount": 0,
@@ -126,7 +129,11 @@ pub struct TraceSummary {
 }
 
 /// Mod 2: son izler (gruflu). min_latency_ms iz-toplamına uygulanır.
-pub fn query_traces(conn: &Connection, limit: i64, min_latency_ms: Option<i64>) -> Result<Vec<Value>, String> {
+pub fn query_traces(
+    conn: &Connection,
+    limit: i64,
+    min_latency_ms: Option<i64>,
+) -> Result<Vec<Value>, String> {
     let lim = limit.clamp(1, 50);
     let mut stmt = conn
         .prepare(
@@ -149,7 +156,7 @@ pub fn query_traces(conn: &Connection, limit: i64, min_latency_ms: Option<i64>) 
     let mut out = Vec::new();
     for r in rows {
         let t = r.map_err(|e| e.to_string())?;
-        let total_ms = (t.last_ts - t.first_ts).max(0);
+        let total_ms = t.last_ts.saturating_sub(t.first_ts).max(0);
         if let Some(min) = min_latency_ms {
             if total_ms < min {
                 continue;
@@ -183,7 +190,10 @@ fn root_of(conn: &Connection, trace_id: &str) -> Result<(Value, Value), String> 
     match msg {
         Some(m) => {
             let (s, k) = parse_tick_root(&m);
-            Ok((s.map(Value::String).unwrap_or(Value::Null), k.map(Value::String).unwrap_or(Value::Null)))
+            Ok((
+                s.map(Value::String).unwrap_or(Value::Null),
+                k.map(Value::String).unwrap_or(Value::Null),
+            ))
         }
         None => Ok((Value::Null, Value::Null)),
     }
@@ -219,9 +229,20 @@ fn db_locked(app: &AppState) -> Result<std::sync::MutexGuard<'_, Connection>, St
     app.db.conn.lock().map_err(|e| format!("kilit: {e}"))
 }
 
-pub async fn events_forensics(State(app): State<Arc<AppState>>, Query(q): Query<ForensicsQuery>) -> Json<Value> {
-    if let Some(t) = q.trace_id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-        let trace: String = t.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(64).collect();
+pub async fn events_forensics(
+    State(app): State<Arc<AppState>>,
+    Query(q): Query<ForensicsQuery>,
+) -> Json<Value> {
+    if let Some(t) = q
+        .trace_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        let trace: String = t
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .take(64)
+            .collect();
         if trace.is_empty() {
             return Json(json!({"trace": Value::Null, "events": [], "at": now_ms()}));
         }
@@ -241,9 +262,14 @@ pub async fn events_forensics(State(app): State<Arc<AppState>>, Query(q): Query<
             Err(e) => Json(json!({"traces": [], "error": e, "at": now_ms()})),
         };
     }
-    let bot = q.bot_id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let bot = q
+        .bot_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let lim = q.limit.unwrap_or(200);
-    match db_locked(&app).and_then(|c| query_filter(&c, bot.as_deref(), q.error_only.unwrap_or(false), lim)) {
+    match db_locked(&app)
+        .and_then(|c| query_filter(&c, bot.as_deref(), q.error_only.unwrap_or(false), lim))
+    {
         Ok(events) => Json(json!({
             "events": events.iter().map(row_to_json).collect::<Vec<_>>(),
             "filters": {"botId": bot, "errorOnly": q.error_only.unwrap_or(false), "minLatencyMs": q.min_latency_ms,
@@ -266,7 +292,9 @@ mod forensics_tests {
             "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id TEXT, level TEXT, gate TEXT, message TEXT, ts INTEGER, trace_id TEXT);",
         )
         .unwrap();
-        crate::store::Db { conn: Mutex::new(conn) }
+        crate::store::Db {
+            conn: Mutex::new(conn),
+        }
     }
 
     fn seed(db: &crate::store::Db) {
