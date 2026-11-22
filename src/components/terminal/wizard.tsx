@@ -100,6 +100,7 @@ import type {
   CalcGridResult,
   EntryTrigger,
   EntryTriggerMode,
+  ExecutionEnvironmentChoice,
   GuardAction,
   Instrument,
   Interval,
@@ -118,16 +119,21 @@ import type {
 interface WizardProps {
   onCreated: (id: string) => void;
   initialMode?: Mode;
+  initialExecutionEnvironment?: ExecutionEnvironmentChoice;
 }
 
-export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
+export function Wizard({ onCreated, initialMode = "PAPER", initialExecutionEnvironment }: WizardProps) {
 
   /* step 1 */
   const [kind, setKind] = useState<BotKind | null>(null);
   const [cardKey, setCardKey] = useState<string | null>(null);
   /* step 2 */
   const [venue, setVenue] = useState<Venue>("BYBIT");
-  const [mode, setMode] = useState<Mode>(initialMode);
+  const [executionEnvironmentChoice, setExecutionEnvironmentChoice] = useState<ExecutionEnvironmentChoice>(
+    initialExecutionEnvironment ?? (initialMode === "LIVE" ? "EXCHANGE_SANDBOX" : "INTERNAL_PAPER"),
+  );
+  const mode: Mode = executionEnvironmentChoice === "INTERNAL_PAPER" ? "PAPER" : "LIVE";
+  const { health: engineHealth } = useEngineHealth(15000);
   const [symbolQuery, setSymbolQuery] = useState("");
   const [listOpen, setListOpen] = useState(false);
   const [symbol, setSymbol] = useState<string | null>(null);
@@ -248,7 +254,7 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
     };
     setKind(c.kind as BotKind);
     setVenue((c.venue as Venue) ?? "BYBIT");
-    setMode("PAPER");
+    setExecutionEnvironmentChoice("INTERNAL_PAPER");
     setSymbol(c.symbol);
     setSymbolQuery(c.symbol);
     carriedSymbolRef.current = c.symbol;
@@ -680,10 +686,19 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
   const sec6Valid = !needsAck || riskAck;
   // Faz 21 (UIX-14): motor çevrimdışıyken submit kapalı — eski davranışta
   // form doluydu, launch ağ hatasıyla patlıyor ve kullanıcı kayboluyordu.
-  const { health: engineHealth } = useEngineHealth(15000);
   const engineOnline = engineHealth?.status === "ok";
-  const canLaunch = sec1Valid && sec2Valid && sec3Valid && sec4Valid && sec5Valid && sec6Valid && engineOnline;
-  const secValid = [sec1Valid, sec2Valid, sec3Valid, sec4Valid, sec5Valid, sec6Valid];
+  const activeExecutionEnvironment = engineHealth?.executionEnvironments?.[venue] ?? null;
+  const executionEnvironmentAvailable = executionEnvironmentChoice === "INTERNAL_PAPER"
+    ? true
+    : executionEnvironmentChoice === "EXCHANGE_SANDBOX"
+      ? (venue === "BYBIT" && ["BYBIT_DEMO", "BYBIT_TESTNET"].includes(activeExecutionEnvironment ?? ""))
+        || (venue === "OKX" && activeExecutionEnvironment === "OKX_DEMO")
+      : (venue === "BYBIT" || venue === "OKX") && activeExecutionEnvironment === "MAINNET";
+  const vaultEnvironment = executionEnvironmentChoice === "EXCHANGE_SANDBOX"
+    ? activeExecutionEnvironment
+    : executionEnvironmentChoice === "MAINNET" ? "MAINNET" : null;
+  const canLaunch = sec1Valid && sec2Valid && sec3Valid && sec4Valid && sec5Valid && sec6Valid && engineOnline && executionEnvironmentAvailable;
+  const secValid = [sec1Valid, sec2Valid && executionEnvironmentAvailable, sec3Valid, sec4Valid, sec5Valid, sec6Valid];
 
   /* ---- LIVE mode: verify a vault key exists for the selected venue ---- */
   useEffect(() => {
@@ -711,7 +726,7 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
 
   const vaultVenueOk =
     mode === "LIVE" && vaultKeys !== null
-      ? vaultKeys.some((k) => k.venue.toUpperCase() === venue.toUpperCase())
+      ? vaultEnvironment !== null && vaultKeys.some((k) => k.venue.toUpperCase() === venue.toUpperCase() && k.environment === vaultEnvironment)
       : null;
 
   const scMetNow = useMemo<boolean | null>(() => {
@@ -834,6 +849,7 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
           kind,
           venue,
           mode,
+          execution_environment: executionEnvironmentChoice,
           symbol,
           interval: intervalSel,
           // Task 18 Ş3: ölü "|| 100000" fallback'i kaldırıldı — sec4Valid
@@ -851,9 +867,13 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
       }
       setServerWarnings([]);
       toast({
-        title: mode === "LIVE" ? "LIVE bot hazırlandı" : "PAPER bot başlatıldı",
+        title: executionEnvironmentChoice === "INTERNAL_PAPER"
+          ? "PAPER bot başlatıldı"
+          : executionEnvironmentChoice === "EXCHANGE_SANDBOX"
+            ? "Borsa Demo/Testnet botu hazırlandı"
+            : "Mainnet LIVE bot hazırlandı",
         description: mode === "LIVE"
-          ? `${botName.trim()} → PAUSED. Ön kontrolleri geçtikten sonra açıkça Başlat seçin.`
+          ? `${botName.trim()} → PAUSED. Ortam ve ön kontrolleri geçtikten sonra açıkça Başlat seçin.`
           : `${botName.trim()} → RUNNING (201)`,
       });
       onCreated(res.id);
@@ -890,7 +910,7 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
   /* ---------------------------------------------------------------- */
 
   /* ---- real gate checklist rows (section 5) ---- */
-  const vaultKeysForVenue = (vaultKeys ?? []).filter((k) => k.venue.toUpperCase() === venue.toUpperCase());
+  const vaultKeysForVenue = (vaultKeys ?? []).filter((k) => k.venue.toUpperCase() === venue.toUpperCase() && k.environment === vaultEnvironment);
   const gateRows: { code: string; desc: string; state: GateState; note: string }[] = [
     {
       code: "INS",
@@ -962,7 +982,7 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
     },
     {
       code: "VAULT",
-      desc: "LIVE anahtarı kasada mevcut",
+      desc: "Seçilen ortamın kasa anahtarı mevcut",
       state:
         mode === "PAPER"
           ? "na"
@@ -975,14 +995,14 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
                 : "fail",
       note:
         mode === "PAPER"
-          ? "N/A — PAPER modunda vault anahtarı gerekmez"
+          ? "N/A — iç PAPER simülasyonunda API anahtarı kullanılmaz"
           : vaultError
             ? `vault okunamadı: ${vaultError}`
             : vaultKeys === null
               ? "vault sorgulanıyor…"
               : vaultVenueOk
-                ? `${vaultKeysForVenue.length} anahtar hazır (${vaultKeysForVenue.map((k) => k.label).join(", ")})`
-                : "VAULT ANAHTARI EKSİK — Ayarlar > API Key Vault'tan bu venue için anahtar ekleyin",
+                ? `${vaultKeysForVenue.length} ${vaultEnvironment} anahtar hazır (${vaultKeysForVenue.map((k) => k.label).join(", ")})`
+                : `${vaultEnvironment} anahtarı eksik — Ayarlar > API Key Vault'ta bu venue ve ortam için anahtar ekleyin`,
     },
     {
       code: "MESH",
@@ -1161,18 +1181,28 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
           )}
         >
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Bot çalışma modu</span>
+            <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Bot yürütme ortamı</span>
             <span className={cn(
               "rounded border px-2 py-0.5 text-[10px] font-extrabold tracking-wider",
-              mode === "PAPER" ? "border-emerald-500/40 text-emerald-300" : "border-amber-500/50 text-amber-300",
+              executionEnvironmentChoice === "INTERNAL_PAPER"
+                ? "border-emerald-500/40 text-emerald-300"
+                : executionEnvironmentChoice === "EXCHANGE_SANDBOX"
+                  ? "border-cyan-500/50 text-cyan-300"
+                  : "border-amber-500/50 text-amber-300",
             )}>
-              {mode === "PAPER" ? "PAPER · SİMÜLASYON" : "LIVE · BORSA EMİR YOLU"}
+              {executionEnvironmentChoice === "INTERNAL_PAPER"
+                ? "PAPER · İÇ SİMÜLASYON"
+                : executionEnvironmentChoice === "EXCHANGE_SANDBOX"
+                  ? "BORSA DEMO / TESTNET"
+                  : "MAINNET LIVE · GERÇEK FON"}
             </span>
           </div>
-          <p className={cn("mt-1 text-[11px]", mode === "PAPER" ? "text-emerald-200/80" : "text-amber-200/90")}>
-            {mode === "PAPER"
-              ? "Bu bot simülasyon emirleri kullanır; gerçek borsa emri göndermez."
-              : "Bot, etkin borsa ortamına emir gönderir (Demo/Testnet veya Mainnet). PAUSED hazırlanır; başlatmak için ayrıca onay ve güvenlik kontrolleri gerekir."}
+          <p className={cn("mt-1 text-[11px]", executionEnvironmentChoice === "INTERNAL_PAPER" ? "text-emerald-200/80" : executionEnvironmentChoice === "EXCHANGE_SANDBOX" ? "text-cyan-200/80" : "text-amber-200/90")}>
+            {executionEnvironmentChoice === "INTERNAL_PAPER"
+              ? "Yerel sanal bakiye ve simülasyon emirleri kullanılır. Borsaya emir gönderilmez; API anahtarı gerekmez."
+              : executionEnvironmentChoice === "EXCHANGE_SANDBOX"
+                ? "Borsanın kendi Demo/Testnet hesabına sanal fonlu emir gönderilir. Bu, PAPER simülasyonundan ayrı bir ortamdır."
+                : "Borsa Mainnet hesabına gerçek emir gönderilir; gerçek fon riski vardır. Bot PAUSED hazırlanır ve ayrıca güvenlik onayı ister."}
           </p>
         </div>
         <nav className="flex flex-wrap items-center gap-1.5" aria-label="Bölüm gezinmesi">
@@ -1282,8 +1312,8 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
                       onClick={() => {
                         setVenue(v);
                         if (v === "PAPER" && mode === "LIVE") {
-                          setMode("PAPER");
-                          toast({ title: "Mod PAPER'a çekildi", description: "PAPER venue ile LIVE mod kullanılamaz." });
+                          setExecutionEnvironmentChoice("INTERNAL_PAPER");
+                          toast({ title: "PAPER ortamı seçildi", description: "PAPER venue borsa Demo/Testnet veya Mainnet emri göndermez." });
                         }
                       }}
                       aria-pressed={venue === v}
@@ -1301,64 +1331,57 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
                 <div className="mt-4 border-t border-border pt-3">
                   <div className="flex flex-wrap items-start justify-between gap-2">
                     <div>
-                      <div className="text-[11px] font-bold uppercase tracking-wider text-slate-200">Çalışma modu</div>
-                      <p className="mt-0.5 text-[10px] text-slate-500">Borsa seçimi venue&apos;yi, mod ise emirlerin simüle mi gerçek mi yürütüleceğini belirler.</p>
+                      <div className="text-[11px] font-bold uppercase tracking-wider text-slate-200">Yürütme ortamı</div>
+                      <p className="mt-0.5 text-[10px] text-slate-500">İç simülasyon, borsanın Demo/Testnet hesabı ve Mainnet ayrı seçimlerdir.</p>
                     </div>
                     <span className={cn(
                       "rounded border px-1.5 py-0.5 text-[9px] font-bold tracking-wider",
-                      mode === "PAPER" ? "border-emerald-500/30 bg-emerald-500/5 text-emerald-300" : "border-amber-500/40 bg-amber-500/10 text-amber-300",
+                      executionEnvironmentChoice === "INTERNAL_PAPER"
+                        ? "border-emerald-500/30 bg-emerald-500/5 text-emerald-300"
+                        : executionEnvironmentChoice === "EXCHANGE_SANDBOX"
+                          ? "border-cyan-500/40 bg-cyan-500/10 text-cyan-300"
+                          : "border-amber-500/40 bg-amber-500/10 text-amber-300",
                     )}>
-                      {mode === "PAPER" ? "İÇ SİMÜLASYON" : "LIVE EMİR YOLU"}
+                      {activeExecutionEnvironment ?? "ORTAM DENETLENİYOR"}
                     </span>
                   </div>
-                  <div role="group" aria-label="Bot çalışma modu" className="mt-2 flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setMode("PAPER")}
-                    aria-pressed={mode === "PAPER"}
-                    className={cn(
-                      "min-h-11 flex-1 rounded-lg border px-3 py-2.5 text-xs font-bold transition-colors",
-                      mode === "PAPER" ? "border-emerald-500/60 bg-emerald-500/10 text-emerald-300" : "border-border text-slate-500",
-                    )}
-                  >
-                    PAPER · SİMÜLASYON
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (venue === "PAPER") {
-                        toast({
-                          title: "LIVE seçilemez",
-                          description: "PAPER venue ile LIVE mod kullanılamaz — önce gerçek bir borsa (BYBIT/BINANCE/OKX) seçin.",
-                          variant: "destructive",
-                        });
-                        return;
-                      }
-                      setMode("LIVE");
-                    }}
-                    disabled={venue === "PAPER"}
-                    aria-disabled={venue === "PAPER"}
-                    aria-pressed={mode === "LIVE"}
-                    className={cn(
-                      "min-h-11 flex-1 rounded-lg border px-3 py-2.5 text-xs font-bold transition-colors",
-                      mode === "LIVE"
-                        ? "border-amber-500/60 bg-amber-500/10 text-amber-300"
-                        : "border-border text-slate-500",
-                      venue === "PAPER" && "cursor-not-allowed opacity-40",
-                    )}
-                    title="LIVE emir yolu — borsa Demo/Testnet veya Mainnet endpoint'ine yönlenir"
-                  >
-                    BORSADA LIVE ⚠
-                  </button>
+                  <div role="group" aria-label="Bot yürütme ortamı" className="mt-3 grid gap-2 sm:grid-cols-3">
+                    {([
+                      { value: "INTERNAL_PAPER", title: "PAPER", detail: "İç sanal bakiye · API anahtarı yok", tone: "emerald" },
+                      { value: "EXCHANGE_SANDBOX", title: "Borsa Demo / Testnet", detail: "Sandbox API anahtarı gerekir", tone: "cyan" },
+                      { value: "MAINNET", title: "Mainnet LIVE", detail: "Gerçek hesap · gerçek fon riski", tone: "amber" },
+                    ] as const).map((option) => {
+                      const selected = executionEnvironmentChoice === option.value;
+                      const external = option.value !== "INTERNAL_PAPER";
+                      const tone = option.tone === "emerald"
+                        ? selected ? "border-emerald-500/60 bg-emerald-500/10 text-emerald-200" : "border-emerald-500/20 text-emerald-300/70"
+                        : option.tone === "cyan"
+                          ? selected ? "border-cyan-500/60 bg-cyan-500/10 text-cyan-200" : "border-cyan-500/20 text-cyan-300/70"
+                          : selected ? "border-amber-500/60 bg-amber-500/10 text-amber-200" : "border-amber-500/20 text-amber-300/70";
+                      return (
+                        <button
+                          key={option.value}
+                          type="button"
+                          disabled={external && venue === "PAPER"}
+                          onClick={() => setExecutionEnvironmentChoice(option.value)}
+                          aria-pressed={selected}
+                          className={cn("min-h-16 rounded-lg border px-3 py-2 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-40", tone)}
+                        >
+                          <span className="block text-xs font-bold">{option.title}</span>
+                          <span className="mt-1 block text-[10px] opacity-80">{option.detail}</span>
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
-                {venue === "PAPER" && (
-                  <p className="mt-1.5 text-[11px] text-amber-400">PAPER venue ile LIVE mod kullanılamaz — simülasyon hesabı gerçek emir göndermez.</p>
-                )}
                 <p className="mt-2 text-[11px] text-slate-400">
-                  {mode === "PAPER"
-                    ? "Kağıt modu: emirler simülasyon çekirdeğinde doldurulur (Gate 5 realizm etiketleriyle)."
-                    : "LIVE emir yolu: etkin borsa endpoint'i Demo/Testnet veya Mainnet olabilir. Bot önce PAUSED hazırlanır; ayrı Başlat onayı, taze self-check ve anahtar/sertifika kontrolleri geçmeden emir gönderilmez."}
+                  {executionEnvironmentChoice === "INTERNAL_PAPER"
+                    ? "PAPER emirleri simülasyon çekirdeğinde doldurulur; borsa hesabı ve API anahtarı kullanılmaz."
+                    : executionEnvironmentAvailable
+                      ? `Etkin endpoint: ${activeExecutionEnvironment}. Bot PAUSED hazırlanır; başlatmadan önce ortam, kasa anahtarı, sertifika ve taze self-check denetlenir.`
+                      : activeExecutionEnvironment
+                        ? `Seçilen ortam etkin endpoint ile uyuşmuyor (${activeExecutionEnvironment}); bot başlatılamaz. Demo/Testnet için BYBIT/OKX sandbox, Mainnet için BYBIT/OKX mainnet gerekir.`
+                        : "Etkin borsa endpoint'i doğrulanıyor; dış emir yolu doğrulama tamamlanmadan açılamaz."}
                 </p>
               </Panel>
 
@@ -2439,7 +2462,14 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
                     {cardKey?.startsWith("SIGNAL") && (
                       <ReviewRow k="Havuz" v={`Signal Bot · ${cardKey === "SIGNAL_FUTURES" ? "vadeli (linear)" : "spot"} · sinyal-gated DCA (3Commas Signal karsiligi)`} />
                     )}
-                <ReviewRow k="Borsa" v={`${venue} · ${mode}`} />
+                <ReviewRow
+                  k="Çalışma ortamı"
+                  v={executionEnvironmentChoice === "INTERNAL_PAPER"
+                    ? `${venue} · PAPER simülasyonu`
+                    : executionEnvironmentChoice === "EXCHANGE_SANDBOX"
+                      ? `${venue} · Demo/Testnet (${activeExecutionEnvironment ?? "endpoint bekleniyor"})`
+                      : `${venue} · Mainnet LIVE`}
+                />
                 <ReviewRow k="Sembol / Periyot" v={`${symbol ?? "—"} · ${intervalSel}`} />
                 {!isGridKind ? (
                   <>
@@ -2841,9 +2871,11 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
                         ? "ÖNCE STRATEJİ SEÇ"
                         : !sec2Valid
                           ? "ÖNCE SEMBOL SEÇ"
-                          : mode === "LIVE"
-                            ? "LIVE BOTU HAZIRLA · DURAKLATILMIŞ"
-                            : "PAPER BOTU BAŞLAT"}
+                          : executionEnvironmentChoice === "INTERNAL_PAPER"
+                            ? "PAPER BOTU BAŞLAT"
+                            : executionEnvironmentChoice === "EXCHANGE_SANDBOX"
+                              ? "DEMO / TESTNET BOTU HAZIRLA · DURAKLATILMIŞ"
+                              : "MAINNET LIVE BOTU HAZIRLA · DURAKLATILMIŞ"}
                   </Button>
                 </span>
               </TooltipTrigger>
@@ -2855,10 +2887,12 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
             </Tooltip>
             {!canLaunch && (
               <p className="text-center text-[10px] text-slate-400">
-                {needsAck && !riskAck
+                  {needsAck && !riskAck
                   ? "Önce 6. bölümdeki onay kutusuyla riskleri onaylayın."
                   : !engineOnline
                     ? "Motor çevrimdışı — çekirdek başlatılınca launch açılır."
+                      : !executionEnvironmentAvailable
+                        ? `Bu seçim motorun etkin ${activeExecutionEnvironment ?? "endpoint"} ortamıyla uyuşmuyor; eşleşen endpoint'i seçin veya motoru uygun ortamla yapılandırın.`
                     : "Tüm bölümler geçerli olunca aktif olur."}
               </p>
             )}

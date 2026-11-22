@@ -52,6 +52,7 @@ import {
   apiMaintenance,
   apiMaintenanceSet,
   apiSelfCheck,
+  apiSetVaultKeyEnvironment,
   apiVaultKeys,
   useAiConfig,
   useEngineHealth,
@@ -66,6 +67,8 @@ export function SettingsView() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [venue, setVenue] = useState("BYBIT");
+  const currentVaultEndpoint = health?.executionEnvironments?.[venue] ?? "endpoint denetleniyor";
+  const [keyEnvironment, setKeyEnvironment] = useState<"SANDBOX" | "MAINNET">("SANDBOX");
   const [label, setLabel] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [apiSecret, setApiSecret] = useState("");
@@ -234,8 +237,8 @@ export function SettingsView() {
     setBusy(true);
     setGateError(null);
     try {
-      const r = await apiAddVaultKey({ venue, label: label.trim() || "default", api_key: apiKey.trim(), api_secret: apiSecret.trim(), passphrase: venue === "OKX" ? apiPass : undefined });
-      toast({ title: "Anahtar kasaya eklendi", description: `${r.venue} · ${r.maskedKey} — zero-withdrawal gate doğrulandı.` });
+      const r = await apiAddVaultKey({ venue, environment: keyEnvironment, label: label.trim() || "default", api_key: apiKey.trim(), api_secret: apiSecret.trim(), passphrase: venue === "OKX" ? apiPass : undefined });
+      toast({ title: "Anahtar kasaya eklendi", description: `${r.venue} · ${r.environment} · ${r.maskedKey} — ortam ve zero-withdrawal gate doğrulandı.` });
       setApiKey("");
       setApiSecret("");
       setApiPass("");
@@ -260,6 +263,19 @@ export function SettingsView() {
     }
   };
 
+  const verifyLegacyKeyEnvironment = async (id: string) => {
+    setBusy(true);
+    try {
+      await apiSetVaultKeyEnvironment(id, keyEnvironment);
+      toast({ title: "Anahtar ortamı doğrulandı", description: `${keyEnvironment} endpoint'inde yetki kontrolü geçti.` });
+      void load();
+    } catch (e) {
+      toast({ title: "Ortam doğrulanamadı", description: e instanceof Error ? e.message : "Bilinmeyen hata", variant: "destructive" });
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="grid gap-4 xl:grid-cols-2">
       {/* API Key Vault */}
@@ -276,6 +292,18 @@ export function SettingsView() {
                     <SelectItem value="BINANCE" className="font-mono">BINANCE</SelectItem>
                     <SelectItem value="OKX" className="font-mono">OKX</SelectItem>
                   </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs text-slate-400">Hesap ortamı</Label>
+              <Select value={keyEnvironment} onValueChange={(v) => setKeyEnvironment(v as "SANDBOX" | "MAINNET")}>
+                <SelectTrigger className="min-h-11 w-full border-border-strong bg-surface text-slate-100">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="border-border-strong bg-[#151a24]">
+                  <SelectItem value="SANDBOX">Borsa Demo / Testnet</SelectItem>
+                  <SelectItem value="MAINNET">Mainnet</SelectItem>
+                </SelectContent>
               </Select>
             </div>
             <div className="space-y-1.5">
@@ -342,6 +370,9 @@ export function SettingsView() {
             ZERO-WITHDRAWAL GATE: kaydedilen anahtar çekim izni içermemelidir. Withdraw yetkisi tespit edilirse motor 422
             ile reddeder — bu kasaya hiçbir anahtar çekim yetkisiyle giremez.
           </p>
+          <p className="mt-1 text-[11px] text-slate-400">
+            Etkin {venue} endpoint&apos;i: <span className="font-mono text-slate-200">{currentVaultEndpoint}</span>. Seçilen hesap ortamı bu endpoint&apos;le eşleşmelidir. PAPER simülasyonu API anahtarı kullanmaz.
+          </p>
           <Button onClick={() => void addKey()} disabled={busy || !apiKey.trim() || !apiSecret.trim() || (venue === "OKX" && !apiPass)} className="mt-3 min-h-11 w-full bg-emerald-500/90 text-[#04150e] hover:bg-emerald-500 sm:w-auto sm:px-6">
             {busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <ShieldCheck className="h-4 w-4" aria-hidden />}
             Kasaya Ekle & Doğrula
@@ -385,6 +416,9 @@ export function SettingsView() {
                     <li key={k.id} className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-surface p-3">
                       <VenueChip venue={k.venue} />
                       <span className="text-sm font-semibold text-slate-100">{k.label}</span>
+                      <span className={`rounded border px-1.5 py-0.5 text-[10px] font-bold ${["BYBIT_DEMO", "BYBIT_TESTNET", "BINANCE_TESTNET", "OKX_DEMO"].includes(k.environment) ? "border-cyan-500/40 bg-cyan-500/10 text-cyan-300" : k.environment === "MAINNET" ? "border-amber-500/40 bg-amber-500/10 text-amber-300" : "border-rose-500/40 bg-rose-500/10 text-rose-300"}`}>
+                        {k.environment === "BYBIT_DEMO" ? "BYBIT DEMO" : k.environment === "BYBIT_TESTNET" ? "BYBIT TESTNET" : k.environment === "BINANCE_TESTNET" ? "BINANCE TESTNET" : k.environment === "OKX_DEMO" ? "OKX DEMO" : k.environment === "MAINNET" ? "MAINNET" : "ORTAM DOĞRULANMADI"}
+                      </span>
                       <span className="num rounded bg-secondary px-2 py-0.5 font-mono text-xs text-slate-300" title="Maskelenmiş API anahtarı">
                         {k.maskedKey}
                       </span>
@@ -409,6 +443,14 @@ export function SettingsView() {
                       {k.note && <span className="w-full truncate text-[11px] text-slate-400" title={k.note}>Not: {k.note}</span>}
                       {k.createdAt && (
                         <span className="w-full text-[10px] text-slate-400">Eklenme: {fmtTs(Date.parse(k.createdAt))}</span>
+                      )}
+                      {k.environment === "UNVERIFIED" && (
+                        <div className="flex w-full flex-wrap items-center justify-between gap-2 rounded-md border border-rose-500/30 bg-rose-500/5 p-2">
+                          <span className="text-[10px] text-rose-300">Eski anahtarın ortamı bilinmiyor; seçilen endpoint&apos;te yeniden doğrulayın.</span>
+                          <Button type="button" size="sm" variant="outline" disabled={busy} onClick={() => void verifyLegacyKeyEnvironment(k.id)} className="min-h-9 border-rose-500/40 text-rose-200">
+                            {keyEnvironment} olarak doğrula
+                          </Button>
+                        </div>
                       )}
                       <AlertDialog>
                     <AlertDialogTrigger asChild>

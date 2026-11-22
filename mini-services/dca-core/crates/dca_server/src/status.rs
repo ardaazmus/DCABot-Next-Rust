@@ -124,7 +124,8 @@ pub async fn live_status(State(app): State<Arc<AppState>>) -> Json<Value> {
         let has_key = if v == "PAPER" {
             false
         } else {
-            crate::store::load_active_key(&app.db, &app.vault, v)
+            let environment = app.execution_environment(v, "LIVE");
+            crate::store::load_active_key_for_environment(&app.db, &app.vault, v, environment)
                 .ok()
                 .flatten()
                 .is_some()

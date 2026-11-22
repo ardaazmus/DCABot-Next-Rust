@@ -10,6 +10,8 @@ export interface Health {
   math: string;
   gates: number;
   venues: string[];
+  /** Effective configured trading endpoint per venue (no credentials). */
+  executionEnvironments?: Record<string, string>;
   uptime_s: number;
   /** Faz 25 (UIX-28): motorun readiness'ından filo durumu (aktif/toplam). */  readiness?: {
     activeBots: number;
@@ -264,6 +266,8 @@ export interface CreateBotBody {
   kind: BotKind;
   venue: Venue;
   mode: Mode;
+  /** Explicit Paper / exchange sandbox / mainnet selection. */
+  execution_environment?: import("./core").ExecutionEnvironmentChoice;
   symbol: string;
   interval: Interval;
   start_cash: string;

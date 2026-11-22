@@ -63,7 +63,11 @@ pub async fn live_multi_status(State(app): State<Arc<AppState>>) -> Json<Value> 
     }
 
     let has_key = |venue: &str| {
-        crate::store::load_active_key(&app.db, &app.vault, venue).ok().flatten().is_some()
+        let environment = app.execution_environment(venue, "LIVE");
+        crate::store::load_active_key_for_environment(&app.db, &app.vault, venue, environment)
+            .ok()
+            .flatten()
+            .is_some()
     };
     let bybit_key = has_key("BYBIT");
     let binance_key = has_key("BINANCE");
@@ -71,7 +75,8 @@ pub async fn live_multi_status(State(app): State<Arc<AppState>>) -> Json<Value> 
 
     // OKX posMode: yalniz anahtar varsa, zaman asimli (10sn), hatada None.
     let okx_pos: Option<String> = if okx_key {
-        match crate::store::load_active_key(&app.db, &app.vault, "OKX") {
+        let environment = app.execution_environment("OKX", "LIVE");
+        match crate::store::load_active_key_for_environment(&app.db, &app.vault, "OKX", environment) {
             Ok(Some(creds)) => tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 app.okx.pos_mode(&creds),

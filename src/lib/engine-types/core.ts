@@ -13,6 +13,10 @@ export type BotKind =
 export type BotStatus = "RUNNING" | "PAUSED" | "STOPPED" | "FROZEN";
 export type Venue = "BYBIT" | "BINANCE" | "OKX" | "PAPER";
 export type Mode = "PAPER" | "LIVE";
+/** User-facing execution choice; the server persists the exact venue environment. */
+export type ExecutionEnvironmentChoice = "INTERNAL_PAPER" | "EXCHANGE_SANDBOX" | "MAINNET";
+export type VaultEnvironmentChoice = "SANDBOX" | "MAINNET";
+export type VaultEnvironment = "BYBIT_DEMO" | "BYBIT_TESTNET" | "BINANCE_TESTNET" | "OKX_DEMO" | "MAINNET" | "UNVERIFIED";
 export type Interval = "1m" | "3m" | "5m" | "15m" | "30m" | "1h" | "2h" | "4h" | "1d";
 
 /**

@@ -69,10 +69,17 @@ async fn validate_live_preflight(
     creds: &VenueCreds,
     require_contract: bool,
     require_fresh_selfcheck: bool,
+    expected_environment: &str,
 ) -> Result<(), String> {
     let venue = venue.to_ascii_uppercase();
     if venue != "BYBIT" && venue != "OKX" {
         return Err(format!("{venue} LIVE kanalı kapalı"));
+    }
+    let actual_environment = app.execution_environment(&venue, "LIVE");
+    if actual_environment != expected_environment {
+        return Err(format!(
+            "bot {expected_environment} ortamına kayıtlı, etkin {venue} endpoint'i {actual_environment}; ortam değişikliği için yeni bot oluşturun"
+        ));
     }
     if venue == "OKX"
         && creds
@@ -121,6 +128,84 @@ async fn validate_live_preflight(
         }
     }
     Ok(())
+}
+
+fn is_sandbox_execution_environment(environment: &str) -> bool {
+    matches!(
+        environment,
+        "BYBIT_DEMO" | "BYBIT_TESTNET" | "BINANCE_TESTNET" | "OKX_DEMO"
+    )
+}
+
+fn is_supported_bot_sandbox_environment(environment: &str) -> bool {
+    matches!(environment, "BYBIT_DEMO" | "BYBIT_TESTNET" | "OKX_DEMO")
+}
+
+fn key_environment_for_execution_environment(environment: &str) -> Option<&'static str> {
+    match environment {
+        "BYBIT_DEMO" => Some("BYBIT_DEMO"),
+        "BYBIT_TESTNET" => Some("BYBIT_TESTNET"),
+        "BINANCE_TESTNET" => Some("BINANCE_TESTNET"),
+        "OKX_DEMO" => Some("OKX_DEMO"),
+        "MAINNET" => Some("MAINNET"),
+        _ => None,
+    }
+}
+
+fn resolve_vault_key_environment(
+    app: &AppState,
+    venue: &str,
+    requested_environment: &str,
+) -> Result<&'static str, String> {
+    let actual = app.execution_environment(venue, "LIVE");
+    match requested_environment {
+        "SANDBOX" if is_sandbox_execution_environment(actual) => Ok(actual),
+        "MAINNET" if actual == "MAINNET" => Ok("MAINNET"),
+        "SANDBOX" | "MAINNET" => Err(format!(
+            "seçilen {requested_environment} ortamı etkin {venue} endpoint'i {actual} ile eşleşmiyor"
+        )),
+        _ => Err("API anahtarı ortamı SANDBOX veya MAINNET olmalı".into()),
+    }
+}
+
+fn resolve_execution_environment_choice(
+    mode: &str,
+    requested: Option<&str>,
+    actual: &str,
+) -> Result<String, String> {
+    if mode == "PAPER" {
+        return match requested {
+            None | Some("INTERNAL_PAPER") => Ok("INTERNAL_PAPER".into()),
+            _ => Err("PAPER bot için INTERNAL_PAPER seçilmelidir".into()),
+        };
+    }
+    if mode != "LIVE" {
+        return Err("geçersiz bot modu".into());
+    }
+    match requested {
+        None => {
+            if matches!(actual, "MAINNET" | "BYBIT_DEMO" | "BYBIT_TESTNET" | "OKX_DEMO") {
+                Ok(actual.into())
+            } else {
+                Err(format!("etkin borsa endpoint'i desteklenmiyor: {actual}"))
+            }
+        }
+        Some("EXCHANGE_SANDBOX") if is_supported_bot_sandbox_environment(actual) => {
+            Ok(actual.into())
+        }
+        Some("MAINNET") if actual == "MAINNET" => Ok("MAINNET".into()),
+        Some("INTERNAL_PAPER") => Err("borsa emir yolu INTERNAL_PAPER seçemez".into()),
+        Some("EXCHANGE_SANDBOX") if is_sandbox_execution_environment(actual) => Err(format!(
+            "{actual} API anahtar yönetimi destekleniyor, ancak bu borsada bot emir yolu henüz etkin değil"
+        )),
+        Some("EXCHANGE_SANDBOX") => Err(format!(
+            "borsa Demo/Testnet seçildi ancak etkin endpoint {actual}; motoru ilgili sandbox ortamıyla başlatın"
+        )),
+        Some("MAINNET") => Err(format!(
+            "Mainnet seçildi ancak etkin endpoint {actual}; Mainnet için ayrı motor yapılandırması gerekir"
+        )),
+        Some(other) => Err(format!("geçersiz execution_environment '{other}'")),
+    }
 }
 
 fn live_certification_is_current(app: &AppState, bot_id: &str) -> Result<bool, String> {
@@ -530,6 +615,7 @@ async fn main() {
                 .post(add_key)
                 .route_layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
         )
+        .route("/api/vault/keys/:id/environment", patch(update_key_environment))
         .route("/api/vault/keys/:id", delete(remove_key))
         // SEC-01: kimlik doğrulama middleware'i (yönetim routes'ları).
         .route_layer(middleware::from_fn_with_state(
@@ -1179,12 +1265,13 @@ async fn restore_bots(app: &Arc<AppState>) {
         String,
         Option<String>,
         Option<String>,
+        Option<String>,
     )> = {
         let conn = match app.db.conn.lock() {
             Ok(c) => c,
             Err(_) => return,
         };
-        let mut stmt = match conn.prepare("SELECT id, name, kind, venue, mode, symbol, status, interval, start_cash FROM bots WHERE status IN ('RUNNING','PAUSED','FROZEN')") {
+        let mut stmt = match conn.prepare("SELECT id, name, kind, venue, mode, symbol, status, interval, start_cash, execution_environment FROM bots WHERE status IN ('RUNNING','PAUSED','FROZEN')") {
             Ok(s) => s,
             Err(_) => return,
         };
@@ -1200,6 +1287,7 @@ async fn restore_bots(app: &Arc<AppState>) {
                     r.get::<_, String>(6)?,
                     r.get::<_, Option<String>>(7)?,
                     r.get::<_, Option<String>>(8)?,
+                    r.get::<_, Option<String>>(9)?,
                 ))
             })
             .ok();
@@ -1209,7 +1297,7 @@ async fn restore_bots(app: &Arc<AppState>) {
         }
     };
     let ambiguous_live_markets = duplicate_live_markets(rows.iter().map(
-        |(_, _, _, venue, mode, symbol, status, _, _)| {
+        |(_, _, _, venue, mode, symbol, status, _, _, _)| {
             (
                 venue.as_str(),
                 mode.as_str(),
@@ -1219,7 +1307,7 @@ async fn restore_bots(app: &Arc<AppState>) {
         },
     ));
 
-    for (id, name, _kind, venue, mode, symbol, status, interval, start_cash) in rows {
+    for (id, name, _kind, venue, mode, symbol, status, interval, start_cash, stored_environment) in rows {
         let ambiguous_live_market = mode.eq_ignore_ascii_case("LIVE")
             && ambiguous_live_markets.contains(&normalized_live_market(&venue, &symbol));
         let (cfg_json,): (String,) = match app.db.conn.lock() {
@@ -1245,6 +1333,17 @@ async fn restore_bots(app: &Arc<AppState>) {
         // missing: that would conceal its venue exposure and mix ledgers.
         // Keep it visible as LIVE, paused, and require explicit re-arming.
         let effective_mode = mode.clone();
+        let execution_environment = stored_environment
+            .filter(|environment| !environment.trim().is_empty())
+            .unwrap_or_else(|| {
+                if effective_mode.eq_ignore_ascii_case("PAPER") {
+                    "INTERNAL_PAPER".into()
+                } else {
+                    "UNVERIFIED".into()
+                }
+            });
+        let environment_matches = effective_mode.eq_ignore_ascii_case("PAPER")
+            || execution_environment == app.execution_environment(&venue, &effective_mode);
         let mut credentials: Option<VenueCreds> = None;
         if effective_mode == "LIVE" {
             // Faz 4 (C-5): HEDGE LIVE kilitli — restore'da dürüst düşürme.
@@ -1262,8 +1361,17 @@ async fn restore_bots(app: &Arc<AppState>) {
                     ),
                 )
                 .await;
-            } else {
-                match store::load_active_key(&app.db, &app.vault, &venue.to_uppercase()) {
+            } else if !environment_matches {
+                state::persist_event(
+                    app,
+                    &id,
+                    "WARN",
+                    "RESTORE",
+                    &format!("bot ortamı {execution_environment}, etkin endpoint {} — LIVE bot güvenli şekilde duraklatıldı", app.execution_environment(&venue, &effective_mode)),
+                )
+                .await;
+            } else if let Some(key_environment) = key_environment_for_execution_environment(&execution_environment) {
+                match store::load_active_key_for_environment(&app.db, &app.vault, &venue.to_uppercase(), key_environment) {
                     Ok(Some(creds)) => {
                         // P4-3: OKX passphrase'siz LIVE'a kalkamaz (imza eksik
                         // kalır, ilk poll'da hata verirdi — restore'da dürüst düşür).
@@ -1293,13 +1401,22 @@ async fn restore_bots(app: &Arc<AppState>) {
                         .await;
                     }
                 }
+            } else {
+                state::persist_event(
+                    app,
+                    &id,
+                    "WARN",
+                    "RESTORE",
+                    "eski LIVE botun çalışma ortamı doğrulanamadı — LIVE kimliği korundu, yeni botu açık ortam seçimiyle oluşturun",
+                )
+                .await;
             }
         }
         let needs_live_rearm =
             mode.eq_ignore_ascii_case("LIVE") && status.eq_ignore_ascii_case("RUNNING");
         let restored_status = if ambiguous_live_market && effective_mode == "LIVE" {
             "FROZEN"
-        } else if needs_live_rearm {
+        } else if needs_live_rearm || !environment_matches {
             "PAUSED"
         } else {
             &status
@@ -1314,6 +1431,7 @@ async fn restore_bots(app: &Arc<AppState>) {
             cfg,
             &interval,
             start_cash,
+            &execution_environment,
             credentials,
         )
         .await
@@ -1337,6 +1455,16 @@ async fn restore_bots(app: &Arc<AppState>) {
                 "WARN",
                 "LIVE_REARM_REQUIRED",
                 "restart sonrası otomatik LIVE emirleri engellendi; self-check ve explicit START gerekli",
+            )
+            .await;
+        } else if !environment_matches {
+            state::persist_status(app, &id, "PAUSED");
+            state::persist_event(
+                app,
+                &id,
+                "WARN",
+                "EXECUTION_ENVIRONMENT_MISMATCH",
+                &format!("bot {} ortamına kayıtlı, etkin endpoint {} — yeni ortamda otomatik emir engellendi", execution_environment, app.execution_environment(&venue, &effective_mode)),
             )
             .await;
         }
@@ -1637,6 +1765,12 @@ async fn health(State(app): State<Arc<AppState>>) -> Json<Value> {
         "math": "4096-bit rational (M01-M20)",
         "gates": 8,
         "venues": ["BYBIT", "BINANCE", "OKX", "PAPER"],
+        "executionEnvironments": {
+            "BYBIT": app.execution_environment("BYBIT", "LIVE"),
+            "BINANCE": app.execution_environment("BINANCE", "LIVE"),
+            "OKX": app.execution_environment("OKX", "LIVE"),
+            "PAPER": "INTERNAL_PAPER",
+        },
         "uptime_s": (now - app.started_at) / 1000,
         "readiness": {
             "db": if db_ok { "ok" } else { "ERR" },
@@ -2011,6 +2145,8 @@ struct CreateBotReq {
     kind: String,
     venue: String,
     mode: String,
+    #[serde(default)]
+    execution_environment: Option<String>,
     symbol: String,
     #[serde(default = "default_interval")]
     interval: String,
@@ -2392,6 +2528,13 @@ async fn create_bot(
             "geçersiz mode '{mode}' — geçerli değerler: PAPER | LIVE"
         )));
     }
+    let actual_execution_environment = app.execution_environment(&req.venue, &mode);
+    let execution_environment = resolve_execution_environment_choice(
+        &mode,
+        req.execution_environment.as_deref(),
+        actual_execution_environment,
+    )
+    .map_err(err422)?;
     let _live_ownership_guard = if mode == "LIVE" {
         Some(
             lock_live_ownership(&app, "", &req.venue, &cfg.symbol)
@@ -2463,20 +2606,33 @@ async fn create_bot(
         // Faz 13B: HEDGE LIVE kilidi KALDIRILDI — bacak-başına stepper (EX-06
         // çözümü) + positionIdx eşlemesi (Faz 4.5/5) tam; Demo kabulü sonrası canlı.
         // Hesap hedge-moddaysa POS_MODE denetimi emirleri positionIdx ile eşler.
-        credentials = match store::load_active_key(&app.db, &app.vault, &venue_uc) {
+        let key_environment = key_environment_for_execution_environment(&execution_environment)
+            .ok_or_else(|| err422("LIVE bot için doğrulanmış Sandbox/Mainnet ortamı çözülemedi"))?;
+        credentials = match store::load_active_key_for_environment(
+            &app.db,
+            &app.vault,
+            &venue_uc,
+            key_environment,
+        ) {
             Ok(Some(c)) => {
                 if venue_uc == "OKX" && c.passphrase.as_deref().map(|p| p.trim().is_empty()).unwrap_or(true) {
                     return Err(err422("OKX LIVE için vault anahtarında passphrase gerekli — anahtarı passphrase ile yeniden ekleyin"));
                 }
                 Some(c)
             }
-            Ok(None) => return Err(err422(format!("LIVE mod için {venue_uc} vault anahtarı gerekli — Ayarlar > Anahtar Kasası'ndan ekleyin"))),
+            Ok(None) => return Err(err422(format!("{execution_environment} botu için {venue_uc} {key_environment} kasa anahtarı gerekli — Ayarlar > Anahtar Kasası'ndan ekleyin"))),
             Err(e) => return Err(err422(format!("vault anahtarı çözülemedi: {e}"))),
         };
         let credentials_ref = credentials.as_ref().expect("LIVE credentials set above");
-        if let Err(e) =
-            validate_live_preflight(&app, &venue_uc, credentials_ref, kind.is_futures(), false)
-                .await
+        if let Err(e) = validate_live_preflight(
+            &app,
+            &venue_uc,
+            credentials_ref,
+            kind.is_futures(),
+            false,
+            &execution_environment,
+        )
+        .await
         {
             return Err(err422(format!("LIVE güvenlik ön kontrolü başarısız: {e}")));
         }
@@ -2634,6 +2790,7 @@ async fn create_bot(
         cfg.clone(),
         &req.interval,
         start_cash.clone(),
+        &execution_environment,
         credentials,
     )
     .await
@@ -2647,13 +2804,14 @@ async fn create_bot(
             Err(e) => return Err(err422(e.to_string())),
         };
         conn.execute(
-            "INSERT INTO bots(id, name, kind, venue, mode, symbol, status, config, stats, interval, start_cash, live_certified, created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'{}',?9,?10,?11,?12)",
+            "INSERT INTO bots(id, name, kind, venue, mode, execution_environment, symbol, status, config, stats, interval, start_cash, live_certified, created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'{}',?10,?11,?12,?13)",
             rusqlite::params![
                 id,
                 req.name,
                 kind.label(),
                 req.venue.to_uppercase(),
                 mode,
+                execution_environment,
                 req.symbol,
                 status,
                 serde_json::to_string(&cfg).map_err(|e| err422(e.to_string()))?,
@@ -3130,7 +3288,7 @@ async fn bot_actions(
             .await;
             return Err(err422("FREEZE devrede — ADD_FUNDS reddedildi"));
         }
-        let (mode, venue, mark, step_size, planned) = {
+        let (mode, venue, execution_environment, mark, step_size, planned) = {
             let rts = app.runtimes.lock().await;
             let rt = rts.get(&id).ok_or_else(|| err422("bot not found"))?;
             let mark = rt
@@ -3208,6 +3366,7 @@ async fn bot_actions(
             (
                 rt.mode.clone(),
                 rt.venue.clone(),
+                rt.execution_environment.clone(),
                 mark,
                 rt.stepper.instrument.step_size.clone(),
                 plan,
@@ -3218,7 +3377,14 @@ async fn bot_actions(
             let adapter = app
                 .adapter(&venue)
                 .ok_or_else(|| err422("venue desteklenmiyor"))?;
-            let creds = store::load_active_key(&app.db, &app.vault, &venue)
+            let key_environment = key_environment_for_execution_environment(&execution_environment)
+                .ok_or_else(|| err422("LIVE botun çalışma ortamı doğrulanamadı"))?;
+            let creds = store::load_active_key_for_environment(
+                &app.db,
+                &app.vault,
+                &venue,
+                key_environment,
+            )
                 .map_err(err422)?
                 .ok_or_else(|| err422("live mode requires vault credentials"))?;
             if !live_certification_is_current(&app, &id).map_err(err422)? {
@@ -3226,7 +3392,14 @@ async fn bot_actions(
                     "LIVE ADD_FUNDS reddedildi: botun geçerli sertifikası yok",
                 ));
             }
-            validate_live_preflight(&app, &venue, &creds, is_futures, true)
+            validate_live_preflight(
+                &app,
+                &venue,
+                &creds,
+                is_futures,
+                true,
+                &execution_environment,
+            )
                 .await
                 .map_err(|e| err422(format!("LIVE ADD_FUNDS ön kontrolü başarısız: {e}")))?;
             engine::pre_order_gate_ctx(&app, &gate, adapter, &creds, Some(&mark_v), &qty)
@@ -3307,17 +3480,35 @@ async fn bot_actions(
             let rts = app.runtimes.lock().await;
             rts.get(&id)
                 .filter(|rt| rt.mode.eq_ignore_ascii_case("LIVE"))
-                .map(|rt| (rt.venue.to_uppercase(), rt.cfg.kind.is_futures()))
+                .map(|rt| (
+                    rt.venue.to_uppercase(),
+                    rt.cfg.kind.is_futures(),
+                    rt.execution_environment.clone(),
+                ))
         };
-        if let Some((venue, is_futures)) = live_context {
+        if let Some((venue, is_futures, execution_environment)) = live_context {
             let guard = acquire_bot_poll_guard(&app, &id).await;
             if !live_certification_is_current(&app, &id).map_err(err422)? {
                 return Err(err422("LIVE bot için geçerli sunucu sertifikası yok; eski botu yeniden sertifikalandırmak için yeni LIVE yapılandırması oluşturun"));
             }
-            let credentials = store::load_active_key(&app.db, &app.vault, &venue)
+            let key_environment = key_environment_for_execution_environment(&execution_environment)
+                .ok_or_else(|| err422("LIVE botun çalışma ortamı doğrulanamadı; yeniden oluşturun"))?;
+            let credentials = store::load_active_key_for_environment(
+                &app.db,
+                &app.vault,
+                &venue,
+                key_environment,
+            )
                 .map_err(err422)?
-                .ok_or_else(|| err422("LIVE bot başlatılamadı: aktif kasa anahtarı bulunamadı"))?;
-            validate_live_preflight(&app, &venue, &credentials, is_futures, true)
+                .ok_or_else(|| err422(format!("LIVE bot başlatılamadı: {key_environment} kasa anahtarı bulunamadı")))?;
+            validate_live_preflight(
+                &app,
+                &venue,
+                &credentials,
+                is_futures,
+                true,
+                &execution_environment,
+            )
                 .await
                 .map_err(|e| err422(format!("LIVE başlatma ön kontrolü başarısız: {e}")))?;
             (Some(guard), Some(credentials))
@@ -4375,7 +4566,7 @@ async fn reconcile(
     State(app): State<Arc<AppState>>,
     Query(q): Query<ReconcileQuery>,
 ) -> Result<Json<Value>, axum::response::Response> {
-    let (mode, venue, symbol, local_side, local_qty) = {
+    let (mode, venue, execution_environment, symbol, local_side, local_qty) = {
         let rts = app.runtimes.lock().await;
         let rt = rts.get(&q.bot_id).ok_or_else(|| err422("bot not found"))?;
         let (local_side, local_qty) = match &rt.engine_kind {
@@ -4397,6 +4588,7 @@ async fn reconcile(
         (
             rt.mode.clone(),
             rt.venue.clone(),
+            rt.execution_environment.clone(),
             rt.cfg.symbol.clone(),
             local_side,
             local_qty,
@@ -4408,8 +4600,13 @@ async fn reconcile(
             "reason": "PAPER modda borsa pozisyonu yok — mutabakat yalnız LIVE botlarda anlamlıdır.",
         })));
     }
+    let key_environment = key_environment_for_execution_environment(&execution_environment)
+        .ok_or_else(|| err422("botun çalışma ortamı doğrulanamadı"))?;
+    if app.execution_environment(&venue, "LIVE") != execution_environment {
+        return Err(err422("bot ortamı ile etkin borsa endpoint'i uyuşmuyor"));
+    }
     let local_zero = local_qty == "0" || local_qty == "0.00000000";
-    let creds = store::load_active_key(&app.db, &app.vault, &venue)
+    let creds = store::load_active_key_for_environment(&app.db, &app.vault, &venue, key_environment)
         .map_err(err422)?
         .ok_or_else(|| err422("bu venue için aktif vault anahtarı yok"))?;
     let adapter = app
@@ -4465,7 +4662,10 @@ struct SelfCheckReq {
 }
 
 fn active_keypair(app: &Arc<AppState>, venue: &str) -> Option<VenueCreds> {
-    store::load_active_key(&app.db, &app.vault, venue)
+    let environment = key_environment_for_execution_environment(
+        app.execution_environment(venue, "LIVE"),
+    )?;
+    store::load_active_key_for_environment(&app.db, &app.vault, venue, environment)
         .ok()
         .flatten()
 }
@@ -6469,6 +6669,8 @@ async fn set_freeze(
 #[derive(Deserialize)]
 struct AddKeyReq {
     venue: String,
+    #[serde(default)]
+    environment: Option<String>,
     label: String,
     api_key: String,
     api_secret: String,
@@ -6481,6 +6683,18 @@ async fn add_key(
     Json(req): Json<AddKeyReq>,
 ) -> Result<Json<Value>, axum::response::Response> {
     let venue = req.venue.to_uppercase();
+    if venue == "PAPER" {
+        return Err(err422("PAPER ortamı için API anahtarı gerekmez"));
+    }
+    let requested_environment = req.environment.unwrap_or_else(|| {
+        if app.is_sandbox_venue(&venue) {
+            "SANDBOX".into()
+        } else {
+            "MAINNET".into()
+        }
+    });
+    let environment = resolve_vault_key_environment(&app, &venue, &requested_environment)
+        .map_err(err422)?;
     let adapter: &dyn VenueAdapter = match venue.as_str() {
         "BYBIT" => &app.bybit,
         "BINANCE" => &app.binance,
@@ -6530,10 +6744,11 @@ async fn add_key(
     {
         let conn = app.db.conn.lock().map_err(|e| err422(e.to_string()))?;
         conn.execute(
-            "INSERT INTO vault_keys(id, venue, label, api_key_enc, api_secret_enc, api_pass_enc, permissions, created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT INTO vault_keys(id, venue, environment, label, api_key_enc, api_secret_enc, api_pass_enc, permissions, created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             rusqlite::params![
                 id,
                 venue,
+                environment,
                 req.label,
                 enc_key,
                 enc_secret,
@@ -6547,6 +6762,7 @@ async fn add_key(
     Ok(Json(json!({
         "id": id,
         "venue": venue,
+        "environment": environment,
         "label": req.label,
         "permissions": perms,
         "maskedKey": mask(&req.api_key),
@@ -6566,10 +6782,74 @@ fn mask(s: &str) -> String {
     }
 }
 
+#[derive(Deserialize)]
+struct SetKeyEnvironmentReq {
+    environment: String,
+}
+
+async fn update_key_environment(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<SetKeyEnvironmentReq>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let requested_environment = req.environment.to_ascii_uppercase();
+    if !matches!(requested_environment.as_str(), "SANDBOX" | "MAINNET") {
+        return Err(err422("API anahtarı ortamı SANDBOX veya MAINNET olmalı"));
+    }
+    let key_row: (String, String, String, String, String) = {
+        let conn = app.db.conn.lock().map_err(|e| err422(e.to_string()))?;
+        conn.query_row(
+            "SELECT venue, environment, api_key_enc, api_secret_enc, api_pass_enc FROM vault_keys WHERE id=?1",
+            [&id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .map_err(|_| err422("vault anahtarı bulunamadı"))?
+    };
+    let (venue, old_environment, key_enc, secret_enc, pass_enc) = key_row;
+    let environment = resolve_vault_key_environment(&app, &venue, &requested_environment)
+        .map_err(err422)?;
+    if old_environment == environment {
+        return Ok(Json(json!({"ok": true, "id": id, "venue": venue, "environment": environment})));
+    }
+    if old_environment != "UNVERIFIED" {
+        return Err(err422(
+            "doğrulanmış bir anahtarın ortamı değiştirilemez; doğru ortam için yeni anahtar ekleyin",
+        ));
+    }
+    let adapter = app
+        .adapter(&venue)
+        .ok_or_else(|| err422("venue desteklenmiyor"))?;
+    let creds = VenueCreds {
+        key: app.vault.decrypt(&key_enc).map_err(err422)?,
+        secret: app.vault.decrypt(&secret_enc).map_err(err422)?,
+        passphrase: if pass_enc.trim().is_empty() {
+            None
+        } else {
+            Some(app.vault.decrypt(&pass_enc).map_err(err422)?)
+        },
+    };
+    let permissions = adapter
+        .key_permissions(&creds)
+        .await
+        .map_err(|e| err422(format!("anahtar {environment} endpoint'inde doğrulanamadı: {e}")))?;
+    if let WithdrawalGate::HardFail(reason) = validate_key_permissions(&permissions) {
+        return Err(err422(reason));
+    }
+    {
+        let conn = app.db.conn.lock().map_err(|e| err422(e.to_string()))?;
+        conn.execute(
+            "UPDATE vault_keys SET environment=?1 WHERE id=?2 AND environment='UNVERIFIED'",
+            rusqlite::params![environment, id],
+        )
+        .map_err(|e| err422(e.to_string()))?;
+    }
+    Ok(Json(json!({"ok": true, "id": id, "venue": venue, "environment": environment})))
+}
+
 async fn list_keys(State(app): State<Arc<AppState>>) -> Json<Value> {
     let conn = app.db.conn.lock().unwrap_or_else(|p| p.into_inner());
     let mut stmt = match conn
-        .prepare("SELECT id, venue, label, permissions, created_at, api_key_enc, api_pass_enc FROM vault_keys ORDER BY created_at DESC")
+        .prepare("SELECT id, venue, environment, label, permissions, created_at, api_key_enc, api_pass_enc FROM vault_keys ORDER BY created_at DESC")
     {
         Ok(s) => s,
         Err(e) => {
@@ -6579,15 +6859,24 @@ async fn list_keys(State(app): State<Arc<AppState>>) -> Json<Value> {
     };
     let rows: Vec<Value> = stmt
         .query_map([], |r| {
-            let perms_raw: String = r.get(3)?;
-            let key_enc: String = r.get(5)?;
+            let perms_raw: String = r.get(4)?;
+            let key_enc: String = r.get(6)?;
             // Eski satırlarda api_pass_enc kolonu migrasyonla gelir (boş = yok).
-            let pass_enc: String = r.get(6).unwrap_or_default();
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, perms_raw, r.get::<_, i64>(4)?, key_enc, pass_enc))
+            let pass_enc: String = r.get(7).unwrap_or_default();
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                perms_raw,
+                r.get::<_, i64>(5)?,
+                key_enc,
+                pass_enc,
+            ))
         })
         .unwrap()
         .filter_map(|x| x.ok())
-        .map(|(id, venue, label, perms_raw, created_at, key_enc, pass_enc): (String, String, String, String, i64, String, String)| {
+        .map(|(id, venue, environment, label, perms_raw, created_at, key_enc, pass_enc): (String, String, String, String, String, i64, String, String)| {
             // permissions are persisted as a JSON string — parse into the object
             // shape the frontend contract expects; fall back to a safe default.
             let perms: Value = serde_json::from_str::<dca_exchange::KeyPermissions>(&perms_raw)
@@ -6618,6 +6907,7 @@ async fn list_keys(State(app): State<Arc<AppState>>) -> Json<Value> {
                 "id": id,
                 "label": label,
                 "venue": venue,
+                "environment": environment,
                 "maskedKey": masked,
                 "permissions": perms,
                 "note": note,
@@ -6633,20 +6923,25 @@ async fn list_keys(State(app): State<Arc<AppState>>) -> Json<Value> {
 /// botlar durdurulur (yeni emir engellenir). Aksi halde runtime kopyasıyla
 /// emir gönderilmeye devam edilebilir.
 async fn remove_key(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Json<Value> {
-    let venue: Option<String> = {
+    let key_identity: Option<(String, String)> = {
         let conn = app.db.conn.lock().unwrap_or_else(|p| p.into_inner());
-        conn.query_row("SELECT venue FROM vault_keys WHERE id=?1", [&id], |r| {
-            r.get::<_, String>(0)
+        conn.query_row("SELECT venue, environment FROM vault_keys WHERE id=?1", [&id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })
         .ok()
     };
     let mut poll_guards: Vec<tokio::sync::OwnedMutexGuard<()>> = Vec::new();
-    if let Some(venue) = venue {
+    if let Some((venue, key_environment)) = key_identity {
         let venue_uc = venue.to_uppercase();
         let mut to_stop: Vec<String> = {
             let rts = app.runtimes.lock().await;
             rts.iter()
-                .filter(|(_, rt)| rt.mode == "LIVE" && rt.venue.to_uppercase() == venue_uc)
+                .filter(|(_, rt)| {
+                    rt.mode == "LIVE"
+                        && rt.venue.to_uppercase() == venue_uc
+                        && key_environment_for_execution_environment(&rt.execution_environment)
+                            == Some(key_environment.as_str())
+                })
                 .map(|(id, _)| id.clone())
                 .collect()
         };

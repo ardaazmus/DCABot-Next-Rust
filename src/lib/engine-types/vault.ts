@@ -1,5 +1,7 @@
 /* Faz B — engine-types bölünmesi. Tüketiciler değişmedi (`@/lib/engine-types` barrel). */
 
+import type { VaultEnvironment } from "./core";
+
 export interface VaultKeyPermissions {
   read_only: boolean;
   can_withdraw: boolean;
@@ -12,6 +14,7 @@ export interface VaultKeyPermissions {
 export interface VaultKey {
   id: string;
   venue: string;
+  environment: VaultEnvironment;
   label: string;
   permissions: VaultKeyPermissions;
   maskedKey: string;

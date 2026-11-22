@@ -548,6 +548,7 @@ impl AppState {
     pub fn is_sandbox_venue(&self, venue: &str) -> bool {
         match venue.to_ascii_uppercase().as_str() {
             "BYBIT" => self.bybit.is_demo_or_testnet(),
+            "BINANCE" => self.binance.base_url == "https://testnet.binance.vision",
             "OKX" => self.okx.is_demo,
             _ => false,
         }
@@ -561,6 +562,8 @@ impl AppState {
             "BYBIT" if self.bybit.base_url == "https://api-demo.bybit.com" => "BYBIT_DEMO",
             "BYBIT" if self.bybit.base_url == "https://api-testnet.bybit.com" => "BYBIT_TESTNET",
             "BYBIT" => "MAINNET",
+            "BINANCE" if self.binance.base_url == "https://testnet.binance.vision" => "BINANCE_TESTNET",
+            "BINANCE" => "MAINNET",
             "OKX" if self.okx.is_demo => "OKX_DEMO",
             "OKX" => "MAINNET",
             _ => "UNSUPPORTED",
@@ -971,6 +974,7 @@ pub async fn create_runtime(
     cfg: BotConfig,
     interval: &str,
     start_cash: Fraction,
+    execution_environment: &str,
     credentials: Option<VenueCreds>,
 ) -> Result<(), String> {
     // Faz 4 (H-6): enstrüman botun kendi venue'sundan çözülür (PAPER bots
@@ -1106,7 +1110,7 @@ pub async fn create_runtime(
         bot_id: id.to_string(),
         name: name.to_string(),
         mode: mode.to_string(),
-        execution_environment: app.execution_environment(venue, mode).into(),
+        execution_environment: execution_environment.to_string(),
         venue: venue.to_string(),
         status: status.to_string(),
         cfg,
@@ -1448,6 +1452,7 @@ mod tests {
             cfg,
             "1h",
             Fraction::from_u64(100_000),
+            "INTERNAL_PAPER",
             None,
         )
         .await

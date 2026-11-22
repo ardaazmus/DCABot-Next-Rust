@@ -44,6 +44,7 @@ import type {
   TickersResponse,
   VaultKey,
   VaultKeyResponse,
+  VaultEnvironmentChoice,
 } from "@/lib/engine-types";
 import { engineFetch, engineJson } from "./engine-client";
 import { useDebouncedValue, useEventStream, usePoll } from "./engine-stream";
@@ -505,6 +506,7 @@ export async function apiVaultKeys(): Promise<{ keys: VaultKey[] }> {
 
 export async function apiAddVaultKey(body: {
   venue: string;
+  environment: VaultEnvironmentChoice;
   label: string;
   api_key: string;
   api_secret: string;
@@ -512,6 +514,16 @@ export async function apiAddVaultKey(body: {
   passphrase?: string;
 }): Promise<VaultKeyResponse> {
   return engineFetch("/api/vault/keys", engineJson("POST", body));
+}
+
+export async function apiSetVaultKeyEnvironment(
+  id: string,
+  environment: VaultEnvironmentChoice,
+): Promise<{ ok: boolean; id: string; venue: string; environment: string }> {
+  return engineFetch(
+    `/api/vault/keys/${id}/environment`,
+    engineJson("PATCH", { environment }),
+  );
 }
 
 export async function apiDeleteVaultKey(id: string): Promise<unknown> {

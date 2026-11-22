@@ -32,6 +32,7 @@ impl Db {
                 kind TEXT NOT NULL,
                 venue TEXT NOT NULL,
                 mode TEXT NOT NULL,
+                execution_environment TEXT NOT NULL DEFAULT '',
                 symbol TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'STOPPED',
                 config TEXT NOT NULL,
@@ -82,6 +83,7 @@ impl Db {
             CREATE TABLE IF NOT EXISTS vault_keys (
                 id TEXT PRIMARY KEY,
                 venue TEXT NOT NULL,
+                environment TEXT NOT NULL DEFAULT 'UNVERIFIED',
                 label TEXT NOT NULL,
                 api_key_enc TEXT NOT NULL,
                 api_secret_enc TEXT NOT NULL,
@@ -191,8 +193,22 @@ impl Db {
             )
             .map_err(|e| e.to_string())?;
         }
+        if !existing.iter().any(|c| c == "execution_environment") {
+            conn.execute(
+                "ALTER TABLE bots ADD COLUMN execution_environment TEXT NOT NULL DEFAULT ''",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
         // P4-3 OKX passphrase: eski kasalara sonradan eklenir (boş = yok).
         let vault_cols = cols("vault_keys")?;
+        if !vault_cols.iter().any(|c| c == "environment") {
+            conn.execute(
+                "ALTER TABLE vault_keys ADD COLUMN environment TEXT NOT NULL DEFAULT 'UNVERIFIED'",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
         if !vault_cols.iter().any(|c| c == "api_pass_enc") {
             conn.execute(
                 "ALTER TABLE vault_keys ADD COLUMN api_pass_enc TEXT NOT NULL DEFAULT ''",
@@ -200,6 +216,13 @@ impl Db {
             )
             .map_err(|e| e.to_string())?;
         }
+        // Earlier builds recorded only the generic SANDBOX category. That
+        // cannot distinguish Demo from Testnet, so require endpoint re-check.
+        conn.execute(
+            "UPDATE vault_keys SET environment='UNVERIFIED' WHERE environment='SANDBOX'",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
         // Faz 3 (C-4): kalıcı runtime snapshot — motor fazı + stepper durumu.
         if !existing.iter().any(|c| c == "runtime_state") {
             conn.execute("ALTER TABLE bots ADD COLUMN runtime_state TEXT", [])
@@ -408,38 +431,42 @@ fn derive_argon2id(secret: &str, salt: &[u8]) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
-/// Resolve the newest ACTIVE vault key for a venue into plaintext credentials.
-/// Used to arm LIVE-mode bots at creation/restore. Errors surface decryption
-/// problems; None means the venue simply has no usable key yet.
-/// P4-3: OKX passphrase üçüncü bileşendir (boş kayıt = None).
-pub fn load_active_key(
+/// Resolve the newest ACTIVE vault key for the exact account environment.
+/// Sandbox and mainnet keys are never interchangeable even when venue matches.
+pub fn load_active_key_for_environment(
     db: &Db,
     vault: &Vault,
     venue: &str,
+    environment: &str,
 ) -> Result<Option<dca_exchange::VenueCreds>, String> {
+    if !matches!(
+        environment,
+        "BYBIT_DEMO" | "BYBIT_TESTNET" | "BINANCE_TESTNET" | "OKX_DEMO" | "MAINNET"
+    ) {
+        return Err("vault environment must identify an exact exchange endpoint".into());
+    }
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT api_key_enc, api_secret_enc, api_pass_enc FROM vault_keys WHERE venue=?1 AND active=1 ORDER BY created_at DESC LIMIT 1",
+            "SELECT api_key_enc, api_secret_enc, api_pass_enc FROM vault_keys WHERE venue=?1 AND environment=?2 AND active=1 ORDER BY created_at DESC LIMIT 1",
         )
         .map_err(|e| e.to_string())?;
-    let mut rows = stmt.query([venue]).map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query(rusqlite::params![venue, environment])
+        .map_err(|e| e.to_string())?;
     match rows.next().map_err(|e| e.to_string())? {
         Some(row) => {
             let ek: String = row.get(0).map_err(|e| e.to_string())?;
             let es: String = row.get(1).map_err(|e| e.to_string())?;
             let ep: String = row.get(2).map_err(|e| e.to_string())?;
-            let k = vault.decrypt(&ek)?;
-            let s = vault.decrypt(&es)?;
-            let p = if ep.trim().is_empty() {
-                None
-            } else {
-                Some(vault.decrypt(&ep)?)
-            };
             Ok(Some(dca_exchange::VenueCreds {
-                key: k,
-                secret: s,
-                passphrase: p,
+                key: vault.decrypt(&ek)?,
+                secret: vault.decrypt(&es)?,
+                passphrase: if ep.trim().is_empty() {
+                    None
+                } else {
+                    Some(vault.decrypt(&ep)?)
+                },
             }))
         }
         None => Ok(None),

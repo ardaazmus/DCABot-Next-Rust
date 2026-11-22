@@ -52,7 +52,7 @@ import { fmtFrac, fmtTimeShort, fmtTs, fmtUsd, fmtUsdSigned, fracToNum, kindLabe
 import { toast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
 import { CRITICAL_LIQUIDATION_DISTANCE_PCT, DealProgressBar } from "@/components/terminal/deal-progress-bar";
-import type { Bot as BotRow, Mode } from "@/lib/engine-types";
+import type { Bot as BotRow, ExecutionEnvironmentChoice, Mode } from "@/lib/engine-types";
 
 /* Task 16 — compact risk-policy chips for fleet cards/table (max 2). */
 const GUARD_KEYS = [
@@ -305,7 +305,17 @@ export function FleetTape() {
   );
 }
 
-export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void; onNewBot: (mode?: Mode) => void }) {
+type ModeFilter = "ALL" | "PAPER" | "EXCHANGE_SANDBOX" | "MAINNET" | "UNVERIFIED";
+const SANDBOX_ENVIRONMENTS = ["BYBIT_DEMO", "BYBIT_TESTNET", "OKX_DEMO"];
+
+function botModeFilter(bot: BotRow): Exclude<ModeFilter, "ALL"> {
+  if (bot.mode === "PAPER" || bot.executionEnvironment === "INTERNAL_PAPER") return "PAPER";
+  if (bot.executionEnvironment === "MAINNET") return "MAINNET";
+  if (SANDBOX_ENVIRONMENTS.includes(bot.executionEnvironment ?? "")) return "EXCHANGE_SANDBOX";
+  return "UNVERIFIED";
+}
+
+export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void; onNewBot: (mode?: Mode, environment?: ExecutionEnvironmentChoice) => void }) {
   const { bots, loading, refetch } = useBots();
   const [view, setView] = useState<"cards" | "table">("cards");
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -326,19 +336,21 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
      sektör standardı (Bitsgap/3Commas) ve en büyük kayıp listede gömülü kalmasın. */
   const [query, setQuery] = useState("");
   const [statusF, setStatusF] = useState<"ALL" | "RUNNING" | "PAUSED" | "FROZEN" | "STOPPED">("ALL");
-  const [modeF, setModeF] = useState<Mode | "ALL">("ALL");
+  const [modeF, setModeF] = useState<ModeFilter>("ALL");
   type SmartFilter = "ALL" | "OPEN_DEAL" | "BAG_HOLDING" | "RISK_MARGIN" | "HALT_WARN" | "STOPPED";
   const [smartF, setSmartF] = useState<SmartFilter>("ALL");
   const [cardSort, setCardSort] = useState<"impact" | "pnl-asc" | "pnl-desc" | "name" | "symbol">("impact");
   const modeCounts = useMemo(
     () => ({
       ALL: bots.length,
-      PAPER: bots.filter((b) => b.mode === "PAPER").length,
-      LIVE: bots.filter((b) => b.mode === "LIVE").length,
+      PAPER: bots.filter((b) => botModeFilter(b) === "PAPER").length,
+      EXCHANGE_SANDBOX: bots.filter((b) => botModeFilter(b) === "EXCHANGE_SANDBOX").length,
+      MAINNET: bots.filter((b) => botModeFilter(b) === "MAINNET").length,
+      UNVERIFIED: bots.filter((b) => botModeFilter(b) === "UNVERIFIED").length,
     }),
     [bots],
   );
-  const changeModeFilter = (nextMode: Mode | "ALL") => {
+  const changeModeFilter = (nextMode: ModeFilter) => {
     if (nextMode !== modeF) setSelected(new Set());
     setModeF(nextMode);
   };
@@ -363,7 +375,7 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
   const shown = useMemo(() => {
     const q = query.trim().toLocaleLowerCase("tr");
     let list = bots;
-    if (modeF !== "ALL") list = list.filter((b) => b.mode === modeF);
+    if (modeF !== "ALL") list = list.filter((b) => botModeFilter(b) === modeF);
     if (hedgeOnly) list = list.filter((b) => HEDGE_KINDS.has(b.kind));
     if (smartF === "OPEN_DEAL") list = list.filter((b) => b.stats.phase === "Open");
     else if (smartF === "BAG_HOLDING") {
@@ -733,18 +745,28 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
           <div role="group" aria-label="Filo çalışma modu filtresi" className="flex flex-wrap items-center gap-1.5">
             {([
               { mode: "ALL", label: "Tümü", count: modeCounts.ALL },
-              { mode: "PAPER", label: "PAPER", count: modeCounts.PAPER },
-              { mode: "LIVE", label: "Borsa · LIVE", count: modeCounts.LIVE },
+              { mode: "PAPER", label: "PAPER simülasyonu", count: modeCounts.PAPER },
+              { mode: "EXCHANGE_SANDBOX", label: "Borsa Demo / Testnet", count: modeCounts.EXCHANGE_SANDBOX },
+              { mode: "MAINNET", label: "Mainnet LIVE", count: modeCounts.MAINNET },
+              { mode: "UNVERIFIED", label: "Ortam doğrulanmamış", count: modeCounts.UNVERIFIED },
             ] as const).map((option) => {
               const active = modeF === option.mode;
               const tone = option.mode === "PAPER"
                 ? active
                   ? "border-emerald-500/60 bg-emerald-500/15 text-emerald-300"
                   : "border-emerald-500/25 text-emerald-400/80 hover:bg-emerald-500/5"
-                : option.mode === "LIVE"
+                : option.mode === "EXCHANGE_SANDBOX"
+                  ? active
+                    ? "border-cyan-500/60 bg-cyan-500/15 text-cyan-300"
+                    : "border-cyan-500/25 text-cyan-400/80 hover:bg-cyan-500/5"
+                  : option.mode === "MAINNET"
                   ? active
                     ? "border-amber-500/60 bg-amber-500/15 text-amber-300"
                     : "border-amber-500/25 text-amber-400/80 hover:bg-amber-500/5"
+                  : option.mode === "UNVERIFIED"
+                    ? active
+                      ? "border-rose-500/60 bg-rose-500/15 text-rose-300"
+                      : "border-rose-500/25 text-rose-400/80 hover:bg-rose-500/5"
                   : active
                     ? "border-slate-400 bg-secondary text-slate-100"
                     : "border-border text-slate-400 hover:text-slate-200";
@@ -894,8 +916,11 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
               <Button type="button" variant="outline" className="border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10" onClick={() => onNewBot("PAPER")}>
                 PAPER bot oluştur
               </Button>
-              <Button type="button" variant="outline" className="border-amber-500/40 text-amber-300 hover:bg-amber-500/10" onClick={() => onNewBot("LIVE")}>
-                Gerçek (LIVE) bot kur
+              <Button type="button" variant="outline" className="border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/10" onClick={() => onNewBot("LIVE", "EXCHANGE_SANDBOX")}>
+                Borsa Demo/Testnet botu kur
+              </Button>
+              <Button type="button" variant="outline" className="border-amber-500/40 text-amber-300 hover:bg-amber-500/10" onClick={() => onNewBot("LIVE", "MAINNET")}>
+                Mainnet LIVE bot kur
               </Button>
             </div>
           </>
@@ -903,22 +928,29 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
           <>
             <EmptyState
               icon={Bot}
-              title={modeF !== "ALL" && modeCounts[modeF] === 0 ? `${modeF === "PAPER" ? "PAPER" : "Gerçek (LIVE)"} bot yok` : "Eşleşen bot yok"}
+              title={modeF !== "ALL" && modeCounts[modeF] === 0 ? `${modeF === "PAPER" ? "PAPER" : modeF === "EXCHANGE_SANDBOX" ? "Demo/Testnet" : modeF === "MAINNET" ? "Mainnet LIVE" : "Ortamı doğrulanmış"} bot yok` : "Eşleşen bot yok"}
               hint={modeF !== "ALL" && modeCounts[modeF] === 0
-                ? "Bu modda henüz bot yok. Yeni bot oluşturma ekranı seçtiğiniz modla açılır."
+                ? modeF === "PAPER"
+                  ? "İç simülasyonda henüz bot yok. Yeni bot oluşturma ekranı PAPER seçimiyle açılır."
+                  : modeF === "EXCHANGE_SANDBOX"
+                    ? "Borsa Demo/Testnet hesabında henüz bot yok. Yeni bot sihirbazı sandbox seçimiyle açılır."
+                    : modeF === "MAINNET"
+                      ? "Mainnet'te henüz bot yok. Yeni bot sihirbazı açıkça Mainnet LIVE seçimiyle açılır."
+                      : "Eski LIVE botların endpoint ortamı kaydedilmemiş; güvenlik için otomatik eşleştirilmez. Yeni bir botta ortamı açıkça seçin."
                 : "Arama, mod, durum filtresi veya Hedge çipini gevşetin."}
             />
-            {modeF !== "ALL" && modeCounts[modeF] === 0 && (
+            {modeF !== "ALL" && modeF !== "UNVERIFIED" && modeCounts[modeF] === 0 && (
               <div className="flex flex-col items-center gap-2 pb-3">
                 <Button
                   type="button"
                   variant="outline"
-                  className={modeF === "LIVE" ? "border-amber-500/40 text-amber-300 hover:bg-amber-500/10" : "border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10"}
-                  onClick={() => onNewBot(modeF)}
+                  className={modeF === "PAPER" ? "border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10" : modeF === "EXCHANGE_SANDBOX" ? "border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/10" : "border-amber-500/40 text-amber-300 hover:bg-amber-500/10"}
+                  onClick={() => onNewBot(modeF === "PAPER" ? "PAPER" : "LIVE", modeF === "PAPER" ? "INTERNAL_PAPER" : modeF === "EXCHANGE_SANDBOX" ? "EXCHANGE_SANDBOX" : "MAINNET")}
                 >
-                  {modeF === "PAPER" ? "PAPER bot oluştur" : "Gerçek (LIVE) bot kur"}
+                  {modeF === "PAPER" ? "PAPER bot oluştur" : modeF === "EXCHANGE_SANDBOX" ? "Demo/Testnet botu kur" : "Mainnet LIVE bot kur"}
                 </Button>
-                {modeF === "LIVE" && <p className="max-w-md text-center text-[10px] text-amber-400/80">LIVE mod gerçek borsa emirleri kullanır; sihirbazdaki anahtar ve risk kontrolleri uygulanır.</p>}
+                {modeF === "EXCHANGE_SANDBOX" && <p className="max-w-md text-center text-[10px] text-cyan-300/80">Emirler seçili borsanın sanal Demo/Testnet hesabına gider.</p>}
+                {modeF === "MAINNET" && <p className="max-w-md text-center text-[10px] text-amber-400/80">Gerçek fon riski vardır; sihirbaz ve motorun mainnet güvenlik kapıları uygulanır.</p>}
               </div>
             )}
           </>

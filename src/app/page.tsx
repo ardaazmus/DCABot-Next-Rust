@@ -31,7 +31,7 @@ import {
   WizardView,
 } from "@/components/terminal/views";
 import { useEngineHealth, useMaintenance } from "@/hooks/use-engine";
-import type { Mode } from "@/lib/engine-types";
+import type { ExecutionEnvironmentChoice, Mode } from "@/lib/engine-types";
 import { fmtDur } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -105,6 +105,7 @@ export default function Page({ searchParams }: { searchParams: PageSearchParams 
   const [view, setView] = useState<View>(initialView);
   const [botId, setBotId] = useState<string | null>(initialBotId);
   const [wizardMode, setWizardMode] = useState<Mode>("PAPER");
+  const [wizardExecutionEnvironment, setWizardExecutionEnvironment] = useState<ExecutionEnvironmentChoice>("INTERNAL_PAPER");
   const [wizardSession, setWizardSession] = useState(0);
   const [authLocked, setAuthLocked] = useState(false);
   /* P1 + P6 */
@@ -167,8 +168,9 @@ export default function Page({ searchParams }: { searchParams: PageSearchParams 
     setView(v);
     syncUrl(v, null);
   };
-  const openNewBot = (mode: Mode = "PAPER") => {
+  const openNewBot = (mode: Mode = "PAPER", executionEnvironment?: ExecutionEnvironmentChoice) => {
     setWizardMode(mode);
+    setWizardExecutionEnvironment(executionEnvironment ?? (mode === "PAPER" ? "INTERNAL_PAPER" : "EXCHANGE_SANDBOX"));
     setWizardSession((current) => current + 1);
     go("wizard");
   };
@@ -300,9 +302,9 @@ export default function Page({ searchParams }: { searchParams: PageSearchParams 
               transition={{ duration: reduceMotion ? 0 : 0.18 }}
             >
               {view === "dashboard" && <DashboardView onInspect={openStudio} onNewBot={() => openNewBot("PAPER")} />}
-              {view === "fleet" && <FleetView onInspect={openStudio} onNewBot={(mode) => openNewBot(mode ?? "PAPER")} />}
+              {view === "fleet" && <FleetView onInspect={openStudio} onNewBot={(mode, environment) => openNewBot(mode ?? "PAPER", environment)} />}
               {view === "studio" && botId && <StudioView botId={botId} onBack={() => go("fleet")} />}
-              {view === "wizard" && <WizardView onCreated={openStudio} initialMode={wizardMode} />}
+              {view === "wizard" && <WizardView onCreated={openStudio} initialMode={wizardMode} initialExecutionEnvironment={wizardExecutionEnvironment} />}
               {view === "calc" && <CalculatorLazy />}
               {view === "backtest" && <BacktestLazy onGoWizard={() => openNewBot("PAPER")} />}
               {view === "knowledge" && <KnowledgeLazy onOpenAi={() => go("backtest")} />}
