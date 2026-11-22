@@ -314,6 +314,9 @@ pub struct AppState {
     /// poll birikmez (supervisor turu + manuel tick çakışması). Boş girişler
     /// bot silinirken kaldırılır.
     pub poll_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// LIVE bot creation/start status transitions are serialized so one
+    /// venue-wide position snapshot cannot be assigned to two bot runtimes.
+    pub live_ownership_lock: Arc<tokio::sync::Mutex<()>>,
     /// Faz 5 (H-8): son başarılı supervisor poll'u (ms) — readiness göstergesi.
     pub last_tick_at: std::sync::Mutex<i64>,
     /// M-3: instrument cache artık TTL'li — (cached_at_ms, liste). Tek bir ağ
@@ -381,6 +384,7 @@ impl AppState {
             sse,
             started_at: now_ms(),
             poll_locks: Mutex::new(HashMap::new()),
+            live_ownership_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_tick_at: std::sync::Mutex::new(0),
             instruments_cache: Mutex::new(HashMap::new()),
             tickers_cache: Mutex::new(HashMap::new()),

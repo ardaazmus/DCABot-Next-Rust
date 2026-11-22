@@ -57,7 +57,7 @@ ENV PORT=3000
 ENV HOSTNAME="0.0.0.0"
 
 # Directories for persistence
-RUN mkdir -p /app/data /app/logs && chown -R dca:dca /app
+RUN mkdir -p /app/data /app/secrets /app/logs && chown -R dca:dca /app
 
 # Copy Rust Engine
 COPY --from=rust-builder /build/mini-services/dca-core/target/release/dca_server /app/dca_server
@@ -77,6 +77,6 @@ USER dca
 
 EXPOSE 3000 3002
 
-VOLUME ["/app/data"]
+VOLUME ["/app/data", "/app/secrets"]
 
 ENTRYPOINT ["/app/entrypoint.sh"]

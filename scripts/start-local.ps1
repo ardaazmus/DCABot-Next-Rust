@@ -6,6 +6,8 @@ $runtimeDirectory = Join-Path $projectRoot '.local-runtime'
 $coreDirectory = Join-Path $projectRoot 'mini-services/dca-core'
 $coreBinary = Join-Path $coreDirectory 'target/debug/dca_server.exe'
 $processFile = Join-Path $runtimeDirectory 'processes.json'
+$recordHelpers = Join-Path $PSScriptRoot 'process-records.ps1'
+. $recordHelpers
 
 # C-2 / M-7: motor (SEC-01/SEC-02) DCA_API_KEY + DCA_VAULT_KEY zorunlu tutar;
 # UI sunucu proxy'si (P0-9) ENGINE_API_KEY / DCA_API_KEY kullanır. Anahtarlar İLK çalıştırmada
@@ -114,10 +116,11 @@ try {
     Wait-LocalHttp 'http://127.0.0.1:3002/api/health' 20
     $nodeBinary = (Get-Command node -ErrorAction Stop).Source
     $uiProcess = Start-Process -FilePath $nodeBinary -ArgumentList @('node_modules/next/dist/bin/next', 'dev', '--hostname', '127.0.0.1', '--port', '3000', '--webpack') -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $runtimeDirectory 'ui.stdout.log') -RedirectStandardError (Join-Path $runtimeDirectory 'ui.stderr.log')
-    @(
+    $localRecords = @(
         @{ Id = $coreProcess.Id; Name = $coreProcess.ProcessName; Started = $coreProcess.StartTime.ToUniversalTime().Ticks }
         @{ Id = $uiProcess.Id; Name = $uiProcess.ProcessName; Started = $uiProcess.StartTime.ToUniversalTime().Ticks }
-    ) | ConvertTo-Json | Set-Content -LiteralPath $processFile -Encoding UTF8
+    )
+    Write-LocalProcessRecords -Path $processFile -Records $localRecords
     Wait-LocalHttp 'http://127.0.0.1:3000/' 120
     Wait-LocalHttp 'http://127.0.0.1:3000/api/health' 20
     Write-Output 'Local terminal: http://127.0.0.1:3000'

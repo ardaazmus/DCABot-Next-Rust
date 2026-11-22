@@ -111,10 +111,14 @@ struct AdxPrev {
     prev_high: Fraction,
     prev_low: Fraction,
     prev_close: Fraction,
+    period: usize,
     s_tr: Fraction,
     s_pdm: Fraction,
     s_mdm: Fraction,
-    /// RMA(DX) — ilk DX ile tohumlanır; None iken ADX Na döner (dürüst warmup).
+    di_count: usize,
+    dx_count: usize,
+    dx_sum: Fraction,
+    /// İlk `period` DX değerinin SMA tohumu; warmup sırasında None.
     adx: Option<Fraction>,
 }
 
@@ -938,11 +942,10 @@ impl<'p> Vm<'p> {
                 }
                 let (high, low, close) =
                     (self.cur_bar.high.clone(), self.cur_bar.low.clone(), self.cur_bar.close.clone());
-                let tr = self.current_tr();
                 let prev = self.ta.entry(node_id).or_default().adx.take();
-                let next = adx_step(prev.as_ref(), &high, &low, &close, &tr, len);
-                let out = next.adx.clone().map(Value::Num).unwrap_or(Value::Na);
-                self.ta.entry(node_id).or_default().adx = Some(next);
+                let next = adx_step(prev.as_ref(), &high, &low, &close, len);
+                let out = next.as_ref().and_then(|state| state.adx.clone()).map(Value::Num).unwrap_or(Value::Na);
+                self.ta.entry(node_id).or_default().adx = next;
                 Ok(out)
             }
             "ta.barssince" => {
@@ -1355,14 +1358,17 @@ fn supertrend_step(
     };
     let (final_upper, final_lower, dir) = match prev {
         Some(p) => {
-            let fu = if close > &p.final_upper {
+            // Pine carries each final band using the PRIOR bar's close. A
+            // current close across the band belongs to the direction flip
+            // below and must not rewrite the band before that comparison.
+            let fu = if p.prev_close > p.final_upper {
                 basic_upper
             } else if basic_upper < p.final_upper {
                 basic_upper
             } else {
                 p.final_upper.clone()
             };
-            let fl = if close < &p.final_lower {
+            let fl = if p.prev_close < p.final_lower {
                 basic_lower
             } else if basic_lower > p.final_lower {
                 basic_lower
@@ -1387,77 +1393,121 @@ fn supertrend_step(
     )
 }
 
-/// Faz 12: Wilder ADX tek-adım — taşıyıcı durumu güncelleyip yeni durumu döndürür.
+/// Wilder ADX tek-adım. DI için ilk `len` TR/DM örneği toplanır; ilk ADX,
+/// sonraki `len` DX örneğinin SMA tohumu tamamlanınca (2*len-1 bar) görünür.
 fn adx_step(
     prev: Option<&AdxPrev>,
     high: &Fraction,
     low: &Fraction,
     close: &Fraction,
-    tr: &Fraction,
     len: usize,
-) -> AdxPrev {
-    let len_f = Fraction::from_u64(len as u64);
-    let _alpha = Fraction::new(num_bigint::BigInt::one(), num_bigint::BigInt::from(len as u64))
-        .unwrap_or_else(|_| Fraction::zero());
-    let rma = |prev_v: &Fraction, cur: &Fraction| -> Fraction {
-        prev_v.mul(&Fraction::from_u64((len - 1) as u64))
-            .and_then(|x| x.add(cur))
-            .and_then(|x| x.div(&len_f))
-            .unwrap_or_else(|_| cur.clone())
+) -> Option<AdxPrev> {
+    if len == 0 {
+        return None;
+    }
+    let Some(p) = prev.filter(|p| p.period == len) else {
+        return Some(AdxPrev {
+            prev_high: high.clone(),
+            prev_low: low.clone(),
+            prev_close: close.clone(),
+            period: len,
+            s_tr: Fraction::zero(),
+            s_pdm: Fraction::zero(),
+            s_mdm: Fraction::zero(),
+            di_count: 0,
+            dx_count: 0,
+            dx_sum: Fraction::zero(),
+            adx: None,
+        });
     };
-    let (up_move, down_move) = match prev {
-        Some(p) => (
-            high.sub(&p.prev_high).unwrap_or_else(|_| Fraction::zero()),
-            p.prev_low.sub(low).unwrap_or_else(|_| Fraction::zero()),
-        ),
-        None => (Fraction::zero(), Fraction::zero()),
+
+    let up_move = high.sub(&p.prev_high).ok()?;
+    let down_move = p.prev_low.sub(low).ok()?;
+    let pdm = if up_move > down_move && up_move.is_positive() {
+        up_move.clone()
+    } else {
+        Fraction::zero()
     };
-    let (pdm, mdm) = match prev {
-        Some(_) => {
-            if up_move > down_move && up_move.is_positive() {
-                (up_move, Fraction::zero())
-            } else if down_move > up_move && down_move.is_positive() {
-                (Fraction::zero(), down_move)
-            } else {
-                (Fraction::zero(), Fraction::zero())
+    let mdm = if down_move > up_move && down_move.is_positive() {
+        down_move
+    } else {
+        Fraction::zero()
+    };
+    let hl = high.sub(low).ok()?;
+    let high_gap = high.sub(&p.prev_close).ok()?.abs().ok()?;
+    let low_gap = low.sub(&p.prev_close).ok()?.abs().ok()?;
+    let tr = Fraction::max(&Fraction::max(&hl, &high_gap), &low_gap);
+    let di_count = (p.di_count + 1).min(len);
+    let (s_tr, s_pdm, s_mdm) = if p.di_count < len {
+        let tr_sum = p.s_tr.add(&tr).ok()?;
+        let pdm_sum = p.s_pdm.add(&pdm).ok()?;
+        let mdm_sum = p.s_mdm.add(&mdm).ok()?;
+        if di_count == len {
+            let divisor = Fraction::from_u64(len as u64);
+            (
+                tr_sum.div(&divisor).ok()?,
+                pdm_sum.div(&divisor).ok()?,
+                mdm_sum.div(&divisor).ok()?,
+            )
+        } else {
+            (tr_sum, pdm_sum, mdm_sum)
+        }
+    } else {
+        let rma = |previous: &Fraction, current: &Fraction| -> Option<Fraction> {
+            previous
+                .mul(&Fraction::from_u64((len - 1) as u64)).ok()?
+                .add(current).ok()?
+                .div(&Fraction::from_u64(len as u64)).ok()
+        };
+        (rma(&p.s_tr, &tr)?, rma(&p.s_pdm, &pdm)?, rma(&p.s_mdm, &mdm)?)
+    };
+
+    let (dx_count, dx_sum, adx) = if di_count < len {
+        (0, Fraction::zero(), None)
+    } else {
+        let dx = (|| -> Option<Fraction> {
+            if s_tr.is_zero() {
+                return Some(Fraction::zero());
             }
+            let pdi = s_pdm.div(&s_tr).ok()?;
+            let mdi = s_mdm.div(&s_tr).ok()?;
+            let sum = pdi.add(&mdi).ok()?;
+            if sum.is_zero() {
+                return Some(Fraction::zero());
+            }
+            pdi.sub(&mdi).ok()?.abs().ok()?.mul(&Fraction::from_u64(100)).ok()?.div(&sum).ok()
+        })()?;
+        if let Some(previous_adx) = p.adx.as_ref() {
+            let next = previous_adx
+                .mul(&Fraction::from_u64((len - 1) as u64)).ok()?
+                .add(&dx).ok()?
+                .div(&Fraction::from_u64(len as u64)).ok()?;
+            (len, p.dx_sum.clone(), Some(next))
+        } else {
+            let dx_count = p.dx_count + 1;
+            let dx_sum = p.dx_sum.add(&dx).ok()?;
+            let adx = if dx_count == len {
+                Some(dx_sum.div(&Fraction::from_u64(len as u64)).ok()?)
+            } else {
+                None
+            };
+            (dx_count, dx_sum, adx)
         }
-        None => (Fraction::zero(), Fraction::zero()),
     };
-    let s_tr = match prev {
-        Some(p) => rma(&p.s_tr, tr),
-        None => tr.clone(),
-    };
-    let s_pdm = match prev {
-        Some(p) => rma(&p.s_pdm, &pdm),
-        None => pdm,
-    };
-    let s_mdm = match prev {
-        Some(p) => rma(&p.s_mdm, &mdm),
-        None => mdm,
-    };
-    // DX = 100·|+DI − −DI| / (+DI + −DI); sıfır bölende DX=0 (trend yok)
-    let dx = (|| -> Option<Fraction> {
-        let pdi = s_pdm.div(&s_tr).ok()?;
-        let mdi = s_mdm.div(&s_tr).ok()?;
-        let sum = pdi.add(&mdi).ok()?;
-        if sum.is_zero() {
-            return Some(Fraction::zero());
-        }
-        let diff = pdi.sub(&mdi).ok()?.abs().ok()?;
-        diff.mul(&Fraction::from_u64(100)).and_then(|x| x.div(&sum)).ok()
-    })()
-    .unwrap_or_else(Fraction::zero);
-    let adx = match prev.and_then(|p| p.adx.clone()) {
-        Some(a) => rma(&a, &dx),
-        // Tohum: ilk ~len bar sonunda ADX, o ana kadarki DX ortalamasıyla başlar
-        None if s_tr.div(&len_f).map(|m| m >= *tr).unwrap_or(false) => dx.clone(),
-        None => return AdxPrev {
-            prev_high: high.clone(), prev_low: low.clone(), prev_close: close.clone(),
-            s_tr, s_pdm, s_mdm, adx: None,
-        },
-    };
-    AdxPrev { prev_high: high.clone(), prev_low: low.clone(), prev_close: close.clone(), s_tr, s_pdm, s_mdm, adx: Some(adx) }
+
+    Some(AdxPrev {
+        prev_high: high.clone(),
+        prev_low: low.clone(),
+        prev_close: close.clone(),
+        period: len,
+        s_tr,
+        s_pdm,
+        s_mdm,
+        di_count,
+        dx_count,
+        dx_sum,
+        adx,
+    })
 }
 
 fn rsi_of(ring: &[Value], len: usize) -> Value {
@@ -1580,6 +1630,82 @@ fn frac_display_trim(f: &Fraction) -> String {
         t.to_string()
     } else {
         s
+    }
+}
+
+#[cfg(test)]
+mod indicator_state_tests {
+    use super::{adx_step, supertrend_step, AdxPrev, StPrev, Value};
+    use dca_math::fraction::Fraction;
+
+    fn f(value: &str) -> Fraction {
+        Fraction::from_decimal_str(value).unwrap()
+    }
+
+    #[test]
+    fn adx_uses_wilder_seed_and_becomes_valid_after_two_periods_minus_one() {
+        let len = 3;
+        let mut state: Option<AdxPrev> = None;
+        for bar in 0..=2 * len {
+            let shift = bar as i64;
+            let high = Fraction::from_i64(11 + shift);
+            let low = Fraction::from_i64(9 + shift);
+            let close = Fraction::from_i64(10 + shift);
+            state = adx_step(state.as_ref(), &high, &low, &close, len);
+            let adx = state.as_ref().and_then(|s| s.adx.as_ref());
+            if bar < 2 * len - 1 {
+                assert!(adx.is_none(), "ADX must be Na at bar {bar}");
+            } else {
+                assert_eq!(adx, Some(&Fraction::from_u64(100)));
+            }
+        }
+    }
+
+    #[test]
+    fn adx_flat_market_returns_zero_after_warmup() {
+        let len = 2;
+        let mut state: Option<AdxPrev> = None;
+        for bar in 0..2 * len {
+            let high = f("10");
+            let low = f("10");
+            let close = f("10");
+            state = adx_step(state.as_ref(), &high, &low, &close, len);
+            let adx = state.as_ref().and_then(|s| s.adx.as_ref());
+            if bar < 2 * len - 1 {
+                assert!(adx.is_none(), "ADX must be Na at bar {bar}");
+            } else {
+                assert_eq!(adx, Some(&Fraction::zero()));
+            }
+        }
+    }
+
+    #[test]
+    fn supertrend_carries_bands_using_previous_close_before_direction_flip() {
+        let prev = StPrev {
+            prev_close: f("10"),
+            atr: f("2"),
+            final_upper: f("15"),
+            final_lower: f("5"),
+            dir: -1,
+        };
+        let high = f("14");
+        let low = f("10");
+        let close = f("16");
+        let tr = f("4");
+        let (line, next) = supertrend_step(
+            Some(&prev),
+            &high,
+            &low,
+            &close,
+            &tr,
+            &Fraction::one(),
+            1,
+        );
+        let next = next.expect("valid Supertrend state");
+        assert_eq!(next.dir, 1, "current close crosses the previous upper band");
+        assert_eq!(next.final_upper, f("15"), "current close must not rewrite carried upper band");
+        assert_eq!(next.final_lower, f("8"));
+        assert_eq!(line, Value::Num(f("8")));
     }
 }
 

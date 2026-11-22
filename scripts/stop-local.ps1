@@ -5,17 +5,12 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $runtimeDirectory = Join-Path $projectRoot '.local-runtime'
 $processFile = Join-Path $runtimeDirectory 'processes.json'
+$recordHelpers = Join-Path $PSScriptRoot 'process-records.ps1'
+. $recordHelpers
 $coreBinary = [System.IO.Path]::GetFullPath((Join-Path $projectRoot 'mini-services/dca-core/target/debug/dca_server.exe'))
 $nextEntry = (Join-Path $projectRoot 'node_modules/next/dist/bin/next').Replace('/', '\')
-$records = @()
-
-if (Test-Path -LiteralPath $processFile) {
-    try {
-        $records = @(Get-Content -LiteralPath $processFile -Raw | ConvertFrom-Json)
-    } catch {
-        Write-Output 'Invalid process record; no process will be stopped.'
-    }
-}
+$nextServerEntry = (Join-Path $projectRoot 'node_modules/next/dist/server/lib/start-server.js').Replace('/', '\')
+$records = Read-LocalProcessRecords -Path $processFile
 
 $stopped = 0
 foreach ($port in @(3002, 3000)) {
@@ -43,7 +38,8 @@ foreach ($port in @(3002, 3000)) {
             $commandLine = [string]$processInfo.CommandLine
             $normalizedCommand = $commandLine.Replace('/', '\')
             $owned = $normalizedCommand.IndexOf($nextEntry, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
-                $normalizedCommand.IndexOf('node_modules\next\dist\bin\next', [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+                $normalizedCommand.IndexOf('node_modules\next\dist\bin\next', [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+                $normalizedCommand.IndexOf($nextServerEntry, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
         }
 
         if ($owned) {
@@ -61,8 +57,15 @@ Start-Sleep -Milliseconds 800
 $remaining = @(
     Get-NetTCPConnection -State Listen -LocalPort 3000, 3002 -ErrorAction SilentlyContinue
 )
-if ($remaining.Count -eq 0 -and (Test-Path -LiteralPath $processFile)) {
+$activeRecords = @(
+    foreach ($record in $records) {
+        if (Get-Process -Id ([int]$record.Id) -ErrorAction SilentlyContinue) { $record }
+    }
+)
+if ($activeRecords.Count -eq 0) {
     Remove-Item -LiteralPath $processFile -ErrorAction SilentlyContinue
+} elseif (Test-Path -LiteralPath $processFile) {
+    Write-LocalProcessRecords -Path $processFile -Records $activeRecords
 }
 
 if ($stopped -eq 0) { Write-Output 'No verified local services were stopped.' }

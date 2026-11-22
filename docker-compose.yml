@@ -1,14 +1,13 @@
 version: "3.8"
 
 # Faz 28 (P0-1 hardening — bağımsız denetim §3 P0-1):
-#  - Sabit secret fallback'leri KALDIRILDI: DCA_API_KEY / DCA_VAULT_KEY host
-#    env'inden gelir; boşsa entrypoint rastgele üretip /app/data'da kalıcılar.
-#    (Eski sabit değerler env'i "dolu" gösterdiği için rastgele üretim yolu
-#    hiç devreye girmiyordu.)
+#  - Sabit secret fallback'leri KALDIRILDI: API/vault/session/UI secrets ayrı
+#    dcabot-secrets volume'unda kalıcıdır; eski data volume anahtarları ilk
+#    başlangıçta güvenli biçimde taşınır. *_FILE ile secret mount desteklenir.
 #  - Port yalnız loopback'e bağlanır: "127.0.0.1:3000:3000". Dış erişim
 #    TLS/VPN (Cloudflare Tunnel vb.) arkasından verilmelidir.
 #  - DCA_REQUIRE_AUTH=1 varsayılan: UI oturum açmadan yönetim API'sine
-#    erişemez. DCA_UI_PASSWORD boşsa entrypoint rastgele üretir + log yazar.
+#    erişemez. DCA_UI_PASSWORD boşsa parola secret volume'a üretilir; loga yazılmaz.
 #  - DCA_PORTFOLIO_MAX_DAILY_LOSS_PCT KALDIRILDI: motor bu değişkeni
 #    TÜKETMİYORDU (bağımsız denetim P1-2) — aktifmiş gibi sunmak yerine
 #    gerçek portföy kesicisi ayrı iş olarak planlanır.
@@ -21,26 +20,38 @@ services:
     image: dcabot:latest
     container_name: dcabot-terminal
     restart: unless-stopped
+    stop_grace_period: 90s
     ports:
       - "127.0.0.1:3000:3000"
     environment:
       - NODE_ENV=production
       - DCA_DB_PATH=/app/data/dcabot.sqlite3
+      - DCA_SECRET_DIR=/app/secrets
       - DCA_BYBIT_TESTNET=1
+      - DCA_BINANCE_TESTNET=1
+      - BINANCE_SPOT_BASE=https://testnet.binance.vision
+      - BINANCE_FUTURES_TESTNET_BASE=https://testnet.binancefuture.com
       - DCA_ALLOW_MAINNET=0
-      # Boş bırakılırsa entrypoint rastgele üretir ve /app/data içinde kalıcılar.
+      # Boş bırakılırsa entrypoint ayrı /app/secrets volume'unda rastgele üretir.
       - DCA_API_KEY=${DCA_API_KEY:-}
       - ENGINE_API_KEY=${ENGINE_API_KEY:-}
       - DCA_VAULT_KEY=${DCA_VAULT_KEY:-}
-      # UI oturumu: auth varsayılan AÇIK; parola host env'den, boşsa rastgele.
+      # UI oturumu: auth varsayılan AÇIK; parola ve imza anahtarı kalıcı güvenli volume'da üretilir.
       - DCA_REQUIRE_AUTH=1
       - DCA_UI_PASSWORD=${DCA_UI_PASSWORD:-}
+      - DCA_SESSION_SECRET=${DCA_SESSION_SECRET:-}
+      - DCA_API_KEY_FILE=${DCA_API_KEY_FILE:-}
+      - ENGINE_API_KEY_FILE=${ENGINE_API_KEY_FILE:-}
+      - DCA_VAULT_KEY_FILE=${DCA_VAULT_KEY_FILE:-}
+      - DCA_SESSION_SECRET_FILE=${DCA_SESSION_SECRET_FILE:-}
+      - DCA_UI_PASSWORD_FILE=${DCA_UI_PASSWORD_FILE:-}
       - DCA_PORTFOLIO_MAX_NOTIONAL_PCT=85
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
       - NOTIFY_WEBHOOK_URL=${NOTIFY_WEBHOOK_URL:-}
     volumes:
       - dcabot-data:/app/data
+      - dcabot-secrets:/app/secrets
     healthcheck:
       # Faz 28 (P1-6): yalnız UI değil — motor readiness'i de denetlenir.
       test: ["CMD-SHELL", "curl -sf http://127.0.0.1:3000/ && curl -sf http://127.0.0.1:3002/api/health"]
@@ -51,4 +62,6 @@ services:
 
 volumes:
   dcabot-data:
+    driver: local
+  dcabot-secrets:
     driver: local

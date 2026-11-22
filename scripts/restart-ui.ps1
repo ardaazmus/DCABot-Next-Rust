@@ -5,6 +5,8 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $runtimeDirectory = Join-Path $projectRoot '.local-runtime'
 $processFile = Join-Path $runtimeDirectory 'processes.json'
+$recordHelpers = Join-Path $PSScriptRoot 'process-records.ps1'
+. $recordHelpers
 
 # Keys: same persistent server-side file as start-local.ps1.
 $keysFile = Join-Path $runtimeDirectory 'local-keys.env'
@@ -17,11 +19,9 @@ if (Test-Path -LiteralPath $keysFile) {
     }
 }
 
-$records = @()
-if (Test-Path -LiteralPath $processFile) {
-    try { $records = @(Get-Content -LiteralPath $processFile -Raw | ConvertFrom-Json) } catch { throw 'Invalid local process record; UI was not stopped.' }
-}
+$records = Read-LocalProcessRecords -Path $processFile
 $nextEntry = (Join-Path $projectRoot 'node_modules/next/dist/bin/next').Replace('/', '\')
+$nextServerEntry = (Join-Path $projectRoot 'node_modules/next/dist/server/lib/start-server.js').Replace('/', '\')
 $old = Get-NetTCPConnection -State Listen -LocalPort 3000 -ErrorAction SilentlyContinue
 foreach ($listener in $old) {
     $processId = [int]$listener.OwningProcess
@@ -34,7 +34,8 @@ foreach ($listener in $old) {
     }
     $normalizedCommand = ([string]$processInfo.CommandLine).Replace('/', '\')
     $isThisNext = $normalizedCommand.IndexOf($nextEntry, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
-        $normalizedCommand.IndexOf('node_modules\next\dist\bin\next', [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+        $normalizedCommand.IndexOf('node_modules\next\dist\bin\next', [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+        $normalizedCommand.IndexOf($nextServerEntry, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
     if (-not $matchesRecord -or -not $isThisNext) {
         throw ("Port 3000 is occupied by an unverified process (PID {0}); refusing to stop it." -f $processId)
     }
@@ -65,5 +66,5 @@ New-Item -ItemType Directory -Force -Path $runtimeDirectory | Out-Null
 $process = Get-Process -Id $proc.Id
 $records = @($records | Where-Object { $_.Name -ne 'node' })
 $records += @{ Id = $proc.Id; Name = $proc.ProcessName; Started = $process.StartTime.ToUniversalTime().Ticks }
-$records | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $processFile -Encoding UTF8
+Write-LocalProcessRecords -Path $processFile -Records $records
 Write-Output "ui restarted (PID $($proc.Id))"

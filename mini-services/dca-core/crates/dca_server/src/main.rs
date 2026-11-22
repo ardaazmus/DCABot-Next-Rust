@@ -35,11 +35,12 @@ use dca_math::fraction::Fraction;
 use dca_math::Instrument;
 use dca_strategy::dca::DcaPhase;
 use dca_strategy::{certify, certify_verdict, run_backtest, BotConfig, StrategyKind};
+use futures_util::FutureExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use crate::routes_common::{err403, err404, err422, fill_marks_json, is_blacklisted, normalize_pair, parse_kind};
 use state::{AppState, SseEvent};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -107,6 +108,74 @@ async fn acquire_bot_poll_guard(app: &AppState, bot_id: &str) -> tokio::sync::Ow
     lock.lock_owned().await
 }
 
+fn normalized_live_market(venue: &str, symbol: &str) -> (String, String) {
+    (venue.trim().to_ascii_uppercase(), symbol.trim().to_ascii_uppercase())
+}
+
+fn live_status_requires_ownership(status: &str, exposure: bool, open_orders: bool, pending_actions: bool) -> bool {
+    !status.eq_ignore_ascii_case("STOPPED") || exposure || open_orders || pending_actions
+}
+
+fn live_runtime_has_ownership(rt: &state::BotRuntime) -> bool {
+    let main_exposure = !rt.stepper.position.qty.is_zero();
+    let hedge_exposure = rt.hedge_stepper.as_ref().is_some_and(|stepper| !stepper.position.qty.is_zero());
+    live_status_requires_ownership(
+        &rt.status,
+        main_exposure || hedge_exposure,
+        !rt.live_open_orders.is_empty(),
+        !rt.pending_live_intents.is_empty() || !rt.pending_engine_actions.is_empty(),
+    )
+}
+
+fn duplicate_live_markets<'a>(
+    rows: impl IntoIterator<Item = (&'a str, &'a str, &'a str, &'a str)>,
+) -> HashSet<(String, String)> {
+    let mut counts = HashMap::<(String, String), usize>::new();
+    for (venue, mode, symbol, status) in rows {
+        if mode.eq_ignore_ascii_case("LIVE") && matches!(status, "RUNNING" | "PAUSED" | "FROZEN") {
+            *counts.entry(normalized_live_market(venue, symbol)).or_default() += 1;
+        }
+    }
+    counts.into_iter().filter_map(|(market, count)| (count > 1).then_some(market)).collect()
+}
+
+fn competing_live_bot(
+    runtimes: &HashMap<String, state::BotRuntime>,
+    except_id: &str,
+    venue: &str,
+    symbol: &str,
+) -> Option<String> {
+    let requested = normalized_live_market(venue, symbol);
+    runtimes.iter().find_map(|(id, rt)| {
+        let existing = normalized_live_market(&rt.venue, &rt.cfg.symbol);
+        (id != except_id
+            && rt.mode.eq_ignore_ascii_case("LIVE")
+            && existing == requested
+            && live_runtime_has_ownership(rt))
+            .then(|| id.clone())
+    })
+}
+
+async fn lock_live_ownership(
+    app: &AppState,
+    except_id: &str,
+    venue: &str,
+    symbol: &str,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    let guard = app.live_ownership_lock.clone().lock_owned().await;
+    let conflict = {
+        let runtimes = app.runtimes.lock().await;
+        competing_live_bot(&runtimes, except_id, venue, symbol)
+    };
+    if let Some(id) = conflict {
+        let (venue, symbol) = normalized_live_market(venue, symbol);
+        return Err(format!(
+            "LIVE market ownership conflict: bot {id} already owns or may own {venue} {symbol}; account-wide position data cannot be safely attributed to a second bot"
+        ));
+    }
+    Ok(guard)
+}
+
 #[tokio::main]
 async fn main() {
     // Ingest .env if present (root or local) before setting up adapters/db
@@ -146,37 +215,93 @@ async fn main() {
     let vault = Vault::new(&db).expect("vault");
     let (app_state, rx) = AppState::new(db, vault);
 
-    // Background supervisor: poll running bots every 20s
-    {
+    // Background supervisor: poll running bots every 20s. All poll tasks are
+    // owned by this task so shutdown can stop scheduling and drain order work.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let supervisor_handle = {
         let st = app_state.clone();
+        let mut shutdown_rx = shutdown_rx;
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(20));
+            let mut poll_tasks = tokio::task::JoinSet::<String>::new();
+            let mut in_flight = HashSet::<String>::new();
             loop {
-                tick.tick().await;
-                let ids: Vec<(String, String)> = {
-                    let rts = st.runtimes.lock().await;
-                    // Faz 3 (H-10 kalıntısı): PAUSED/STOPPED botlar da poll edilir — açık emirlerin
-                // dolum takibi (execution sweep) sürer; strateji kararı poll_inner'da kapalıdır.
-                rts.iter().filter(|(_, rt)| matches!(rt.status.as_str(), "RUNNING" | "FROZEN" | "PAUSED" | "STOPPED")).map(|(id, rt)| (id.clone(), rt.venue.clone())).collect()
-                };
-                for (id, _venue) in ids {
-                    let st2 = st.clone();
-                    let id2 = id.clone();
-                    // Faz 13 (ilk dilim): botlar aynı ana sıkışmasın — bot-kimliğinden
-                    // türetilen jitter (0..2.4 sn) poll'u dağıtır; tek yavaş venue
-                    // tüm botları aynı turda kilitlemez.
-                    let jitter = (id2.bytes().map(|b| b as u64).sum::<u64>() % 1200) as u64;
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(jitter)).await;
-                        if let Err(e) = engine::poll_and_advance(&st2, &id2, &st2.sse).await {
-                            tracing::warn!("bot {id2} poll error: {e}");
-                            state::persist_event(&st2, &id2, "ERROR", "POLL", &e).await;
+                tokio::select! {
+                    _ = tick.tick() => {
+                        let ids: Vec<(String, String)> = {
+                            let rts = st.runtimes.lock().await;
+                            // PAUSED/STOPPED botlar da poll edilir: açık emirlerin fill takibi sürer.
+                            rts.iter()
+                                .filter(|(_, rt)| matches!(rt.status.as_str(), "RUNNING" | "FROZEN" | "PAUSED" | "STOPPED"))
+                                .map(|(id, rt)| (id.clone(), rt.venue.clone()))
+                                .collect()
+                        };
+                        for (id, _venue) in ids {
+                            if !in_flight.insert(id.clone()) {
+                                continue;
+                            }
+                            let st2 = st.clone();
+                            let id2 = id.clone();
+                            // Bot-kimliğinden türetilen jitter poll'u dağıtır.
+                            let jitter = (id2.bytes().map(|b| b as u64).sum::<u64>() % 1200) as u64;
+                            poll_tasks.spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(jitter)).await;
+                                let outcome = std::panic::AssertUnwindSafe(
+                                    engine::poll_and_advance(&st2, &id2, &st2.sse),
+                                )
+                                .catch_unwind()
+                                .await;
+                                match outcome {
+                                    Ok(Ok(_)) => {}
+                                    Ok(Err(e)) => {
+                                        tracing::warn!("bot {id2} poll error: {e}");
+                                        state::persist_event(&st2, &id2, "ERROR", "POLL", &e).await;
+                                    }
+                                    Err(_) => {
+                                        let e = "poll task panicked";
+                                        tracing::error!("bot {id2} {e}");
+                                        state::persist_event(&st2, &id2, "ERROR", "POLL", e).await;
+                                    }
+                                }
+                                id2
+                            });
                         }
-                    });
+                    }
+                    joined = poll_tasks.join_next(), if !poll_tasks.is_empty() => {
+                        match joined {
+                            Some(Ok(id)) => { in_flight.remove(&id); }
+                            Some(Err(e)) => {
+                                tracing::error!("bot poll task join failed: {e}");
+                                in_flight.clear();
+                            }
+                            None => {}
+                        }
+                    }
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
                 }
             }
-        });
-    }
+
+            tracing::info!("[shutdown] New bot polls stopped; draining in-flight bot work.");
+            let drain = async {
+                while let Some(joined) = poll_tasks.join_next().await {
+                    match joined {
+                        Ok(id) => { in_flight.remove(&id); }
+                        Err(e) => tracing::error!("bot poll task failed during drain: {e}"),
+                    }
+                }
+            };
+            if tokio::time::timeout(std::time::Duration::from_secs(45), drain).await.is_err() {
+                tracing::error!("[shutdown] Poll drain exceeded 45s; aborting remaining tasks before snapshot persistence.");
+                poll_tasks.abort_all();
+                while poll_tasks.join_next().await.is_some() {}
+            }
+            tracing::info!("[shutdown] Bot poll tasks drained.");
+        })
+    };
 
     // Faz 0.2/0.3 — şalter durumunu olay akışından geri yükle (restart-safe),
     // sonra kalıcı RUNNING botları kur (ilk poll şalterli başlar).
@@ -377,18 +502,52 @@ async fn main() {
         )
         .with_state(app_state.clone());
 
-    let shutdown_state = app_state.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3002").await.expect("bind 3002");
     tracing::info!("dca-core engine listening on :3002");
     // Faz 28 (P2-1): ConnectInfo servis eder — rate limiter gerçek istemci
     // IP'sini (XFF yoksa) okur.
-    axum::serve(
+    let serve_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-        .with_graceful_shutdown(shutdown_signal(shutdown_state))
+        .with_graceful_shutdown(shutdown_signal(shutdown_tx.clone()))
         .await
-        .unwrap();
+        ;
+    if let Err(e) = &serve_result {
+        tracing::error!("HTTP server stopped with an error: {e}");
+        shutdown_tx.send_replace(true);
+    }
+    if let Err(e) = supervisor_handle.await {
+        tracing::error!("bot supervisor failed during shutdown: {e}");
+    }
+
+    // No request or bot poll can mutate runtimes now. Persist one final copy
+    // per bot before checkpointing the WAL.
+    {
+        let runtimes = app_state.runtimes.lock().await;
+        for (id, runtime) in runtimes.iter() {
+            state::save_runtime_state(&app_state, id, runtime);
+        }
+    }
+    match app_state.db.conn.lock() {
+        Ok(conn) => match conn.query_row(
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+        ) {
+            Ok((busy, log_frames, checkpointed_frames)) if busy == 0 && checkpointed_frames >= log_frames => {
+                tracing::info!("[shutdown] Final WAL checkpoint completed ({checkpointed_frames}/{log_frames} frames).");
+            }
+            Ok((busy, log_frames, checkpointed_frames)) => {
+                tracing::error!("[shutdown] WAL checkpoint incomplete (busy={busy}, checkpointed={checkpointed_frames}/{log_frames}).");
+            }
+            Err(e) => tracing::error!("[shutdown] WAL checkpoint failed: {e}"),
+        },
+        Err(e) => tracing::error!("[shutdown] Could not lock database for final checkpoint: {e}"),
+    }
+    if let Err(e) = serve_result {
+        panic!("HTTP server failed: {e}");
+    }
 }
 
 /// Faz 7: hazır strateji kütüphanesi — sektör-standart klasikler (bütün metin
@@ -428,7 +587,7 @@ async fn seed_pine_library(app: &Arc<AppState>) {
 }
 
 /// Faz 0.9 (B-4): SIGINT / SIGTERM graceful shutdown — bağlantıları durdurur, WAL checkpoint (TRUNCATE) yapar
-async fn shutdown_signal(app_state: Arc<AppState>) {
+async fn shutdown_signal(shutdown_tx: tokio::sync::watch::Sender<bool>) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -451,11 +610,8 @@ async fn shutdown_signal(app_state: Arc<AppState>) {
         _ = terminate => {},
     }
 
-    tracing::info!("[shutdown] Graceful shutdown tetiklendi: SQLite WAL checkpoint yapılıyor...");
-    if let Ok(conn) = app_state.db.conn.lock() {
-        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-    }
-    tracing::info!("[shutdown] WAL checkpoint tamamlandı. Motor güvenle kapatılıyor.");
+    tracing::info!("[shutdown] Graceful shutdown triggered; stopping poll scheduling.");
+    shutdown_tx.send_replace(true);
 }
 
 /// Faz 0.6 (B-4): Prometheus metrik ucu (/metrics)
@@ -799,7 +955,15 @@ async fn restore_bots(app: &Arc<AppState>) {
             None => Vec::new(),
         }
     };
-    for (id, name, _kind, venue, mode, _symbol, status, interval, start_cash) in rows {
+    let ambiguous_live_markets = duplicate_live_markets(rows.iter().map(
+        |(_, _, _, venue, mode, symbol, status, _, _)| {
+            (venue.as_str(), mode.as_str(), symbol.as_str(), status.as_str())
+        },
+    ));
+
+    for (id, name, _kind, venue, mode, symbol, status, interval, start_cash) in rows {
+        let ambiguous_live_market = mode.eq_ignore_ascii_case("LIVE")
+            && ambiguous_live_markets.contains(&normalized_live_market(&venue, &symbol));
         let (cfg_json,): (String,) = match app.db.conn.lock() {
             Ok(conn) => match conn.query_row("SELECT config FROM bots WHERE id=?1", [&id], |r| r.get(0)) {
                 Ok(v) => (v,),
@@ -853,13 +1017,24 @@ async fn restore_bots(app: &Arc<AppState>) {
                 }
             }
         }
-        if let Err(e) = state::create_runtime(app, &id, &name, &effective_mode, &venue, &status, cfg, &interval, start_cash, credentials).await {
+        let restored_status = if ambiguous_live_market && effective_mode == "LIVE" { "FROZEN" } else { &status };
+        if let Err(e) = state::create_runtime(app, &id, &name, &effective_mode, &venue, restored_status, cfg, &interval, start_cash, credentials).await {
             tracing::warn!("restore bot {id} failed: {e}");
+        } else if ambiguous_live_market && effective_mode == "LIVE" {
+            state::persist_status(app, &id, "FROZEN");
+            state::persist_event(
+                app,
+                &id,
+                "CRITICAL",
+                "LIVE_OWNERSHIP",
+                "aynı venue/sembolde birden fazla LIVE bot bulundu; hesap-geneli pozisyon güvenle atanamadığı için bot FROZEN açıldı ve pozisyon reconcile edilmedi",
+            )
+            .await;
         }
     }
     // BOT-03: yeniden başlatmada açık pozisyon ve emirleri geri yükle —
     //会場 ile uzlaştırma; yeni risk açılmadan önce yerel ayna senkronize edilir.
-    reconcile_restored_bots(app).await;
+    reconcile_restored_bots(app, &ambiguous_live_markets).await;
 }
 
 /// BOT-03: restore edilen RUNNING/PAUSED/FROZEN botları venue ile uzlaştır:
@@ -887,7 +1062,7 @@ fn restored_order_semantics(bot_id: &str, order_id: &str) -> Option<(&'static st
     Some(role)
 }
 
-async fn reconcile_restored_bots(app: &Arc<AppState>) {
+async fn reconcile_restored_bots(app: &Arc<AppState>, ambiguous_live_markets: &HashSet<(String, String)>) {
     let bot_ids: Vec<String> = {
         let rts = app.runtimes.lock().await;
         rts.iter().filter(|(_, rt)| rt.status == "RUNNING" || rt.status == "PAUSED" || rt.status == "FROZEN").map(|(id, _)| id.clone()).collect()
@@ -909,6 +1084,11 @@ async fn reconcile_restored_bots(app: &Arc<AppState>) {
         };
         // Yalnız LIVE botlar için venue'den pozisyon/emir alınabilir.
         if mode != "LIVE" {
+            continue;
+        }
+        if ambiguous_live_markets.contains(&normalized_live_market(&venue, &symbol)) {
+            // Do not assign an account-wide aggregate position to every bot
+            // that shares this venue/symbol after an older deployment restore.
             continue;
         }
         let Some(creds) = creds_opt else {
@@ -1728,6 +1908,14 @@ async fn create_bot(State(app): State<Arc<AppState>>, Json(req): Json<CreateBotR
     let short_uuid = format!("{}", Uuid::new_v4().simple());
     let id = format!("b-{}", short_uuid.chars().take(8).collect::<String>());
     let mode = req.mode.to_uppercase();
+    if !matches!(mode.as_str(), "PAPER" | "LIVE") {
+        return Err(err422(format!("geçersiz mode '{mode}' — geçerli değerler: PAPER | LIVE")));
+    }
+    let _live_ownership_guard = if mode == "LIVE" {
+        Some(lock_live_ownership(&app, "", &req.venue, &cfg.symbol).await.map_err(err422)?)
+    } else {
+        None
+    };
     let status = "RUNNING";
     // M-5: start_cash pozitif olmalı — negatif/sıfır sermaye anlamsız bir
     // kurulumun G6'yı hiç test etmeden geçmesine yol açardı.
@@ -2022,6 +2210,20 @@ struct PatchBotReq {
 }
 
 async fn patch_bot(State(app): State<Arc<AppState>>, Path(id): Path<String>, Json(req): Json<PatchBotReq>) -> Result<Json<Value>, axum::response::Response> {
+    let _live_ownership_guard = if req.status.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("RUNNING")) {
+        let identity = {
+            let runtimes = app.runtimes.lock().await;
+            runtimes.get(&id).filter(|rt| rt.mode.eq_ignore_ascii_case("LIVE"))
+                .map(|rt| (rt.venue.clone(), rt.cfg.symbol.clone()))
+        };
+        if let Some((venue, symbol)) = identity {
+            Some(lock_live_ownership(&app, &id, &venue, &symbol).await.map_err(err422)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let mut rts = app.runtimes.lock().await;
     let rt = rts.get_mut(&id).ok_or_else(|| err422("bot not found"))?;
     if req.status.is_some() {
@@ -2092,49 +2294,68 @@ async fn patch_bot(State(app): State<Arc<AppState>>, Path(id): Path<String>, Jso
 
 /// BOT-07: silmeden önce açık venue emirleri iptal edilir (sahipsiz bırakılmaz).
 async fn delete_bot(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, axum::response::Response> {
-    // LIVE botun açık emirlerini iptal et.
-    let (is_live, creds_opt, venue_str, category_str, symbol_str) = {
-        let rts = app.runtimes.lock().await;
-        let rt = match rts.get(&id) {
+    // Serialize deletion with the bot's in-flight poll/order cascade. The
+    // guard is per bot, so unrelated bots continue while venue cancellations
+    // run without holding the shared runtime map lock.
+    let _poll_guard = acquire_bot_poll_guard(&app, &id).await;
+    // LIVE botun açık emirlerini iptal et. Mark STOPPED before network I/O so
+    // a failed cancel leaves a visible, retained bot that cannot add risk.
+    let (is_live, creds_opt, venue_str, category_str, symbol_str, snapshot) = {
+        let mut rts = app.runtimes.lock().await;
+        let rt = match rts.get_mut(&id) {
             Some(r) => r,
             None => return Err(err404("bot not found")),
         };
         // Arena 1.10 Düzeltmesi: LIVE açık pozisyonu varken bot silinemez (sahipsiz pozisyon kalmaması için fail-closed)
-        if rt.mode == "LIVE" && !rt.stepper.position.qty.is_zero() {
+        let live_exposure = !rt.stepper.position.qty.is_zero()
+            || rt.hedge_stepper.as_ref().is_some_and(|stepper| !stepper.position.qty.is_zero());
+        if rt.mode == "LIVE" && live_exposure {
             return Err(err422(format!(
-                "Açık pozisyonu olan LIVE bot silinemez (Açık miktar: {}). Lütfen önce 'Tümünü Kapat' (PANIC) ile pozisyonu kapatın veya işlemin tamamlanmasını bekleyin.",
-                rt.stepper.position.qty.to_half_even_display(8)
+                "Açık pozisyonu olan LIVE bot silinemez (ana miktar: {}, hedge miktarı: {}). Önce tüm bacakları kapatıp pozisyon uzlaşmasını bekleyin.",
+                rt.stepper.position.qty.to_half_even_display(8),
+                rt.hedge_stepper.as_ref().map(|stepper| stepper.position.qty.to_half_even_display(8)).unwrap_or_else(|| "0".into())
             )));
         }
+        rt.status = "STOPPED".into();
+        state::persist_status(&app, &id, "STOPPED");
+        let snapshot = rt.snapshot_json();
         (
             rt.mode == "LIVE",
             rt.credentials.clone(),
             rt.venue.clone(),
             if rt.cfg.kind.is_futures() { "linear".to_string() } else { "spot".to_string() },
             rt.cfg.symbol.clone(),
+            snapshot,
         )
     };
+    app.ui_cache.lock().await.insert(id.clone(), snapshot);
+    let _ = app.sse.send(SseEvent {
+        event: "BOT_STATE".into(),
+        data: json!({"botId": id, "status": "STOPPED", "action": "DELETING"}).to_string(),
+    });
     if is_live {
-        if let (Some(creds), Some(adapter)) = (creds_opt, app.adapter(&venue_str)) {
-            match adapter.open_orders(&creds, &category_str, &symbol_str).await {
-                Ok(orders) => {
-                    // Faz 23 (derin inceleme): yalnız SİLİNEN botun emirleri
-                    // iptal edilir — eski kod aynı hesapta aynı sembolde işlem
-                    // yapan DİĞER botların mesh/safety/TP emirlerini de
-                    // iptal ediyordu; o botlar takip ettikleri emirlerin
-                    // kaybolmasını "fail-closed kayıp" olarak görüyordu.
-                    let prefix = format!("{id}-");
-                    for o in &orders {
-                        if !o.order_link_id.starts_with(&prefix) {
-                            continue;
-                        }
-                        let _ = adapter.cancel_order(&creds, &category_str, &symbol_str, &o.order_link_id).await;
-                    }
-                }
-                Err(e) => {
-                    state::persist_event(&*app, &id, "WARN", "DELETE", &format!("open order listesi alınamadı: {e}")).await;
-                }
+        let creds = creds_opt.ok_or_else(|| err422("LIVE bot silinmedi: aktif kasa anahtarı olmadan açık emir güvenle uzlaştırılamaz"))?;
+        let adapter = app.adapter(&venue_str).ok_or_else(|| err422("LIVE bot silinmedi: venue adapter bulunamadı"))?;
+        let orders = match adapter.open_orders(&creds, &category_str, &symbol_str).await {
+            Ok(orders) => orders,
+            Err(e) => {
+                state::persist_event(&*app, &id, "WARN", "DELETE", &format!("open order listesi alınamadı; bot silinmedi: {e}")).await;
+                return Err(err422(format!("LIVE bot silinmedi: açık emirler doğrulanamadı ({e})")));
             }
+        };
+        // Only this bot's order ids are canceled. Any failed cancellation keeps
+        // the runtime available for fill reconciliation and a safe retry.
+        let prefix = format!("{id}-");
+        let mut failed = Vec::new();
+        for order in orders.iter().filter(|order| order.order_link_id.starts_with(&prefix)) {
+            if let Err(e) = adapter.cancel_order(&creds, &category_str, &symbol_str, &order.order_link_id).await {
+                failed.push(format!("{}: {e}", order.order_link_id));
+            }
+        }
+        if !failed.is_empty() {
+            let detail = failed.join("; ");
+            state::persist_event(&*app, &id, "CRITICAL", "DELETE", &format!("emir iptali başarısız; bot silinmedi: {detail}")).await;
+            return Err(err422(format!("LIVE bot silinmedi; bazı emirler iptal edilemedi: {detail}")));
         }
     }
     app.runtimes.lock().await.remove(&id);
@@ -2252,10 +2473,24 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
         }
         let _ = (mark, step_size); // PAPER: normal akışa düş
     }
+    let _live_ownership_guard = if matches!(req.action.as_str(), "START" | "UNFREEZE") {
+        let live_identity = {
+            let rts = app.runtimes.lock().await;
+            rts.get(&id).filter(|rt| rt.mode.eq_ignore_ascii_case("LIVE"))
+                .map(|rt| (rt.venue.to_uppercase(), rt.cfg.symbol.clone()))
+        };
+        if let Some((venue, symbol)) = live_identity {
+            Some(lock_live_ownership(&app, &id, &venue, &symbol).await.map_err(err422)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let (_start_poll_guard, mut start_credentials) = if req.action == "START" {
         let live_venue = {
             let rts = app.runtimes.lock().await;
-            rts.get(&id).filter(|rt| rt.mode == "LIVE").map(|rt| rt.venue.to_uppercase())
+            rts.get(&id).filter(|rt| rt.mode.eq_ignore_ascii_case("LIVE")).map(|rt| rt.venue.to_uppercase())
         };
         if let Some(venue) = live_venue {
             let guard = acquire_bot_poll_guard(&app, &id).await;
@@ -4616,5 +4851,33 @@ mod rate_limit_tests {
         assert_eq!(restored_order_semantics("b-1234abcd", "b-1234abcd-7-SAFETY-2"), Some(("SAFETY", OrderKind::Add)));
         assert_eq!(restored_order_semantics("b-1234abcd", "b-9876abcd-7-TPL-0"), None);
         assert_eq!(restored_order_semantics("b-1234abcd", "b-1234abcd-7-UNKNOWN-0"), None);
+    }
+
+    #[test]
+    fn live_market_identity_is_case_and_whitespace_insensitive() {
+        assert_eq!(
+            normalized_live_market(" bybit ", " btcusdt "),
+            normalized_live_market("BYBIT", "BTCUSDT")
+        );
+    }
+
+    #[test]
+    fn only_one_restored_active_live_bot_may_own_a_venue_symbol() {
+        let duplicates = duplicate_live_markets([
+            ("Bybit", "LIVE", " btcusdt", "RUNNING"),
+            ("BYBIT", "live", "BTCUSDT ", "PAUSED"),
+            ("OKX", "LIVE", "BTC-USDT-SWAP", "RUNNING"),
+            ("BYBIT", "PAPER", "BTCUSDT", "RUNNING"),
+            ("BINANCE", "LIVE", "ETHUSDT", "STOPPED"),
+        ]);
+        assert_eq!(duplicates, HashSet::from([("BYBIT".into(), "BTCUSDT".into())]));
+    }
+
+    #[test]
+    fn stopped_live_bot_keeps_ownership_while_it_has_exposure_or_orders() {
+        assert!(!live_status_requires_ownership("STOPPED", false, false, false));
+        assert!(live_status_requires_ownership("STOPPED", true, false, false));
+        assert!(live_status_requires_ownership("STOPPED", false, true, false));
+        assert!(live_status_requires_ownership("PAUSED", false, false, false));
     }
 }

@@ -6,6 +6,8 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $runtimeDirectory = Join-Path $projectRoot '.local-runtime'
 $coreBinary = Join-Path $projectRoot 'mini-services/dca-core/target/debug/dca_server.exe'
 $processFile = Join-Path $runtimeDirectory 'processes.json'
+$recordHelpers = Join-Path $PSScriptRoot 'process-records.ps1'
+. $recordHelpers
 
 # Keys: same persistent file as start-local.ps1.
 $keysFile = Join-Path $runtimeDirectory 'local-keys.env'
@@ -18,10 +20,7 @@ Get-Content -LiteralPath $keysFile | ForEach-Object {
 }
 if (-not $env:DCA_API_KEY -or -not $env:DCA_VAULT_KEY) { throw "anahtarlar okunamadi" }
 
-$records = @()
-if (Test-Path -LiteralPath $processFile) {
-    try { $records = @(Get-Content -LiteralPath $processFile -Raw | ConvertFrom-Json) } catch { throw 'Invalid local process record; engine was not stopped.' }
-}
+$records = Read-LocalProcessRecords -Path $processFile
 $expectedBinary = [System.IO.Path]::GetFullPath($coreBinary)
 $old = Get-NetTCPConnection -State Listen -LocalPort 3002 -ErrorAction SilentlyContinue
 foreach ($listener in $old) {
@@ -62,5 +61,5 @@ New-Item -ItemType Directory -Force -Path $runtimeDirectory | Out-Null
 $started = Get-Process -Id $proc.Id
 $records = @($records | Where-Object { $_.Name -ne 'dca_server' })
 $records += @{ Id = $proc.Id; Name = $proc.ProcessName; Started = $started.StartTime.ToUniversalTime().Ticks }
-$records | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $processFile -Encoding UTF8
+Write-LocalProcessRecords -Path $processFile -Records $records
 Write-Output "engine restarted (PID $($proc.Id))"

@@ -8,6 +8,18 @@
 
 use crate::types::{BarData, IndicatorKey, IndicatorSpec};
 
+fn convex_update(previous: f64, value: f64, weight: f64) -> f64 {
+    if previous.is_sign_positive() == value.is_sign_positive() {
+        // Same-sign subtraction cannot exceed the finite input range, and this
+        // form preserves a constant series even at the edge of f64::MAX.
+        previous + (value - previous) * weight
+    } else {
+        // Opposite signs can overflow in `value - previous`; use a fused
+        // weighted sum so cancellation happens before the final rounding.
+        previous.mul_add(1.0 - weight, value * weight)
+    }
+}
+
 /// EMA over an arbitrary series (reusable helper; MACD signal line uses it).
 /// Assumes NaNs only at the LEADING edge. Seed = SMA of the first `period` values
 /// (placed at index `first_valid + period - 1`), then `v*alpha + prev*(1-alpha)`
@@ -24,15 +36,18 @@ pub fn ema_of_series(values: &[f64], period: usize) -> Vec<f64> {
     if n - f0 < period {
         return out;
     }
-    let mut sum = 0.0;
-    for v in &values[f0..f0 + period] {
-        sum += v;
+    let mut prev: f64 = 0.0;
+    for (i, value) in values[f0..f0 + period].iter().copied().enumerate() {
+        let weight = 1.0 / (i + 1) as f64;
+        // A conventional sum can overflow even when the mean is representable
+        // (for example, several finite values near f64::MAX). Compute the
+        // running mean as a convex combination and fuse the final addition.
+        prev = convex_update(prev, value, weight);
     }
-    let mut prev = sum / period as f64;
     out[f0 + period - 1] = prev;
     let alpha = 2.0 / (period as f64 + 1.0);
     for i in f0 + period..n {
-        prev = values[i] * alpha + prev * (1.0 - alpha);
+        prev = convex_update(prev, values[i], alpha);
         out[i] = prev;
     }
     out
@@ -426,6 +441,17 @@ mod tests {
         assert!((ema[2] - 2.0).abs() < 1e-12);
         assert!((ema[3] - 3.0).abs() < 1e-12);
         assert!((ema[4] - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn ema_handles_finite_values_whose_raw_seed_sum_overflows() {
+        let closes = [f64::MAX, f64::MAX, f64::MAX, f64::MAX];
+        let bars = bars_from_closes(&closes);
+        let ema = compute_ema(&bars, 3);
+        assert!(ema[..2].iter().all(|value| value.is_nan()));
+        assert!(ema[2..].iter().all(|value| value.is_finite()));
+        assert_eq!(ema[2], f64::MAX);
+        assert_eq!(ema[3], f64::MAX);
     }
 
     #[test]

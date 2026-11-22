@@ -32,6 +32,11 @@ Bu belge kaynak rapordaki maddelerin repo üzerindeki uygulama durumunu kaydeder
 - Sertifikasyon trial'ları farklı uzunluktaysa ortak uzunluğa kırpılıyor.
 - Yeniden başlatmada borsa hesap-geneli açık emir listesinden yalnız bot kimliğiyle başlayan emirler alınıyor. Bilinen BASE/SAFETY/TP/SL/TRAIL/MANUAL/GRID rollerinin `Add`/`Reduce` anlamı korunuyor. Botun kendi emir kimliği çözülemiyorsa bot FROZEN oluyor.
 - Terminal dolum yedeğinde borsa toplam komisyonundan önceden işlenmiş komisyon çıkarılıyor; kalan dolum komisyonu ikinci kez yazılmıyor.
+- LIVE bot sahipliği, normalize edilmiş venue/sembol çifti için kurulum, START, UNFREEZE ve RUNNING yaması sırasında seri biçimde denetleniyor; aynı piyasa için ikinci LIVE bot reddediliyor. Eski veride çakışan aktif LIVE botlar yeniden başlatmada FROZEN yapılıyor ve hesap-geneli pozisyon bu botlara atanmak yerine uzlaştırma atlanıyor. Silme, bot poll kilidini bekleyip durumu önce STOPPED yapıyor; LIVE silme ayrıca ana ve hedge pozisyonlarını, açık emir listesini ve iptal sonuçlarını doğruluyor. Doğrulama/iptal başarısızsa bot kayıtları korunuyor ve yeni risk üretemiyor.
+- Engine SIGINT/SIGTERM'de yeni poll planlamasını durduruyor, süren poll/order cascade'lerini 45 saniyeye kadar drenaj ediyor, son runtime snapshot'larını yazıyor ve en son WAL checkpoint deniyor. Docker stop süresi 90 saniyeye çıkarıldı.
+- Pine ADX artık Wilder DI ve DX tohumlarını doğru warmup boyunca taşıyor; ilk ADX `2×len−1` indeksinde beliriyor. Sıfır true-range piyasası sıfır ADX üretip durumu sıfırlamıyor. Supertrend son bantlarını önceki bar kapanışıyla taşıyor. Sinyal EMA'sında taşan ham toplamla SMA tohumu yerine taşmaya dayanıklı ağırlıklı ortalama kullanılıyor.
+- Docker sırları data volume'dan ayrı korumalı volume'a taşındı; API, kasa, session ve UI sırları için `*_FILE` desteği ve eski `.api_key`/`.vault_key` geçişi eklendi. Üretilen sırlar loglanmıyor. Session secret kalıcı üretiliyor; test container'larında Binance spot/futures testnet varsayılanı açık. Giriş betiği POSIX `/bin/sh` ile uyumlu sinyal/çıkış yönetimi kullanıyor.
+- Windows yerel süreç kayıtları ortak bir doğrulayıcıyla normalize ediliyor; eski iç içe JSON kayıtları PID/start-time/name alanlarına ayrılıyor. Durdurma yalnız kaydı ve gerçek executable/Next `start-server.js` komutunu doğrulayan PID'lere uygulanıyor. UI yeniden başlatma ve durdurma artık Next'in çalışan gerçek entrypoint'ini tanıyor.
 
 ### UI/UX ve veri gösterimi
 
@@ -44,23 +49,22 @@ Bu belge kaynak rapordaki maddelerin repo üzerindeki uygulama durumunu kaydeder
 
 ## Doğrulama
 
-- `cargo test --locked --offline --workspace --quiet`: geçti (359 test).
+- `cargo test --locked --offline --workspace --quiet`: geçti (361 test).
 - `npx tsc --noEmit`: geçti.
 - `npm run test:auth`: geçti (8 test).
 - Değiştirilen lint temiz UI dosyalarında hedefli ESLint: geçti.
 - Güncel motor ve UI yerelde PAPER kipinde çalışıyor: `http://127.0.0.1:3000/` HTTP 200, `http://127.0.0.1:3002/api/health` `ok`, API bot listesi 18 botun tamamını `PAPER` gösteriyor; 3000/3002 portları dinliyor.
+- İzole Docker image/container denemeleri geçti: Compose config ve Docker build, shell syntax, health/login, `*_FILE` sırları, eski sır geçişi, sırların loglanmaması ve graceful stop kontrol edildi. Test container'ları ve yalnız bu teste ait volume'lar temizlendi; proje volume'larına dokunulmadı.
+- Son kodla yerel engine yeniden derlenip aynı PAPER DB ile başlatıldı: UI HTTP 200, engine health `ok`, 18 botun tamamı `PAPER` ve RUNNING. Yeniden başlatma öncesi DB `VACUUM INTO` ile tutarlı anlık görüntü olarak yedeklendi; UI süreci çalışır kaldı.
 - `npm run lint`: hâlâ 23 `react-hooks/set-state-in-effect` hatası veriyor. Bunlar Calculator, Forensics, Kill Switch, Settings, Signal Builder, Studio, TV Chart, Wizard, Carousel ve `use-mobile` dosyalarında; tümüne tek tek state/effect tasarım işi gerekiyor.
 - Tam Rust workspace, gerçek borsa anahtarları veya LIVE emirleriyle denenmedi. Yerel kontrol PAPER modundadır; bu LIVE/mainnet işlem onayı değildir.
 
 ## Açık kalan öncelikli işler
 
-1. **P1 — Runtime kilidi altında borsa ağı:** `live_fill_sweep` ve bazı funding/ticker yolları `app.runtimes` kilidi açıkken ağ çağrısı yapıyor. Aynı venue'deki yavaş yanıt diğer bot ve API işlerini geciktirebilir. Durum kopyası + sürüm kontrollü yeniden uzlaştırma ile kilitsiz ağ fazı tasarlanmalı.
-2. **P1 — Graceful shutdown:** Supervisor/engine kapanışında poll döngülerinin ve in-flight order cascade'lerinin drenajı, tüm snapshot'ların yazılması ve son WAL checkpoint'i sıralanmalı.
-3. **P1 — Restore pozisyon sahipliği:** Açık emirler bot bazında filtrelendi; ancak borsa pozisyon endpoint'i aynı sembolde hesap toplamını döndürür. Birden çok LIVE bot aynı venue/sembolü paylaşınca pozisyonu hangi bota ait olduğu hâlâ güvenilir biçimde çıkarılamıyor; bu kombinasyon güvenli attribution kuralı eklenmeden LIVE'da kullanılmamalı.
-4. **P1 — Backtest/PAPER/LIVE parity:** Kaynak rapordaki hedge funding, funding imleci, hedge likidasyonu, grid bootstrap referansı, bar içi işlem sırası, gerçek MMR kademeleri ve birleşik hedge equity/fee eşlemesi ayrı parity testi ve tasarım gerektiriyor.
-5. **P1 — Pine gösterge doğruluğu:** EMA uzun pencere sayısal kararlılığı, `ta.stoch` argümanları, ADX warmup ve Supertrend önceki kapanış kullanımı bu değişiklik paketinde yeniden yazılmadı.
-6. **P1 — Docker sırları:** Giriş betiği otomatik UI parolasını stdout'a yazıyor; API/vault anahtarlarını DB ile aynı data volume içinde saklayabiliyor. Docker volume/secrets geçişi mevcut kurulumların anahtarlarını koruyacak migrasyon gerektirdiğinden burada değiştirilmedi.
-7. **P2 — UI lint ve mimari:** 23 effect lint hatası, tek-route ekran yapısı, büyük `wizard.tsx`/`studio.tsx`, kullanılmayan npm bağımlılıkları, erişilebilirlik ve mobil drawer yol haritası sürüyor.
-8. **P2 — Daha geniş dosya/işlem güvenliği:** SQLite writer actor/yedek, limit emir fiyat-adım hassasiyeti, sayaç/harita büyüme sınırları ve gerçek borsa sandbox kabul testleri eklenmeli.
+1. **P1 — Kilit altında kalan LIVE uzlaştırma çağrıları:** `poll_inner` içindeki `live_fill_sweep` ve venue-flat emir iptalleri `app.runtimes` kilidi tutulurken ağ çağrısı yapıyor. Yavaş/yanıt vermeyen venue diğer botların state erişimini geciktirebilir. Bu fazın doğru çözümü, venue yanıtlarını kilit dışında toplayıp emir kimliği/runtime sürümüyle yeniden doğrulayarak kısa kilitte uygulamak; bu değişiklikte yapılmadı.
+2. **P1 — Hesap-geneli pozisyonun dış sahipliği:** Aynı botların aynı LIVE venue/sembolü paylaşması engellendi ve eski çakışmalar donduruluyor. Bununla birlikte tek botun yanında manuel işlem veya bu motor dışındaki başka bir uygulama pozisyon açmışsa borsanın net pozisyon endpoint'i bot sahipliğini kanıtlamaz; LIVE uzlaştırmada bu dış pozisyon için güvenilir attribution kuralı hâlâ yok.
+3. **P1 — Backtest/PAPER/LIVE parity:** Kaynak rapordaki hedge funding ve funding imleci, hedge likidasyonu, grid bootstrap referansı, bar içi işlem sırası, gerçek MMR kademeleri ve birleşik hedge equity/fee eşlemesi ayrı tasarım ve parity testleri gerektiriyor.
+4. **P2 — UI lint ve mimari:** 23 `react-hooks/set-state-in-effect` hatası, tek-route ekran yapısı, büyük `wizard.tsx`/`studio.tsx`, kullanılmayan npm bağımlılıkları, erişilebilirlik ve mobil drawer yol haritası sürüyor.
+5. **P2 — Daha geniş dosya/işlem güvenliği:** SQLite writer actor/yedek, limit emir fiyat-adım hassasiyeti, sayaç/harita büyüme sınırları ve gerçek borsa sandbox kabul testleri eklenmeli.
 
-Özel borsa hesabı endpoint'lerine veya ana ağa işlem isteği gönderilmedi. PAPER motoru kamuya açık piyasa verisi çekebilir; hiçbir canlı emir gönderilmedi. Bu doküman denetim notlarının tümünü tamamlanmış saymaz; yukarıdaki P1 maddeleri ayrı uygulama işi olarak açık bırakılmıştır.
+Özel borsa hesabı endpoint'lerine veya ana ağa işlem isteği gönderilmedi. PAPER motoru kamuya açık piyasa verisi çekebilir; hiçbir canlı emir gönderilmedi. Docker kontrolleri izole sahte sırlarla yapıldı; kullanıcı volume'ları korunarak test volume'ları silindi. Bu doküman denetim notlarının tümünü tamamlanmış saymaz; yukarıdaki maddeler ayrı geliştirme işi olarak açık bırakılmıştır.
