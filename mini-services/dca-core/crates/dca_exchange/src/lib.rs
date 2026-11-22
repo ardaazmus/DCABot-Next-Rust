@@ -185,6 +185,52 @@ pub enum WithdrawalGate {
     HardFail(String),
 }
 
+#[cfg(test)]
+mod live_permission_tests {
+    use super::*;
+
+    fn permissions() -> KeyPermissions {
+        KeyPermissions {
+            read_only: false,
+            can_withdraw: false,
+            spot_trade: true,
+            contract_trade: true,
+            ips: vec!["203.0.113.10".into()],
+            note: "test".into(),
+        }
+    }
+
+    #[test]
+    fn mainnet_live_key_requires_trade_scope_and_ip_restriction() {
+        let mut p = permissions();
+        assert!(validate_live_trade_permissions(&p, false, true).is_ok());
+        assert!(validate_live_trade_permissions(&p, true, true).is_ok());
+        p.ips.clear();
+        assert!(validate_live_trade_permissions(&p, false, true)
+            .unwrap_err()
+            .contains("IP"));
+        assert!(validate_live_trade_permissions(&p, false, false).is_ok());
+        p.spot_trade = false;
+        assert!(validate_live_trade_permissions(&p, false, false)
+            .unwrap_err()
+            .contains("spot"));
+    }
+
+    #[test]
+    fn live_key_never_accepts_withdrawal_or_read_only_permissions() {
+        let mut p = permissions();
+        p.can_withdraw = true;
+        assert!(validate_live_trade_permissions(&p, false, false)
+            .unwrap_err()
+            .contains("WITHDRAWAL"));
+        p.can_withdraw = false;
+        p.read_only = true;
+        assert!(validate_live_trade_permissions(&p, false, false)
+            .unwrap_err()
+            .contains("read-only"));
+    }
+}
+
 /// THE ZERO-WITHDRAWAL HARD GATE: any key with withdrawal permission is
 /// rejected with an unbypassable error (server maps this to HTTP 422).
 pub fn validate_key_permissions(p: &KeyPermissions) -> WithdrawalGate {
@@ -201,6 +247,35 @@ pub fn validate_key_permissions(p: &KeyPermissions) -> WithdrawalGate {
         );
     }
     WithdrawalGate::Ok
+}
+
+/// Validate the minimum exchange-key scope needed by a live bot. Mainnet
+/// trading keys must be IP-restricted; withdrawal and account-transfer access
+/// remain forbidden by the existing hard gate.
+pub fn validate_live_trade_permissions(
+    p: &KeyPermissions,
+    require_contract: bool,
+    require_ip_restriction: bool,
+) -> Result<(), String> {
+    if let WithdrawalGate::HardFail(reason) = validate_key_permissions(p) {
+        return Err(reason);
+    }
+    let has_trade_scope = if require_contract {
+        p.contract_trade
+    } else {
+        p.spot_trade
+    };
+    if !has_trade_scope {
+        return Err(if require_contract {
+            "API key does not have contract/futures trading permission".into()
+        } else {
+            "API key does not have spot trading permission".into()
+        });
+    }
+    if require_ip_restriction && p.ips.is_empty() {
+        return Err("mainnet API key must be restricted to trusted IP addresses".into());
+    }
+    Ok(())
 }
 
 /// L2 derinlik satırı + anlık görüntü. Fiyat/adet ondalık string (zero-float).

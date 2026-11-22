@@ -19,6 +19,23 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 pub const MAINNET: &str = "https://api.bybit.com";
 pub const TESTNET: &str = "https://api-testnet.bybit.com";
+const MAINNET_HOSTS: &[&str] = &[
+    "api.bybit.com",
+    "api.bytick.com",
+    "api.bybit.tr",
+    "api.bybit.nl",
+    "api.bybit.kz",
+    "api.bybitgeorgia.ge",
+    "api.bybit.ae",
+    "api.bybit.eu",
+    "api.bybit.id",
+    "api.manepa.jp",
+    "api.spark-fintech.com",
+];
+
+fn is_demo_or_testnet_url(base_url: &str) -> bool {
+    base_url == "https://api-demo.bybit.com" || base_url == "https://api-testnet.bybit.com"
+}
 
 fn parse_key_permissions(v: &Value) -> Result<KeyPermissions, String> {
     let read_only = match v.get("readOnly").and_then(|x| x.as_i64()) {
@@ -102,11 +119,11 @@ impl BybitAdapter {
             &raw_base_url,
             "Bybit",
             &[
-                "api.bybit.com",
-                "api-testnet.bybit.com",
-                "api-demo.bybit.com",
-            ],
-            &["api.bybit.com"],
+                MAINNET_HOSTS,
+                &["api-testnet.bybit.com", "api-demo.bybit.com"],
+            ]
+            .concat(),
+            MAINNET_HOSTS,
             false,
         );
         let recv_window = std::env::var("BYBIT_RECV_WINDOW").unwrap_or_else(|_| "5000".into());
@@ -338,7 +355,7 @@ impl BybitAdapter {
     /// Motor bu adaptör Demo/Testnet ucuna mı bakıyor (otomatik mod
     /// düzeltmesi yalnız burada denenir).
     pub fn is_demo_or_testnet(&self) -> bool {
-        self.base_url.contains("api-demo") || self.base_url.contains("api-testnet")
+        is_demo_or_testnet_url(&self.base_url)
     }
 
     fn parse_instrument(&self, category: &str, item: &Value) -> Option<Instrument> {
@@ -1465,6 +1482,14 @@ mod tests {
             t2 >= t1 + 4900,
             "now_ms with 5000ms offset should reflect clock adjustment"
         );
+    }
+
+    #[test]
+    fn sandbox_classification_is_exact_and_regional_hosts_are_mainnet() {
+        assert!(is_demo_or_testnet_url("https://api-demo.bybit.com"));
+        assert!(is_demo_or_testnet_url("https://api-testnet.bybit.com"));
+        assert!(!is_demo_or_testnet_url("https://api.bybit.tr"));
+        assert!(!is_demo_or_testnet_url("https://api.bybit.com.evil.test"));
     }
 }
 

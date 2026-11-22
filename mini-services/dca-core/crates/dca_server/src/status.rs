@@ -19,6 +19,14 @@ use std::sync::Arc;
 use super::summary;
 use crate::state::AppState;
 
+pub const SELF_CHECK_MAX_AGE_MS: i64 = 15 * 60 * 1_000;
+
+/// Self-check results are operational evidence, not a permanent approval.
+/// Future timestamps are invalid as well as stale records.
+pub fn selfcheck_is_fresh(at_ms: i64, now_ms: i64) -> bool {
+    at_ms > 0 && at_ms <= now_ms && now_ms.saturating_sub(at_ms) <= SELF_CHECK_MAX_AGE_MS
+}
+
 /// `verdict=GECTI passed=19 failed=0 abstained=0` bicimindeki SELF_CHECK
 /// olay mesajini cozer (selfcheck handler'inin persist formati).
 pub fn parse_selfcheck_message(msg: &str) -> Option<(String, u32, u32, u32)> {
@@ -42,15 +50,31 @@ pub fn parse_selfcheck_message(msg: &str) -> Option<(String, u32, u32, u32)> {
 /// Rampa karari (v3 §11.3 sira-tabanli, freeze dali bize ozgu):
 /// selfcheck GECTI degilse T0-hazirlik; kill devredeyse T0-kill;
 /// freeze devredeyse T0-freeze; hepsi temizse T1.
-pub fn ramp_stage(selfcheck_ok: bool, kill: bool, freeze: bool) -> (&'static str, &'static str, &'static str) {
+pub fn ramp_stage(
+    selfcheck_ok: bool,
+    kill: bool,
+    freeze: bool,
+) -> (&'static str, &'static str, &'static str) {
     if !selfcheck_ok {
-        ("T0", "T0 - Hazirlik", "Selfcheck PASS (anahtarlar Ayarlar > Kasa'da)")
+        (
+            "T0",
+            "T0 - Hazirlik",
+            "Selfcheck PASS (anahtarlar Ayarlar > Kasa'da)",
+        )
     } else if kill {
-        ("T0", "T0 - Kill-switch devrede", "Kill-switch birak + selfcheck yenile")
+        (
+            "T0",
+            "T0 - Kill-switch devrede",
+            "Kill-switch birak + selfcheck yenile",
+        )
     } else if freeze {
         ("T0", "T0 - Freeze devrede", "Freeze coz + hatti gozle")
     } else {
-        ("T1", "T1 - Canli hat acik (Faz 0 kapilari devrede)", "Dry-run ile prova; mutabakat ile izle")
+        (
+            "T1",
+            "T1 - Canli hat acik (Faz 0 kapilari devrede)",
+            "Dry-run ile prova; mutabakat ile izle",
+        )
     }
 }
 
@@ -79,6 +103,7 @@ fn latest_selfcheck(app: &AppState) -> Option<Value> {
         Some((row.get(0).ok()?, row.get(1).ok()?, row.get(2).ok()?))
     })()?;
     let (verdict, passed, failed, abstained) = parse_selfcheck_message(&message)?;
+    let now = crate::state::now_ms();
     Some(json!({
         "verdict": verdict,
         "passed": passed,
@@ -86,6 +111,8 @@ fn latest_selfcheck(app: &AppState) -> Option<Value> {
         "abstained": abstained,
         "level": level,
         "at": ts,
+        "ageMs": now.saturating_sub(ts),
+        "fresh": selfcheck_is_fresh(ts, now),
     }))
 }
 
@@ -97,21 +124,30 @@ pub async fn live_status(State(app): State<Arc<AppState>>) -> Json<Value> {
         let has_key = if v == "PAPER" {
             false
         } else {
-            crate::store::load_active_key(&app.db, &app.vault, v).ok().flatten().is_some()
+            crate::store::load_active_key(&app.db, &app.vault, v)
+                .ok()
+                .flatten()
+                .is_some()
         };
         venues.push(json!({"venue": v, "hasKey": has_key, "keyless": v == "PAPER"}));
     }
     let kill = app.kill_json().await;
     let freeze = app.freeze_json().await;
-    let kill_on = kill.get("engaged").and_then(|x| x.as_bool()).unwrap_or(false);
-    let freeze_on = freeze.get("frozen").and_then(|x| x.as_bool()).unwrap_or(false);
+    let kill_on = kill
+        .get("engaged")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    let freeze_on = freeze
+        .get("frozen")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
 
     let selfcheck = latest_selfcheck(&app);
-    let selfcheck_ok = selfcheck
-        .as_ref()
-        .and_then(|s| s.get("verdict"))
-        .and_then(|v| v.as_str())
-        == Some("GECTI");
+    let selfcheck_ok = selfcheck.as_ref().is_some_and(|s| {
+        s.get("verdict").and_then(|v| v.as_str()) == Some("GECTI")
+            && s.get("failed").and_then(|v| v.as_u64()) == Some(0)
+            && s.get("fresh").and_then(|v| v.as_bool()) == Some(true)
+    });
     let (stage, label, next_requirement) = ramp_stage(selfcheck_ok, kill_on, freeze_on);
 
     // Reconcile destegi: ag cagrisi YOK - yalniz kural bayragi (reconcile
@@ -154,7 +190,7 @@ pub async fn live_status(State(app): State<Arc<AppState>>) -> Json<Value> {
         "certGate": {
             "liveBots": live_bots,
             "runningLive": running_live,
-            "rule": "§10: rozeti gecemeyen strateji canliya eklenemez (LIVE create'te motor-ici kapi)",
+            "rule": "LIVE botlar sertifika geçmeden başlatılamaz; anahtar, self-check ve endpoint kontrolleri her başlatmada yenilenir",
         },
         "bots": bots,
         "summary": summ,
@@ -169,7 +205,8 @@ mod status_tests {
 
     #[test]
     fn selfcheck_message_parses_verdict_counts() {
-        let (v, p, f, a) = parse_selfcheck_message("verdict=GECTI passed=19 failed=0 abstained=3").unwrap();
+        let (v, p, f, a) =
+            parse_selfcheck_message("verdict=GECTI passed=19 failed=0 abstained=3").unwrap();
         assert_eq!((v.as_str(), p, f, a), ("GECTI", 19, 0, 3));
     }
 
@@ -202,6 +239,15 @@ mod status_tests {
     fn ramp_freeze_overrides_gecti() {
         let (stage, label, _) = ramp_stage(true, false, true);
         assert_eq!((stage, label), ("T0", "T0 - Freeze devrede"));
+    }
+
+    #[test]
+    fn selfcheck_freshness_rejects_old_future_and_missing_timestamps() {
+        let now = 2_000_000;
+        assert!(selfcheck_is_fresh(now - SELF_CHECK_MAX_AGE_MS, now));
+        assert!(!selfcheck_is_fresh(now - SELF_CHECK_MAX_AGE_MS - 1, now));
+        assert!(!selfcheck_is_fresh(now + 1, now));
+        assert!(!selfcheck_is_fresh(0, now));
     }
 
     #[test]

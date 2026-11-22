@@ -223,9 +223,8 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
   const [riskAck, setRiskAck] = useState(false);
   /** Warnings echoed by an engine 422 RISK_ACKNOWLEDGMENT_REQUIRED body. */
   const [serverWarnings, setServerWarnings] = useState<AdvisoryWarning[]>([]);
-  /** ÜRÜN-1: LIVE sertifika kapısı KALDI — bilinçli-onay istisnası akışı. */
+  /** Server-enforced LIVE certification failure; user acknowledgment cannot bypass it. */
   const [certGateFailed, setCertGateFailed] = useState<string | null>(null);
-  const [certAck, setCertAck] = useState(false);
   /* LIVE vault check */
   const [vaultKeys, setVaultKeys] = useState<VaultKey[] | null>(null);
   const [vaultError, setVaultError] = useState<string | null>(null);
@@ -824,6 +823,7 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
     if (!kind || !symbol) return;
     setLaunching(true);
     setLaunchError(null);
+    setCertGateFailed(null);
     try {
       const cfg = buildConfig();
       /* Task 16: uyarı yoksa onay gereksiz (true gönderilir); uyarı varsa kutu işaretliyse true,
@@ -842,7 +842,6 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
           config: cfg,
         },
         needsAck ? riskAck : true,
-        certGateFailed && certAck ? true : undefined,
       );
       saveBotMeta(res.id, { deviation_pct: cfg.deviation_pct });
       try {
@@ -851,7 +850,12 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
         /* ignore */
       }
       setServerWarnings([]);
-      toast({ title: "Bot başlatıldı", description: `${botName.trim()} → RUNNING (201)` });
+      toast({
+        title: mode === "LIVE" ? "LIVE bot hazırlandı" : "PAPER bot başlatıldı",
+        description: mode === "LIVE"
+          ? `${botName.trim()} → PAUSED. Ön kontrolleri geçtikten sonra açıkça Başlat seçin.`
+          : `${botName.trim()} → RUNNING (201)`,
+      });
       onCreated(res.id);
     } catch (e) {
       /* Task 16: RISK_ACKNOWLEDGMENT_REQUIRED özel akışı — kırmızı alert yerine
@@ -868,14 +872,10 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
           return;
         }
         if (body.code === "CERT_GATE_FAILED") {
-          /* ÜRÜN-1: sertifika kapısı KALDI — bilinçli-onay istisnası sunulur
-             (motor onayı kalıcı WARN olayına yazar). Kullanıcı istemeyebilir:
-             kutu işaretsizse launch tekrarında yine 422 döner. */
           setCertGateFailed(typeof body.error === "string" ? body.error : "LIVE sertifika kapısı KALDI");
-          setCertAck(false);
           toast({
             title: "LIVE sertifika kapısı: KALDI",
-            description: "Strateji sertifikasyon eşiklerini geçemedi — istisna için bilinçli onay kutusunu işaretleyin veya Lab'de config'inizi güçlendirin.",
+            description: "Canlı bot kurulmadı. Config'i Lab'de geliştirip yeniden sertifikalandırın.",
           });
           return;
         }
@@ -1166,13 +1166,13 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
               "rounded border px-2 py-0.5 text-[10px] font-extrabold tracking-wider",
               mode === "PAPER" ? "border-emerald-500/40 text-emerald-300" : "border-amber-500/50 text-amber-300",
             )}>
-              {mode === "PAPER" ? "PAPER · SİMÜLASYON" : "GERÇEK · LIVE"}
+              {mode === "PAPER" ? "PAPER · SİMÜLASYON" : "LIVE · BORSA EMİR YOLU"}
             </span>
           </div>
           <p className={cn("mt-1 text-[11px]", mode === "PAPER" ? "text-emerald-200/80" : "text-amber-200/90")}>
             {mode === "PAPER"
               ? "Bu bot simülasyon emirleri kullanır; gerçek borsa emri göndermez."
-              : "Bot başlatıldığında gerçek borsa emirleri gönderebilir. Seçilen venue için kasa anahtarı ve risk kontrolleri gerekir."}
+              : "Bot, etkin borsa ortamına emir gönderir (Demo/Testnet veya Mainnet). PAUSED hazırlanır; başlatmak için ayrıca onay ve güvenlik kontrolleri gerekir."}
           </p>
         </div>
         <nav className="flex flex-wrap items-center gap-1.5" aria-label="Bölüm gezinmesi">
@@ -1308,7 +1308,7 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
                       "rounded border px-1.5 py-0.5 text-[9px] font-bold tracking-wider",
                       mode === "PAPER" ? "border-emerald-500/30 bg-emerald-500/5 text-emerald-300" : "border-amber-500/40 bg-amber-500/10 text-amber-300",
                     )}>
-                      {mode === "PAPER" ? "SİMÜLASYON" : "GERÇEK EMİR"}
+                      {mode === "PAPER" ? "İÇ SİMÜLASYON" : "LIVE EMİR YOLU"}
                     </span>
                   </div>
                   <div role="group" aria-label="Bot çalışma modu" className="mt-2 flex items-center gap-2">
@@ -1346,9 +1346,9 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
                         : "border-border text-slate-500",
                       venue === "PAPER" && "cursor-not-allowed opacity-40",
                     )}
-                    title="Gerçek LIVE modu — borsaya gerçek emir gönderir"
+                    title="LIVE emir yolu — borsa Demo/Testnet veya Mainnet endpoint'ine yönlenir"
                   >
-                    GERÇEK · LIVE ⚠
+                    BORSADA LIVE ⚠
                   </button>
                   </div>
                 </div>
@@ -1358,7 +1358,7 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
                 <p className="mt-2 text-[11px] text-slate-400">
                   {mode === "PAPER"
                     ? "Kağıt modu: emirler simülasyon çekirdeğinde doldurulur (Gate 5 realizm etiketleriyle)."
-                    : "LIVE mod: gerçek emirler gönderilir. Vault'ta doğrulanmış anahtar gerekir — dikkatli olun."}
+                    : "LIVE emir yolu: etkin borsa endpoint'i Demo/Testnet veya Mainnet olabilir. Bot önce PAUSED hazırlanır; ayrı Başlat onayı, taze self-check ve anahtar/sertifika kontrolleri geçmeden emir gönderilmez."}
                 </p>
               </Panel>
 
@@ -2659,18 +2659,15 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
                 )}
               >
                 {needsAck || certGateFailed ? <TriangleAlert className="h-4 w-4" aria-hidden /> : <ShieldCheck className="h-4 w-4" aria-hidden />}
-                RİSK ÖZETİ — TEK ONAY
+                RİSK UYARILARI
                 {needsAck && (
                   <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-300">
                     {displayWarnings.length} UYARI
                   </span>
                 )}
               </div>
-              {/* Faz 20 (UIX-10): iki ayrı onay kutusu yerine TEK "Risk Özeti"
-                  bloğu — uyarılar ve (varsa) sertifika kapısı istisnası aynı
-                  listede sayılır, TEK onay ikisini birden kapsar. Kullanıcı
-                  hangi riski kabul ettiğini listeden okur; motor sözleşmesi
-                  korunur (riskAck + cert_acknowledged ayrı alanlar gönderilir). */}
+              {/* Advisory risks can be acknowledged; a failed LIVE certificate
+                  is a hard block and is never included in the acknowledgment. */}
               {displayWarnings.length === 0 && !certGateFailed ? (
                 <p className="mt-2 text-[11px] text-slate-400">
                   Aktif uyarı yok — tüm korumalar ZORUNLU modda ve riskli modlar kapalı. Onay kutusu gerekmez.
@@ -2692,10 +2689,9 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
                         <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-rose-400" aria-hidden />
                         <span className="text-rose-200/90">
                           <span className="font-semibold">
-                            {displayWarnings.length > 0 ? "2." : "1."} LIVE sertifika kapısı istisnası:
+                            {displayWarnings.length > 0 ? "2." : "1."} LIVE sertifika kapısı başarısız:
                           </span>{" "}
-                          strateji sertifika eşiklerini geçemedi ({certGateFailed.length > 160 ? certGateFailed.slice(0, 160) + "…" : certGateFailed}) —
-                          istatistiksel aşırı-uyum riskiyle canlıya alınıyor. Onay kalıcı olay kaydına yazılır.
+                          bot oluşturulmadı. Strateji eşiği geçmedi ({certGateFailed.length > 160 ? certGateFailed.slice(0, 160) + "…" : certGateFailed}). Config'i Lab'de geliştirip yeniden deneyin.
                         </span>
                       </li>
                     )}
@@ -2714,53 +2710,28 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
                       </li>
                     ))}
                   </ul>
-                  <label
-                    htmlFor="risk-ack"
-                    className="mt-3 flex cursor-pointer items-start gap-2 rounded-md border border-amber-500/30 bg-surface p-2.5"
-                  >
-                    <Checkbox
-                      id="risk-ack"
-                      checked={riskAck}
-                      onCheckedChange={(v) => {
-                        // Faz 22 (P0-10 kalanı): sertifika istisnası AYRI onaydır —
-                        // Faz 20'deki tek-tik birleşimi kapı istisnasını da
-                        // yanlışlıkla kapsıyordu; iki onay iki ayrı sorumluluktur
-                        // (strateji uyarıları ≠ sertifika istisnası).
-                        setRiskAck(v === true);
-                        if (v !== true) setCertAck(false);
-                      }}
-                      className="mt-0.5 border-amber-500/60 data-[state=checked]:border-amber-500 data-[state=checked]:bg-amber-500 data-[state=checked]:text-[#1c1204]"
-                      aria-label="Risk özetindeki tüm maddeleri okudum ve onaylıyorum"
-                    />
-                    <span className="text-[11px] leading-snug text-amber-200/90">
-                      Yukarıda numaralı <span className="font-semibold">TÜM risk maddelerini</span>
-                      {certGateFailed ? " (uyarılar ve sertifika kapısı istisnası dâhil)" : ""} okudum, anladım ve sorumluluğu üstleniyorum.
-                      (Kullanıcı Kendi Riskini Taşır; onaylar kalıcı olay kaydına yazılır.)
-                    </span>
-                  </label>
+                  {needsAck && (
+                    <label
+                      htmlFor="risk-ack"
+                      className="mt-3 flex cursor-pointer items-start gap-2 rounded-md border border-amber-500/30 bg-surface p-2.5"
+                    >
+                      <Checkbox
+                        id="risk-ack"
+                        checked={riskAck}
+                        onCheckedChange={(v) => setRiskAck(v === true)}
+                        className="mt-0.5 border-amber-500/60 data-[state=checked]:border-amber-500 data-[state=checked]:bg-amber-500 data-[state=checked]:text-[#1c1204]"
+                        aria-label="Risk uyarılarını okudum ve onaylıyorum"
+                      />
+                      <span className="text-[11px] leading-snug text-amber-200/90">
+                        Yukarıdaki <span className="font-semibold">strateji ve politika uyarılarını</span> okudum, anladım ve sorumluluğu üstleniyorum.
+                        (Onay olay kaydına yazılır.)
+                      </span>
+                    </label>
+                  )}
                   {serverWarnings.length > 0 && (
                     <p className="mt-1.5 text-[10px] text-slate-400">
                       Motor 422 yanıtı uyarı listesini doğruladı — onay işaretliyse BOTU BAŞLAT&apos;a tekrar basın.
                     </p>
-                  )}
-                  {certGateFailed && (
-                    <label
-                      htmlFor="cert-ack"
-                      className="mt-2 flex cursor-pointer items-start gap-2 rounded-md border border-rose-500/30 bg-surface p-2.5"
-                    >
-                      <Checkbox
-                        id="cert-ack"
-                        checked={certAck}
-                        onCheckedChange={(v) => setCertAck(v === true)}
-                        className="mt-0.5 border-rose-500/60 data-[state=checked]:border-rose-500 data-[state=checked]:bg-rose-500 data-[state=checked]:text-white"
-                        aria-label="Sertifikasız stratejiyi bilinçli onaylıyorum"
-                      />
-                      <span className="text-[11px] leading-snug text-rose-200/90">
-                        <span className="font-semibold">Sertifika kapısı istisnası ayrı onaydır:</span> strateji sertifika
-                        eşiklerini geçemediğini bilerek canlıya alıyorum; tüm riski üstleniyorum. (Onay kalıcı olay
-                        kaydına yazılır; strateji uyarı onayı bunun yerine GEÇMEZ.)
-                      </span>
-                    </label>
                   )}
                 </>
               )}
@@ -2864,7 +2835,15 @@ export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
                     {launching ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Rocket className="h-4 w-4" aria-hidden />}
                     {/* Faz 25 (UIX-29): CTA duruma sadık — önceki seçim eksikse
                         düğme neyi beklediğini söyler. */}
-                    {launching ? "Launch ediliyor…" : !sec1Valid ? "ÖNCE STRATEJİ SEÇ" : !sec2Valid ? "ÖNCE SEMBOL SEÇ" : "BOTU BAŞLAT"}
+                    {launching
+                      ? "Hazırlanıyor…"
+                      : !sec1Valid
+                        ? "ÖNCE STRATEJİ SEÇ"
+                        : !sec2Valid
+                          ? "ÖNCE SEMBOL SEÇ"
+                          : mode === "LIVE"
+                            ? "LIVE BOTU HAZIRLA · DURAKLATILMIŞ"
+                            : "PAPER BOTU BAŞLAT"}
                   </Button>
                 </span>
               </TooltipTrigger>

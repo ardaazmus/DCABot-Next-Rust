@@ -24,6 +24,10 @@ pub struct BotRuntime {
     pub bot_id: String,
     pub name: String,
     pub mode: String,  // PAPER | LIVE
+    /// Effective exchange endpoint, distinct from the order-execution path.
+    /// Values include INTERNAL_PAPER, BYBIT_DEMO, BYBIT_TESTNET, OKX_DEMO,
+    /// MAINNET, and UNSUPPORTED.
+    pub execution_environment: String,
     pub venue: String, // BYBIT | BINANCE | OKX | PAPER
     pub status: String,
     pub cfg: BotConfig,
@@ -329,6 +333,7 @@ impl BotRuntime {
             "kind": self.cfg.kind.label(),
             "venue": self.venue,
             "mode": self.mode,
+            "executionEnvironment": self.execution_environment,
             "status": self.status,
             // Faz 21 (N-8): kernel halt durumu arayüze görünür — Studio/Fleet
             // kırmızı rozet + "KERNEL'İ SIFIRLA" düğmesi bununla çalışır.
@@ -534,6 +539,31 @@ impl AppState {
             "OKX" => Some(&self.okx),
             "PAPER" => Some(&self.paper),
             _ => None,
+        }
+    }
+
+    /// Report the effective adapter endpoint, not environment flags that can
+    /// disagree with an endpoint override. A demo flag on a mainnet URL is not
+    /// a sandbox.
+    pub fn is_sandbox_venue(&self, venue: &str) -> bool {
+        match venue.to_ascii_uppercase().as_str() {
+            "BYBIT" => self.bybit.is_demo_or_testnet(),
+            "OKX" => self.okx.is_demo,
+            _ => false,
+        }
+    }
+
+    pub fn execution_environment(&self, venue: &str, mode: &str) -> &'static str {
+        if !mode.eq_ignore_ascii_case("LIVE") {
+            return "INTERNAL_PAPER";
+        }
+        match venue.to_ascii_uppercase().as_str() {
+            "BYBIT" if self.bybit.base_url == "https://api-demo.bybit.com" => "BYBIT_DEMO",
+            "BYBIT" if self.bybit.base_url == "https://api-testnet.bybit.com" => "BYBIT_TESTNET",
+            "BYBIT" => "MAINNET",
+            "OKX" if self.okx.is_demo => "OKX_DEMO",
+            "OKX" => "MAINNET",
+            _ => "UNSUPPORTED",
         }
     }
 }
@@ -1076,6 +1106,7 @@ pub async fn create_runtime(
         bot_id: id.to_string(),
         name: name.to_string(),
         mode: mode.to_string(),
+        execution_environment: app.execution_environment(venue, mode).into(),
         venue: venue.to_string(),
         status: status.to_string(),
         cfg,

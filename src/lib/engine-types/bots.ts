@@ -134,6 +134,8 @@ export interface Bot {
   kind: BotKind;
   venue: Venue;
   mode: Mode;
+  /** Effective adapter destination: internal paper, exchange demo/testnet, or mainnet. */
+  executionEnvironment?: string;
   status: BotStatus;
   /** Faz 21 (N-8): kernel sticky-halt durumu — UI kırmızı rozet + RESET_KERNEL düğmesi. */
   kernelHalted?: boolean;

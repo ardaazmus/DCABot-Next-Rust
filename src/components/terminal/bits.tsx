@@ -120,21 +120,40 @@ export function VenueChip({ venue, className }: { venue: string; className?: str
   );
 }
 
-export function ModeBadge({ mode, className }: { mode: string; className?: string }) {
+export function ModeBadge({ mode, executionEnvironment, className }: { mode: string; executionEnvironment?: string; className?: string }) {
   const live = mode === "LIVE";
+  const sandbox = live && ["BYBIT_DEMO", "BYBIT_TESTNET", "OKX_DEMO"].includes(executionEnvironment ?? "");
+  const label = !live
+    ? "PAPER"
+    : executionEnvironment === "BYBIT_DEMO"
+      ? "BYBIT DEMO"
+      : executionEnvironment === "BYBIT_TESTNET"
+        ? "BYBIT TESTNET"
+        : executionEnvironment === "OKX_DEMO"
+          ? "OKX DEMO"
+          : executionEnvironment === "MAINNET"
+            ? "GERÇEK PARA · MAINNET ⚠"
+            : "LIVE · ORTAM BELİRSİZ";
+  const title = !live
+    ? "PAPER — iç simülasyon, borsa emri ve gerçek fon kullanılmaz"
+    : sandbox
+      ? `${label} — borsanın demo/testnet ortamına emir yolu; mainnet fonu kullanılmaz`
+      : executionEnvironment === "MAINNET"
+        ? "MAINNET LIVE — gerçek borsa hesabında emir gönderilebilir"
+        : "LIVE emir yolu, ancak etkin borsa ortamı doğrulanamadı";
   return (
     <span
       className={cn(
         "inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-bold tracking-wider",
-        live
+        live && !sandbox
           ? "border-rose-500/60 bg-rose-500/20 text-rose-300 shadow-sm shadow-rose-950/40"
-          : "border-emerald-500/50 bg-emerald-500/15 text-emerald-300",
+          : sandbox
+            ? "border-amber-500/50 bg-amber-500/10 text-amber-300"
+            : "border-emerald-500/50 bg-emerald-500/15 text-emerald-300",
         className,
       )}
     >
-      <span title={live ? "LIVE — gercek borsa emri (3Commas: Real)" : "PAPER — sanal bakiye, risksiz deneme"}>
-        {live ? "GERÇEK PARA ⚠" : "PAPER"}
-      </span>
+      <span title={title}>{label}</span>
     </span>
   );
 }

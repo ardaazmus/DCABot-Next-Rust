@@ -1481,7 +1481,7 @@ async fn ingest_kernel_fills(
     Ok(())
 }
 
-async fn pre_order_gate_ctx(
+pub(crate) async fn pre_order_gate_ctx(
     app: &AppState,
     gate: &crate::state::GateCtx,
     adapter: &dyn VenueAdapter,

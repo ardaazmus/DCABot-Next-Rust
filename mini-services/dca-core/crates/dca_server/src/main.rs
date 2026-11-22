@@ -33,7 +33,8 @@ use axum::response::IntoResponse;
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use dca_exchange::{
-    validate_key_permissions, KeyPermissions, VenueAdapter, VenueCreds, WithdrawalGate,
+    validate_key_permissions, validate_live_trade_permissions, KeyPermissions, VenueAdapter,
+    VenueCreds, WithdrawalGate,
 };
 use dca_kernel::GuardAction;
 use dca_math::fraction::Fraction;
@@ -61,6 +62,77 @@ use uuid::Uuid;
 const RATE_LIMIT_MAX: usize = 400;
 const RATE_LIMIT_WINDOW_SECS: u64 = 10;
 const RATE_LIMIT_MAX_BUCKETS: usize = 10_000;
+
+async fn validate_live_preflight(
+    app: &AppState,
+    venue: &str,
+    creds: &VenueCreds,
+    require_contract: bool,
+    require_fresh_selfcheck: bool,
+) -> Result<(), String> {
+    let venue = venue.to_ascii_uppercase();
+    if venue != "BYBIT" && venue != "OKX" {
+        return Err(format!("{venue} LIVE kanalı kapalı"));
+    }
+    if venue == "OKX"
+        && creds
+            .passphrase
+            .as_deref()
+            .map(|p| p.trim().is_empty())
+            .unwrap_or(true)
+    {
+        return Err("OKX LIVE için vault anahtarında passphrase gerekli".into());
+    }
+
+    let sandbox = app.is_sandbox_venue(&venue);
+    let allow_mainnet = std::env::var("DCA_ALLOW_MAINNET").as_deref() == Ok("1");
+    if !sandbox && !allow_mainnet {
+        return Err(format!(
+            "LIVE_MAINNET_LOCKED: etkin {venue} adaptörü mainnet kullanıyor; başlatma için DCA_ALLOW_MAINNET=1 gerekir"
+        ));
+    }
+    let adapter = app
+        .adapter(&venue)
+        .ok_or_else(|| format!("{venue} adapter bulunamadı"))?;
+    let permissions = adapter.key_permissions(creds).await?;
+    validate_live_trade_permissions(&permissions, require_contract, !sandbox)?;
+
+    if require_fresh_selfcheck {
+        if app.kill_engaged().await || app.freeze_engaged().await {
+            return Err("KILL_SWITCH veya FREEZE devrede; LIVE başlatılamaz".into());
+        }
+        let (level, message, ts): (String, String, i64) = {
+            let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
+            conn.query_row(
+                "SELECT level, message, ts FROM events WHERE bot_id='SYSTEM' AND gate='SELF_CHECK' ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(|_| "LIVE başlatılamadı: önce başarılı bir self-check çalıştırın".to_string())?
+        };
+        let parsed = status::parse_selfcheck_message(&message)
+            .ok_or_else(|| "LIVE başlatılamadı: self-check kaydı bozuk".to_string())?;
+        if level != "INFO"
+            || parsed.0 != "GECTI"
+            || parsed.2 != 0
+            || !status::selfcheck_is_fresh(ts, state::now_ms())
+        {
+            return Err("LIVE başlatılamadı: son self-check geçmemiş veya 15 dakikadan eski; Settings > Self-check'i yenileyin".into());
+        }
+    }
+    Ok(())
+}
+
+fn live_certification_is_current(app: &AppState, bot_id: &str) -> Result<bool, String> {
+    let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
+    conn.query_row(
+        "SELECT live_certified FROM bots WHERE id=?1",
+        [bot_id],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|value| value == 1)
+    .map_err(|e| e.to_string())
+}
 
 #[derive(Default, Clone)]
 struct RateLimiter {
@@ -1169,10 +1241,10 @@ async fn restore_bots(app: &Arc<AppState>) {
             .as_deref()
             .and_then(|s| Fraction::from_any_str(s).ok())
             .unwrap_or_else(|| Fraction::from_decimal_str("100000").unwrap());
-        // LIVE bots need vault credentials; without a resolvable key the bot is
-        // downgraded to PAPER and a WARN event makes the downgrade visible
-        // (status stays untouched — it is not silently faked as live trading).
-        let mut effective_mode = mode.clone();
+        // A LIVE bot must never be relabelled PAPER when credentials are
+        // missing: that would conceal its venue exposure and mix ledgers.
+        // Keep it visible as LIVE, paused, and require explicit re-arming.
+        let effective_mode = mode.clone();
         let mut credentials: Option<VenueCreds> = None;
         if effective_mode == "LIVE" {
             // Faz 4 (C-5): HEDGE LIVE kilitli — restore'da dürüst düşürme.
@@ -1180,14 +1252,13 @@ async fn restore_bots(app: &Arc<AppState>) {
                 // Faz 13B: HEDGE LIVE kilidi kaldırıldı (bacak-başına stepper) —
                 // dal yapısı korundu; ileride tekrar kilit gerekirse buraya.
             } else if venue.to_uppercase() != "BYBIT" && venue.to_uppercase() != "OKX" {
-                effective_mode = "PAPER".into();
                 state::persist_event(
                     app,
                     &id,
                     "WARN",
                     "RESTORE",
                     &format!(
-                        "{venue} LIVE kanalı desteklenmiyor — bot PAPER modunda restore edildi"
+                        "{venue} LIVE kanalı desteklenmiyor — LIVE kimliği korundu, güvenli şekilde duraklatıldı"
                     ),
                 )
                 .await;
@@ -1203,32 +1274,33 @@ async fn restore_bots(app: &Arc<AppState>) {
                                 .map(|p| p.trim().is_empty())
                                 .unwrap_or(true)
                         {
-                            effective_mode = "PAPER".into();
-                            state::persist_event(app, &id, "WARN", "RESTORE", "OKX passphrase yok — bot PAPER moduna düşürüldü (anahtarı passphrase ile yeniden ekleyin)").await;
+                            state::persist_event(app, &id, "WARN", "RESTORE", "OKX passphrase yok — LIVE bot duraklatıldı (anahtarı passphrase ile yeniden ekleyin)").await;
                         } else {
                             credentials = Some(creds);
                         }
                     }
                     Ok(None) => {
-                        effective_mode = "PAPER".into();
-                        state::persist_event(app, &id, "WARN", "RESTORE", "LIVE anahtarı bulunamadı — bot PAPER moduna düşürüldü (Ayarlar > Anahtar Kasası'ndan ekleyin)").await;
+                        state::persist_event(app, &id, "WARN", "RESTORE", "LIVE anahtarı bulunamadı — LIVE bot duraklatıldı (Ayarlar > Anahtar Kasası'ndan ekleyin)").await;
                     }
                     Err(e) => {
-                        effective_mode = "PAPER".into();
                         state::persist_event(
                             app,
                             &id,
                             "WARN",
                             "RESTORE",
-                            &format!("LIVE anahtarı çözülemedi ({e}) — bot PAPER moduna düşürüldü"),
+                            &format!("LIVE anahtarı çözülemedi ({e}) — LIVE bot duraklatıldı"),
                         )
                         .await;
                     }
                 }
             }
         }
+        let needs_live_rearm =
+            mode.eq_ignore_ascii_case("LIVE") && status.eq_ignore_ascii_case("RUNNING");
         let restored_status = if ambiguous_live_market && effective_mode == "LIVE" {
             "FROZEN"
+        } else if needs_live_rearm {
+            "PAUSED"
         } else {
             &status
         };
@@ -1255,6 +1327,16 @@ async fn restore_bots(app: &Arc<AppState>) {
                 "CRITICAL",
                 "LIVE_OWNERSHIP",
                 "aynı venue/sembolde birden fazla LIVE bot bulundu; hesap-geneli pozisyon güvenle atanamadığı için bot FROZEN açıldı ve pozisyon reconcile edilmedi",
+            )
+            .await;
+        } else if needs_live_rearm {
+            state::persist_status(app, &id, "PAUSED");
+            state::persist_event(
+                app,
+                &id,
+                "WARN",
+                "LIVE_REARM_REQUIRED",
+                "restart sonrası otomatik LIVE emirleri engellendi; self-check ve explicit START gerekli",
             )
             .await;
         }
@@ -1939,23 +2021,6 @@ struct CreateBotReq {
     /// bayrak yoksa motor 422 RISK_ACKNOWLEDGMENT_REQUIRED ile uyarı listesini döner.
     #[serde(default)]
     risk_acknowledged: bool,
-    /// ÜRÜN-1 (bilinçli-onay istisnası): LIVE sertifika kapısı KALDI'ysa ve bu
-    /// bayrak TRUE ise kurulum WARN olayıyla devam eder ("rozetsiz strateji
-    /// canlıya eklenemez" politikası, kullanıcının açık sorumluluk onayıyla tek
-    /// istisna). Onay kalıcı olarak olay akışına yazılır.
-    #[serde(default)]
-    cert_acknowledged: bool,
-    /// Faz 28 (P1-4 — bağımsız denetim): bilinçli-onayın GEREKÇESİ.
-    /// cert_acknowledged=true iken zorunludur (422 CERT_ACK_REASON_REQUIRED);
-    /// gerekçe WARN olayının kalıcı metnine yazılır — boş onay audit değerini
-    /// düşürür ("kim, neden" kaydı olmadan istisna kapatılamaz).
-    #[serde(default)]
-    cert_reason: Option<String>,
-    /// Faz 22 (P0-10 kalanı): kullanıcının GERÇEK denediği strateji
-    /// konfigürasyon sayısı — DSR söndürmesi bunu kullanır (dahili 9 varyant
-    /// alt sınırdır). 0/eksik = sadece dahili varyantlar.
-    #[serde(default)]
-    attempts: usize,
 }
 
 fn default_interval() -> String {
@@ -2336,7 +2401,10 @@ async fn create_bot(
     } else {
         None
     };
-    let status = "RUNNING";
+    // A LIVE bot is configured and certified here, but it is never armed by
+    // creation. The operator must explicitly START after fresh preflight.
+    let status = if mode == "LIVE" { "PAUSED" } else { "RUNNING" };
+    let mut live_certified = false;
     // M-5: start_cash pozitif olmalı — negatif/sıfır sermaye anlamsız bir
     // kurulumun G6'yı hiç test etmeden geçmesine yol açardı.
     let start_cash = match Fraction::from_decimal_str(&req.start_cash) {
@@ -2392,22 +2460,6 @@ async fn create_bot(
         if venue_uc != "BYBIT" && venue_uc != "OKX" {
             return Err(err422("Bu venue'de LIVE kanal kapalı (Binance fill-reconciliation ile doğrulanmadı) — PAPER modunu kullan"));
         }
-        // Faz 0.5 (B-6): LIVE Mainnet Gate — venue bazlı testnet/demo kapısı (Arena P0-3 düzeltmesi)
-        let is_testnet_env = match venue_uc.as_str() {
-            "BYBIT" => std::env::var("DCA_BYBIT_TESTNET").as_deref() == Ok("1"),
-            "OKX" => {
-                std::env::var("DCA_OKX_DEMO").as_deref() == Ok("1")
-                    || std::env::var("DCA_OKX_TESTNET").as_deref() == Ok("1")
-            }
-            _ => false,
-        };
-        let allow_mainnet = std::env::var("DCA_ALLOW_MAINNET").as_deref() == Ok("1");
-        if !is_testnet_env && !allow_mainnet {
-            return Err(err422(format!(
-                "LIVE_MAINNET_LOCKED: {venue_uc} gerçek ana ağda (Mainnet) LIVE bot başlatmak için DCA_ALLOW_MAINNET=1 ortam değişkeni zorunludur (B-6 fail-closed kapısı). Testnet/Demo için {} kullanın.",
-                if venue_uc == "OKX" { "DCA_OKX_DEMO=1" } else { "DCA_BYBIT_TESTNET=1" }
-            )));
-        }
         // Faz 13B: HEDGE LIVE kilidi KALDIRILDI — bacak-başına stepper (EX-06
         // çözümü) + positionIdx eşlemesi (Faz 4.5/5) tam; Demo kabulü sonrası canlı.
         // Hesap hedge-moddaysa POS_MODE denetimi emirleri positionIdx ile eşler.
@@ -2421,6 +2473,13 @@ async fn create_bot(
             Ok(None) => return Err(err422(format!("LIVE mod için {venue_uc} vault anahtarı gerekli — Ayarlar > Anahtar Kasası'ndan ekleyin"))),
             Err(e) => return Err(err422(format!("vault anahtarı çözülemedi: {e}"))),
         };
+        let credentials_ref = credentials.as_ref().expect("LIVE credentials set above");
+        if let Err(e) =
+            validate_live_preflight(&app, &venue_uc, credentials_ref, kind.is_futures(), false)
+                .await
+        {
+            return Err(err422(format!("LIVE güvenlik ön kontrolü başarısız: {e}")));
+        }
     }
 
     // Faz 0.1 — LIVE sertifika kapısı (v3 §10 "rozetsiz strateji canlıya eklenemez").
@@ -2489,7 +2548,9 @@ async fn create_bot(
             .collect();
         let gate_cfg = cfg.clone();
         let gate_cash = start_cash.clone();
-        let gate_attempts = req.attempts;
+        // Attempts supplied by the client are not evidence. Until the server
+        // persists a verifiable trial history, do not trust caller input.
+        let gate_attempts = 0usize;
         let (gate_cert, gate_base) = tokio::task::spawn_blocking(move || {
             let base = run_backtest(
                 &bars_n,
@@ -2533,71 +2594,23 @@ async fn create_bot(
                 .filter(|g| !g.pass)
                 .map(|g| format!("{} (eşik {}, değer {})", g.label, g.threshold, g.value))
                 .collect();
-            // ÜRÜN-1: bilinçli-onay istisnası — kapı felsefesi korunur (onay
-            // şart + kalıcı WARN), Demo/uzman kullanımı için kanal açılır.
-            // Faz 28 (P1-4): onay gerekçesiz kabul edilmez — audit zinciri
-            // "kim + neden" ikilisini tam istemek zorundadır.
-            let cert_reason = req
-                .cert_reason
-                .as_deref()
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.chars().take(300).collect::<String>());
-            if req.cert_acknowledged {
-                let Some(cert_reason) = cert_reason else {
-                    state::persist_event(
-                        &app,
-                        &id,
-                        "WARN",
-                        "CERT_GATE",
-                        "cert_acknowledged=true ancak cert_reason yok — istisna reddedildi",
-                    )
-                    .await;
-                    return Err((
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        Json(json!({
-                            "error": "LIVE sertifika kapısı: bilinçli onay istisnası için cert_reason zorunlu",
-                            "code": "CERT_ACK_REASON_REQUIRED",
-                            "verdict": gate.verdict,
-                            "gates": gate.gates,
-                            "hint": "cert_acknowledged=true + cert_reason (örn. 'backtest 200 deal üstünde doğrulandı, kapı eşikleri manuel gözden geçirildi') gönderin",
-                        })),
-                    )
-                        .into_response());
-                };
-                let failed_list = failed.join(" · ");
-                state::persist_event(&app, &id, "WARN", "CERT_GATE", &format!("sertifika kapısı KALDI ama kullanıcı bilinçli onayıyla AŞILDI (cert_acknowledged=true, gerekçe: \"{cert_reason}\"). Kalan kapılar: {failed_list}")).await;
-                let _ = app.sse.send(SseEvent {
-                    event: "RISK".into(),
-                    data: json!({"botId": id, "code": "CERT_GATE_ACK", "message": format!("LIVE sertifika kapısı bilinçli onayla aşıldı (gerekçe: {cert_reason}) — kalan kapılar: {failed_list}"), "ts": state::now_ms()}).to_string(),
-                });
-                state::persist_event(
-                    &app,
-                    &id,
-                    "INFO",
-                    "CERT_GATE",
-                    "bilinçli onaylı istisna ile kuruluma devam ediliyor",
-                )
-                .await;
-            } else {
-                let mut reason = format!("LIVE sertifika kapısı: KALDI — sertifikasız strateji canlıya eklenemez. Kalan kapılar: {}", failed.join(" · "));
-                if let Some(e) = funding_err {
-                    reason.push_str(&format!(" [funding geçmişi alınamadı: {e}]"));
-                }
-                state::persist_event(&app, &id, "WARN", "CERT_GATE", &reason).await;
-                return Err((
+            let mut reason = format!("LIVE sertifika kapısı: KALDI — sertifikasız strateji canlıya eklenemez. Kalan kapılar: {}", failed.join(" · "));
+            if let Some(e) = funding_err.as_deref() {
+                reason.push_str(&format!(" [funding geçmişi alınamadı: {e}]"));
+            }
+            state::persist_event(&app, &id, "WARN", "CERT_GATE", &reason).await;
+            return Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(json!({
                     "error": reason,
                     "code": "CERT_GATE_FAILED",
                     "verdict": gate.verdict,
                     "gates": gate.gates,
-                    "hint": "bilinçli sorumluluk onayıyla devam için cert_acknowledged=true + cert_reason (gerekçe metni) gönderin (WARN olayıyla kayıt altına alınır)",
+                    "hint": "config'i Lab'de geliştirip tekrar sertifikalandırın; LIVE sertifika kapısı kullanıcı onayıyla aşılamaz",
                 })),
-            )
-                .into_response());
-            }
+            ).into_response());
         }
+        live_certified = true;
         state::persist_event(
             &app,
             &id,
@@ -2634,7 +2647,7 @@ async fn create_bot(
             Err(e) => return Err(err422(e.to_string())),
         };
         conn.execute(
-            "INSERT INTO bots(id, name, kind, venue, mode, symbol, status, config, stats, interval, start_cash, created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'{}',?9,?10,?11)",
+            "INSERT INTO bots(id, name, kind, venue, mode, symbol, status, config, stats, interval, start_cash, live_certified, created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'{}',?9,?10,?11,?12)",
             rusqlite::params![
                 id,
                 req.name,
@@ -2646,12 +2659,24 @@ async fn create_bot(
                 serde_json::to_string(&cfg).map_err(|e| err422(e.to_string()))?,
                 req.interval,
                 start_cash.to_string(),
+                live_certified as i64,
                 state::now_ms()
             ],
         )
         .map_err(|e| err422(e.to_string()))?;
     }
-    state::persist_event(&app, &id, "INFO", "LIFECYCLE", "bot created & running").await;
+    state::persist_event(
+        &app,
+        &id,
+        "INFO",
+        "LIFECYCLE",
+        if mode == "LIVE" {
+            "LIVE bot certified and created PAUSED; explicit START preflight is required"
+        } else {
+            "PAPER bot created & running"
+        },
+    )
+    .await;
     // Task 20 L5 — makro takvim staleness'u: takvim 2026 sonuna kadar kapsar;
     // bayat takvimde Gate 7 sessizce no-op olur. Sessiz koruma kaybı YOK —
     // her yeni bot için bir kez görünür uyarı.
@@ -2681,7 +2706,7 @@ async fn create_bot(
     }
     let _ = app.sse.send(SseEvent {
         event: "BOT_STATE".into(),
-        data: json!({"botId": id.clone(), "status": "RUNNING", "action": "CREATED"}).to_string(),
+        data: json!({"botId": id.clone(), "status": status, "action": "CREATED"}).to_string(),
     });
     // 201 sözleşmesi: e2e + UI `CreateBotResponse {id, status, warnings?}` bekler
     // (onaylanan advisory uyarılar yanıtta yankılanır).
@@ -2689,7 +2714,7 @@ async fn create_bot(
         StatusCode::CREATED,
         Json(json!({
             "id": id,
-            "status": "RUNNING",
+            "status": status,
             "warnings": warnings,
         })),
     )
@@ -2748,6 +2773,38 @@ async fn patch_bot(
     Path(id): Path<String>,
     Json(req): Json<PatchBotReq>,
 ) -> Result<Json<Value>, axum::response::Response> {
+    let live_strategy_change = {
+        let runtimes = app.runtimes.lock().await;
+        runtimes.get(&id).is_some_and(|rt| {
+            rt.mode.eq_ignore_ascii_case("LIVE")
+                && req.status.is_none()
+                && (req.target_profit_pct.is_some()
+                    || req.stop_loss_pct.is_some()
+                    || req.trailing_enabled.is_some())
+        })
+    };
+    if live_strategy_change {
+        return Err(err422(
+            "LIVE strateji/risk ayarları sertifika kapısını geçersiz kılabileceği için PATCH edilemez; yeni ayarları ayrı bir bot olarak yeniden sertifikalandırın",
+        ));
+    }
+    if req
+        .status
+        .as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case("RUNNING"))
+    {
+        let is_live = app
+            .runtimes
+            .lock()
+            .await
+            .get(&id)
+            .is_some_and(|rt| rt.mode.eq_ignore_ascii_case("LIVE"));
+        if is_live {
+            return Err(err422(
+                "LIVE botlar PATCH ile başlatılamaz; ön kontrolleri çalıştıran explicit START aksiyonunu kullanın",
+            ));
+        }
+    }
     let _live_ownership_guard = if req
         .status
         .as_deref()
@@ -3029,6 +3086,26 @@ async fn bot_actions(
     // Faz 13A (IEA, handler ölçeği): LIVE ADD_FUNDS — plan kısa kilitte, AĞ
     // ÇAĞRISI kilit dışında, uygulama yeni kilitte. PAPER normal akışa düşer.
     if req.action == "ADD_FUNDS" {
+        let live_identity = {
+            let rts = app.runtimes.lock().await;
+            rts.get(&id)
+                .filter(|rt| rt.mode.eq_ignore_ascii_case("LIVE"))
+                .map(|rt| (rt.venue.to_uppercase(), rt.cfg.symbol.clone()))
+        };
+        let _live_ownership_guard = if let Some((venue, symbol)) = live_identity {
+            Some(
+                lock_live_ownership(&app, &id, &venue, &symbol)
+                    .await
+                    .map_err(err422)?,
+            )
+        } else {
+            None
+        };
+        let _add_funds_poll_guard = if _live_ownership_guard.is_some() {
+            Some(acquire_bot_poll_guard(&app, &id).await)
+        } else {
+            None
+        };
         // Faz 17 (P0-7): ADD_FUNDS da yürütme şalterlerine saygılı — şalter
         // devredeyken borsaya emir gitmez (şalterin anlamı korunur).
         if app.kill_engaged().await {
@@ -3062,6 +3139,9 @@ async fn bot_actions(
                 .as_deref()
                 .and_then(|s| Fraction::from_any_str(s).ok());
             let plan = if rt.mode == "LIVE" {
+                if rt.status != "RUNNING" {
+                    return Err(err422("LIVE ADD_FUNDS yalnız RUNNING botta kullanılabilir"));
+                }
                 let amount = req
                     .amount
                     .clone()
@@ -3112,7 +3192,16 @@ async fn bot_actions(
                         0
                     },
                 };
-                Some((req_o, order_id, qty, mark_v))
+                let gate = state::GateCtx {
+                    pos_mode_blocked: rt.pos_mode_blocked,
+                    last_close: Some(mark_v.clone()),
+                    leverage: rt.stepper.cfg.leverage.clone(),
+                    is_spot: rt.stepper.cfg.is_spot,
+                    quote: rt.stepper.instrument.quote.clone(),
+                    min_notional: rt.stepper.instrument.min_notional.clone(),
+                    venue: rt.venue.clone(),
+                };
+                Some((req_o, order_id, qty, mark_v, gate, rt.cfg.kind.is_futures()))
             } else {
                 None
             };
@@ -3124,7 +3213,7 @@ async fn bot_actions(
                 plan,
             )
         };
-        if let Some((req_o, order_id, qty, mark_v)) = planned {
+        if let Some((req_o, order_id, qty, mark_v, gate, is_futures)) = planned {
             // --- kilit yok; ağ serbest ---
             let adapter = app
                 .adapter(&venue)
@@ -3132,6 +3221,28 @@ async fn bot_actions(
             let creds = store::load_active_key(&app.db, &app.vault, &venue)
                 .map_err(err422)?
                 .ok_or_else(|| err422("live mode requires vault credentials"))?;
+            if !live_certification_is_current(&app, &id).map_err(err422)? {
+                return Err(err422(
+                    "LIVE ADD_FUNDS reddedildi: botun geçerli sertifikası yok",
+                ));
+            }
+            validate_live_preflight(&app, &venue, &creds, is_futures, true)
+                .await
+                .map_err(|e| err422(format!("LIVE ADD_FUNDS ön kontrolü başarısız: {e}")))?;
+            engine::pre_order_gate_ctx(&app, &gate, adapter, &creds, Some(&mark_v), &qty)
+                .await
+                .map_err(|e| err422(format!("LIVE ADD_FUNDS bakiye/risk kapısı: {e}")))?;
+            let still_running = app
+                .runtimes
+                .lock()
+                .await
+                .get(&id)
+                .is_some_and(|rt| rt.mode == "LIVE" && rt.status == "RUNNING");
+            if !still_running {
+                return Err(err422(
+                    "LIVE bot işlem öncesinde duraklatıldı; ADD_FUNDS iptal edildi",
+                ));
+            }
             adapter
                 .place_order(&creds, &req_o)
                 .await
@@ -3188,18 +3299,27 @@ async fn bot_actions(
     } else {
         None
     };
-    let (_start_poll_guard, mut start_credentials) = if req.action == "START" {
-        let live_venue = {
+    let (_start_poll_guard, mut start_credentials) = if matches!(
+        req.action.as_str(),
+        "START" | "UNFREEZE"
+    ) {
+        let live_context = {
             let rts = app.runtimes.lock().await;
             rts.get(&id)
                 .filter(|rt| rt.mode.eq_ignore_ascii_case("LIVE"))
-                .map(|rt| rt.venue.to_uppercase())
+                .map(|rt| (rt.venue.to_uppercase(), rt.cfg.kind.is_futures()))
         };
-        if let Some(venue) = live_venue {
+        if let Some((venue, is_futures)) = live_context {
             let guard = acquire_bot_poll_guard(&app, &id).await;
+            if !live_certification_is_current(&app, &id).map_err(err422)? {
+                return Err(err422("LIVE bot için geçerli sunucu sertifikası yok; eski botu yeniden sertifikalandırmak için yeni LIVE yapılandırması oluşturun"));
+            }
             let credentials = store::load_active_key(&app.db, &app.vault, &venue)
                 .map_err(err422)?
                 .ok_or_else(|| err422("LIVE bot başlatılamadı: aktif kasa anahtarı bulunamadı"))?;
+            validate_live_preflight(&app, &venue, &credentials, is_futures, true)
+                .await
+                .map_err(|e| err422(format!("LIVE başlatma ön kontrolü başarısız: {e}")))?;
             (Some(guard), Some(credentials))
         } else {
             (None, None)
@@ -3232,6 +3352,11 @@ async fn bot_actions(
         "UNFREEZE" => {
             if rt.status != "FROZEN" {
                 return Err(err422("unfreeze yalnız FROZEN botta"));
+            }
+            if rt.mode == "LIVE" {
+                rt.credentials = Some(start_credentials.take().ok_or_else(|| {
+                    err422("LIVE bot çözülemedi: aktif kasa anahtarı bulunamadı")
+                })?);
             }
             rt.status = "RUNNING".into();
         }

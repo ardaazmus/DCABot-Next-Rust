@@ -503,7 +503,7 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
             <h2 className="truncate text-lg font-bold text-slate-50">{bot.name}</h2>
             <KindBadge kind={bot.kind} />
             <VenueChip venue={bot.venue} />
-            <ModeBadge mode={bot.mode} />
+            <ModeBadge mode={bot.mode} executionEnvironment={bot.executionEnvironment} />
             <StatusPill status={bot.status} />
           </div>
           <div className="num mt-0.5 text-[11px] text-slate-400">
@@ -534,7 +534,13 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
               className="min-h-9 border-emerald-500/50 text-emerald-300 hover:bg-emerald-500/10"
               onClick={async () => {
                 try {
-                  await apiPatchBot(bot.id, { status: "RUNNING" });
+                  if (bot.mode === "LIVE") {
+                    const action = bot.status === "FROZEN" ? "UNFREEZE" : "START";
+                    if (!window.confirm(`${bot.name} LIVE modda ${action === "START" ? "başlatılacak" : "dondurulmuş durumdan çıkarılacak"}. Başlatma ön kontrolleri geçerse gerçek borsa emirleri gönderilebilir. Devam edilsin mi?`)) return;
+                    await apiBotAction(bot.id, action);
+                  } else {
+                    await apiPatchBot(bot.id, { status: "RUNNING" });
+                  }
                   toast({ title: `${bot.name} başlatıldı` });
                 } catch (e) {
                   toast({ title: "Hata", description: String(e), variant: "destructive" });

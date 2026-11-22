@@ -38,6 +38,7 @@ impl Db {
                 stats TEXT NOT NULL DEFAULT '{}',
                 interval TEXT,
                 start_cash TEXT,
+                live_certified INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS fills (
@@ -182,6 +183,13 @@ impl Db {
         if !existing.iter().any(|c| c == "start_cash") {
             conn.execute("ALTER TABLE bots ADD COLUMN start_cash TEXT", [])
                 .map_err(|e| e.to_string())?;
+        }
+        if !existing.iter().any(|c| c == "live_certified") {
+            conn.execute(
+                "ALTER TABLE bots ADD COLUMN live_certified INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
         }
         // P4-3 OKX passphrase: eski kasalara sonradan eklenir (boş = yok).
         let vault_cols = cols("vault_keys")?;

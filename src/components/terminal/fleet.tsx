@@ -155,7 +155,7 @@ function BotIdentityBadges({ bot }: { bot: BotRow }) {
     <>
       <KindBadge kind={bot.kind} />
       <VenueChip venue={bot.venue} />
-      <ModeBadge mode={bot.mode} />
+      <ModeBadge mode={bot.mode} executionEnvironment={bot.executionEnvironment} />
     </>
   );
 }
@@ -465,12 +465,32 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
     }
   };
 
-  const togglePause = (b: BotRow) =>
-    withBusy(b.id, async () => {
-      const target = b.status === "RUNNING" ? "PAUSED" : "RUNNING";
-      await apiPatchBot(b.id, { status: target });
-      toast({ title: `${b.name}`, description: `Durum → ${target}` });
+  const resumeBot = (b: BotRow) => {
+    const run = () => withBusy(b.id, async () => {
+      if (b.mode === "LIVE") await apiBotAction(b.id, b.status === "FROZEN" ? "UNFREEZE" : "START");
+      else await apiPatchBot(b.id, { status: "RUNNING" });
+      toast({ title: `${b.name}`, description: b.mode === "LIVE" ? "LIVE başlatma ön kontrolleri geçti." : "RUNNING" });
     });
+    if (b.mode === "LIVE") {
+      setConfirmation({
+        title: `${b.name} LIVE modda başlatılsın mı?`,
+        description: "Bu onay gerçek borsa emirlerine izin verebilir. Başlatma öncesi self-check, API yetkileri, IP kısıtı, sertifika, bakiye ve kill/freeze durumu yeniden doğrulanır.",
+        confirmLabel: "LIVE Başlat",
+        tone: "danger",
+        onConfirm: run,
+      });
+    } else {
+      void run();
+    }
+  };
+
+  const togglePause = (b: BotRow) => {
+    if (b.status !== "RUNNING") return resumeBot(b);
+    return withBusy(b.id, async () => {
+      await apiPatchBot(b.id, { status: "PAUSED" });
+      toast({ title: `${b.name}`, description: "Durum → PAUSED" });
+    });
+  };
 
   /* Faz 24 (UI/UX Pro Max raporu §3.2.3): PANIC — açık pozisyonu marketten
      kapat (CLOSE_ALL) ve botu durdur (STOP). İki aşamalı onaylı. */
@@ -521,12 +541,19 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
   };
 
   /* P2-2 Freeze: RUNNING → FROZEN (yeni emir yok, açıklar korunur), geri dönüş RUNNING. */
-  const toggleFreeze = (b: BotRow) =>
-    withBusy(b.id, async () => {
-      const action = b.status === "FROZEN" ? "UNFREEZE" : "FREEZE";
-      await apiBotAction(b.id, action);
-      toast({ title: `${b.name}`, description: action === "FREEZE" ? "Donduruldu — yeni emir üretilmez, açıklar korunur." : "Çözüldü → RUNNING" });
+  const toggleFreeze = (b: BotRow) => {
+    if (b.status === "FROZEN") {
+      if (b.mode === "LIVE") return resumeBot(b);
+      return withBusy(b.id, async () => {
+        await apiBotAction(b.id, "UNFREEZE");
+        toast({ title: `${b.name}`, description: "Çözüldü → RUNNING" });
+      });
+    }
+    return withBusy(b.id, async () => {
+      await apiBotAction(b.id, "FREEZE");
+      toast({ title: `${b.name}`, description: "Donduruldu — yeni emir üretilmez, açıklar korunur." });
     });
+  };
 
   const closeAll = (b: BotRow) => {
     setCloseAllDialogId(b.id);
@@ -575,14 +602,15 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
     const targets = [...pausedBots];
     setConfirmation({
       title: "Duraklatılmış botlar başlatılsın mı?",
-      description: `${targets.length} bot yeniden RUNNING durumuna alınacak. Giriş kapıları emir açmayı engelleyebilir.`,
+      description: `${targets.length} bot yeniden çalıştırılacak. ${targets.filter((b) => b.mode === "LIVE").length} LIVE bot etkin borsa endpoint'ine emir gönderebilir (Mainnet ise gerçek fon riski vardır); LIVE ön kontrolleri her botta yeniden çalışır.`,
       confirmLabel: "Tümünü Başlat",
       tone: "normal",
       onConfirm: async () => {
         let ok = 0;
         for (const b of targets) {
           try {
-            await apiPatchBot(b.id, { status: "RUNNING" });
+            if (b.mode === "LIVE") await apiBotAction(b.id, "START");
+            else await apiPatchBot(b.id, { status: "RUNNING" });
             ok++;
           } catch {
             /* devam et */
@@ -706,7 +734,7 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
             {([
               { mode: "ALL", label: "Tümü", count: modeCounts.ALL },
               { mode: "PAPER", label: "PAPER", count: modeCounts.PAPER },
-              { mode: "LIVE", label: "Gerçek · LIVE", count: modeCounts.LIVE },
+              { mode: "LIVE", label: "Borsa · LIVE", count: modeCounts.LIVE },
             ] as const).map((option) => {
               const active = modeF === option.mode;
               const tone = option.mode === "PAPER"
@@ -1109,17 +1137,13 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
                   ) : b.status === "STOPPED" ? (
                     // Faz 23 (UI derin inceleme #8): STOPPED bot ölü uçtu —
                     // UI'da START yolu hiç yoktu (yalnız apiStopAllBots bunları
-                    // üretiyordu). Devam = patch status RUNNING.
+                    // üretiyordu). LIVE devamı explicit START kapısından geçer.
                     <Button
                       size="sm"
                       variant="outline"
                       className="min-h-9 border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10"
                       disabled={busyId === b.id}
-                      onClick={() =>
-                        void apiPatchBot(b.id, { status: "RUNNING" })
-                          .then(() => toast({ title: `${b.name} devam ettirildi`, description: "RUNNING" }))
-                          .catch((e) => toast({ title: "Devam ettirilemedi", description: String(e) }))
-                      }
+                      onClick={() => resumeBot(b)}
                     >
                       <Play className="h-3.5 w-3.5" aria-hidden />
                       Devam

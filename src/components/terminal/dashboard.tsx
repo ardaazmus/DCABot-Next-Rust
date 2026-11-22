@@ -738,7 +738,7 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
                       <span className="truncate text-sm font-semibold text-slate-100">{b.name}</span>
                       <KindBadge kind={b.kind} />
                       <VenueChip venue={b.venue} />
-                      <ModeBadge mode={b.mode} />
+                      <ModeBadge mode={b.mode} executionEnvironment={b.executionEnvironment} />
                       {b.stats.phase === "Open" &&
                         b.config?.max_safety_orders != null &&
                         b.stats.safety_triggered >= b.config.max_safety_orders && (

@@ -133,13 +133,9 @@ export interface CreateBotResponse {
 export async function apiCreateBot(
   body: CreateBotBody,
   riskAcknowledged?: boolean,
-  certAcknowledged?: boolean,
 ): Promise<CreateBotResponse> {
-  /* ÜRÜN-1: LIVE sertifika kapısı KALDI verdiyse sihirbazın bilinçli-onay
-     kutusuyla tek istisna — motor onayı kalıcı WARN olayına yazar. */
   const flags: Record<string, boolean> = {};
   if (riskAcknowledged !== undefined) flags.risk_acknowledged = riskAcknowledged;
-  if (certAcknowledged !== undefined) flags.cert_acknowledged = certAcknowledged;
   const payload = Object.keys(flags).length === 0 ? body : { ...body, ...flags };
   return engineFetch("/api/bots", engineJson("POST", payload));
 }
