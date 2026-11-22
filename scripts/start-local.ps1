@@ -121,8 +121,10 @@ try {
     $coreProcess = Start-Process -FilePath $coreBinary -WorkingDirectory $runtimeDirectory -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $runtimeDirectory 'core.stdout.log') -RedirectStandardError (Join-Path $runtimeDirectory 'core.stderr.log')
     Wait-LocalHttp 'http://127.0.0.1:3002/api/health' 20
     # The UI receives only its proxy key and session signer.
-    Remove-Item Env:DCA_API_KEY -ErrorAction SilentlyContinue
-    Remove-Item Env:DCA_VAULT_KEY -ErrorAction SilentlyContinue
+    # An empty value prevents Next's automatic .env loading from re-importing
+    # the engine/vault secrets into the UI process.
+    $env:DCA_API_KEY = ''
+    $env:DCA_VAULT_KEY = ''
     $env:ENGINE_API_KEY = $keyValues['DCA_API_KEY']
     $env:DCA_SESSION_SECRET = $keyValues['DCA_SESSION_SECRET']
     $nodeBinary = (Get-Command node -ErrorAction Stop).Source

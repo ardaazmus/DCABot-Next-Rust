@@ -33,9 +33,10 @@ function enginePort(): string {
 function engineKey(): string {
   // Faz 22 (N-13): NEXT_PUBLIC_ fallback SİLİNDİ — o önekli her değişken,
   // herhangi bir istemci dosyası okuduğu anda pakete girer; anahtarın tek
-  // kaynağı sunucu env'idir. Motorun gerçek anahtarı DCA_API_KEY'dir
-  // (start-local üretir); ENGINE_API_KEY opsiyonel takma addır.
-  return process.env.DCA_API_KEY || process.env.ENGINE_API_KEY || "";
+  // kaynağı sunucu env'idir. UI süreci için ayrılmış ENGINE_API_KEY önce gelir:
+  // Next.js .env'den eski DCA_API_KEY değerini yüklemiş olsa bile, PAPER motor
+  // anahtarının üstüne yazıp bot listesini 401'le boş gösteremez.
+  return process.env.ENGINE_API_KEY || process.env.DCA_API_KEY || "";
 }
 
 /** N-12: proxy'ye CSRF/origin kapısı — same-origin doğrulaması.

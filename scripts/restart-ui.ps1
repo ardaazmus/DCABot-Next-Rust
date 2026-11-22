@@ -22,8 +22,8 @@ if (Test-Path -LiteralPath $keysFile) {
     throw "local-keys.env yok: $keysFile"
 }
 if (-not $keyValues['DCA_API_KEY'] -or -not $keyValues['DCA_SESSION_SECRET']) { throw 'local-keys.env UI anahtarlari eksik' }
-Remove-Item Env:DCA_API_KEY -ErrorAction SilentlyContinue
-Remove-Item Env:DCA_VAULT_KEY -ErrorAction SilentlyContinue
+$env:DCA_API_KEY = ''
+$env:DCA_VAULT_KEY = ''
 $env:ENGINE_API_KEY = $keyValues['DCA_API_KEY']
 $env:DCA_SESSION_SECRET = $keyValues['DCA_SESSION_SECRET']
 
