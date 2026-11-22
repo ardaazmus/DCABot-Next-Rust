@@ -566,7 +566,7 @@ export function Dashboard({ onInspect, onNewBot }: { onInspect: (id: string) => 
             Maruziyet / Marj
           </div>
           <div className="mt-3">
-            <ExposureBar longPct={longPct} shortPct={0} />
+            <ExposureBar longPct={longPct} shortPct={shortPct} />
           </div>
           {/* Faz 25 (UIX-40): "L $3,230 / S $3,086" neyin değeri belirsizdi —
               açık pozisyon notional'ı + özkaynağa oranı net etiketle. */}

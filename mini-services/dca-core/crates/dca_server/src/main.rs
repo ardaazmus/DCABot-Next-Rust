@@ -63,18 +63,22 @@ struct RateLimiter {
 }
 
 impl RateLimiter {
-    fn check(&mut self, _key: &str) -> bool {
+    fn check(&mut self, key: &str) -> bool {
         let now = Instant::now();
         let window_start = now - std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
 
-        // Eğer bucket sayısı sınırı aşıldıysa, en eski boş/eaşırı süren bucket'ları temizle.
-        if self.buckets.len() >= RATE_LIMIT_MAX_BUCKETS {
+        // Yeni kimlikler için önce süresi dolmuş kovaları temizle; doluysa
+        // yeni kimliği reddet ki saldırgan anahtarla bellek sınırsız büyümesin.
+        if !self.buckets.contains_key(key) && self.buckets.len() >= RATE_LIMIT_MAX_BUCKETS {
             self.buckets.retain(|_, v| {
                 v.iter().any(|t| *t > window_start)
             });
+            if self.buckets.len() >= RATE_LIMIT_MAX_BUCKETS {
+                return false;
+            }
         }
 
-        let entry = self.buckets.entry(_key.to_string()).or_default();
+        let entry = self.buckets.entry(key.to_string()).or_default();
         entry.retain(|t| *t > window_start);
         if entry.len() < RATE_LIMIT_MAX {
             entry.push(now);
@@ -83,6 +87,24 @@ impl RateLimiter {
             false
         }
     }
+}
+
+/// The engine is bound to loopback and sits behind the local Next proxy. The
+/// peer address is supplied by the TCP connection; forwarded headers are
+/// client-controlled and must never define a rate-limit identity.
+fn rate_limit_key(req: &axum::extract::Request) -> String {
+    req.extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|connect| connect.0.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+async fn acquire_bot_poll_guard(app: &AppState, bot_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = {
+        let mut locks = app.poll_locks.lock().await;
+        locks.entry(bot_id.to_string()).or_insert_with(|| Arc::new(AsyncMutex::new(()))).clone()
+    };
+    lock.lock_owned().await
 }
 
 #[tokio::main]
@@ -171,6 +193,7 @@ async fn main() {
 
     // SEC-04: rate limiter durumu (tüm yönetim rotaları ortak kotalar).
     let rate_limiter = Arc::new(AsyncMutex::new(RateLimiter::default()));
+    let sse_rate_limiter = rate_limiter.clone();
 
     // SEC-01: Yönetim API kimlik doğrulaması — DCA_API_KEY env'de zorunlu.
     // Eksikse anahtar boş bırakılır ve tüm authenticated istekler 401 döner
@@ -260,26 +283,10 @@ async fn main() {
             middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
                 let limiter = rate_limiter.clone();
                 async move {
-                    // Faz 28 (P2-1 — bağımsız denetim): per-IP bucket — eski
-                    // tek "gateway" kovası TÜM istemcileri birleştiriyordu;
-                    // yoğun bir dashboard tarayıcısı webhook/api trafiğini
-                    // boğabiliyordu. Anahtar: proxy arkasındaysa ilk XFF hop'u
-                    // (engine yalnız loopback'e bind — XFF'i Next proxy yazar;
-                    // doğrudan maruz kalmada XFF SAHTELENEBİLİR — o senaryoda
-                    // XFF güvenilir bir kimlik DEĞİLDİR), yoksa gerçek
-                    // ConnectInfo IP'si.
-                    let key = req
-                        .headers()
-                        .get("x-forwarded-for")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.split(',').next())
-                        .map(|s| s.trim().to_string())
-                        .unwrap_or_else(|| {
-                            req.extensions()
-                                .get::<axum::extract::ConnectInfo<SocketAddr>>()
-                                .map(|c| c.0.ip().to_string())
-                                .unwrap_or_else(|| "unknown".into())
-                        });
+                    // The engine only accepts loopback connections from the
+                    // local UI proxy. Use the socket peer; X-Forwarded-For is
+                    // preserved from browser input and is therefore spoofable.
+                    let key = rate_limit_key(&req);
                     let allowed = {
                         let mut l = limiter.lock().await;
                         l.check(&key)
@@ -294,22 +301,25 @@ async fn main() {
         // M-15: yönetim uçlarında gövde limiti — 1MB isim gibi aşırı yük reddedilir.
         .layer(axum::extract::DefaultBodyLimit::max(131_072));
 
-    // SEC-FIND-03: SSE akışı kimlik doğrulaması — Bearer başlığı veya ?token=<DCA_API_KEY>.
+    // SEC-FIND-03: SSE akışı yalnız Authorization Bearer başlığıyla doğrulanır.
     let sse_api_key = api_key.clone();
     let sse_routes = Router::new().route(
         "/api/stream",
-        get(move |headers: axum::http::HeaderMap, query: axum::extract::Query<std::collections::HashMap<String, String>>| {
+        get(move |headers: axum::http::HeaderMap| {
             let st = sse_state.clone();
-            let rx = sse_rx.resubscribe();
             let key = sse_api_key.clone();
             async move {
+                // Bound the number of concurrent streams before allocating a
+                // replay query and a new broadcast receiver for the client.
+                if st.sse.receiver_count() > 128 {
+                    return (StatusCode::SERVICE_UNAVAILABLE, "too many event streams").into_response();
+                }
+                let rx = sse_rx.resubscribe();
                 let auth_header = headers
                     .get("authorization")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|h| h.strip_prefix("Bearer "));
-                let auth_query = query.get("token").map(|s| s.as_str());
-
-                let provided = auth_header.or(auth_query).unwrap_or("");
+                let provided = auth_header.unwrap_or("");
                 if !constant_time_eq_str(provided, &key) {
                     return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
                 }
@@ -321,7 +331,20 @@ async fn main() {
                 sse_handler(st, rx, last_event_id).await.into_response()
             }
         }),
-    );
+    ).layer(middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
+        let limiter = sse_rate_limiter.clone();
+        async move {
+            let key = rate_limit_key(&req);
+            let allowed = {
+                let mut limiter = limiter.lock().await;
+                limiter.check(&key)
+            };
+            if !allowed {
+                return Err(StatusCode::TOO_MANY_REQUESTS);
+            }
+            Ok(next.run(req).await)
+        }
+    }));
 
     let app = health_routes
         .merge(api_routes)
@@ -842,6 +865,28 @@ async fn restore_bots(app: &Arc<AppState>) {
 /// BOT-03: restore edilen RUNNING/PAUSED/FROZEN botları venue ile uzlaştır:
 /// açık pozisyonu stepper'a, açık emirleri live_open_orders'a yükler.
 /// Uzlaştırma bitmeden yeni deal açılmaz (durum RECONCILING).
+fn restored_order_semantics(bot_id: &str, order_id: &str) -> Option<(&'static str, dca_kernel::OrderKind)> {
+    let prefix = format!("{bot_id}-");
+    let suffix = order_id.strip_prefix(&prefix)?;
+    let role = if suffix.contains("-GRID_CLOSE-") {
+        ("GRID_CLOSE", dca_kernel::OrderKind::Reduce)
+    } else if suffix.contains("-TPL-") || suffix.contains("-SL-") || suffix.contains("-MANUAL-") {
+        let role = if suffix.contains("-TPL-") { "TP" } else if suffix.contains("-SL-") { "SL" } else { "MANUAL" };
+        (role, dca_kernel::OrderKind::Reduce)
+    } else if suffix.contains("-TRAIL-") || suffix.contains("-INF-") {
+        ("TP", dca_kernel::OrderKind::Reduce)
+    } else if suffix.contains("-SAFETY-") {
+        ("SAFETY", dca_kernel::OrderKind::Add)
+    } else if suffix.contains("-GRID-") {
+        ("GRID", dca_kernel::OrderKind::Add)
+    } else if suffix.contains("-BASE-") || suffix.starts_with("BASE-") {
+        ("BASE", dca_kernel::OrderKind::Add)
+    } else {
+        return None;
+    };
+    Some(role)
+}
+
 async fn reconcile_restored_bots(app: &Arc<AppState>) {
     let bot_ids: Vec<String> = {
         let rts = app.runtimes.lock().await;
@@ -916,6 +961,22 @@ async fn reconcile_restored_bots(app: &Arc<AppState>) {
             Ok(open_orders) => {
                 let mut added = 0usize;
                 for o in &open_orders {
+                    // open_orders is account-wide on several venues. Never
+                    // attach another bot's same-symbol order to this runtime.
+                    if !o.order_link_id.starts_with(&format!("{id}-")) {
+                        continue;
+                    }
+                    let Some((role, kind)) = restored_order_semantics(&id, &o.order_link_id) else {
+                        if let Some(rt_mut) = app.runtimes.lock().await.get_mut(&id) {
+                            rt_mut.status = "FROZEN".into();
+                        }
+                        state::persist_status(app, &id, "FROZEN");
+                        state::persist_event(app, &id, "CRITICAL", "RESTORE", &format!(
+                            "bu botun açık emrinin rolü çözülemedi ({}); yeni emirler güvenlik için durduruldu",
+                            o.order_link_id
+                        )).await;
+                        continue;
+                    };
                     let already = {
                         let rts = app.runtimes.lock().await;
                         rts.get(&id).map(|rt| rt.live_open_orders.iter().any(|t| t.id == o.order_link_id)).unwrap_or(false)
@@ -927,10 +988,10 @@ async fn reconcile_restored_bots(app: &Arc<AppState>) {
                                 rt_mut.live_open_orders.push(state::LiveTrackedOrder {
                                     id: o.order_link_id.clone(),
                                     side: match o.side.as_str() { "Sell" => dca_math::Side::Sell, _ => dca_math::Side::Buy },
-                                    kind: dca_kernel::OrderKind::Add,
+                                    kind,
                                     price: o.price.clone().unwrap_or_else(Fraction::zero),
                                     qty: o.qty.clone(),
-                                    role: "RESTORED".into(),
+                                    role: role.into(),
                                 });
                                 added += 1;
                             }
@@ -2191,10 +2252,30 @@ async fn bot_actions(State(app): State<Arc<AppState>>, Path(id): Path<String>, J
         }
         let _ = (mark, step_size); // PAPER: normal akışa düş
     }
+    let (_start_poll_guard, mut start_credentials) = if req.action == "START" {
+        let live_venue = {
+            let rts = app.runtimes.lock().await;
+            rts.get(&id).filter(|rt| rt.mode == "LIVE").map(|rt| rt.venue.to_uppercase())
+        };
+        if let Some(venue) = live_venue {
+            let guard = acquire_bot_poll_guard(&app, &id).await;
+            let credentials = store::load_active_key(&app.db, &app.vault, &venue)
+                .map_err(err422)?
+                .ok_or_else(|| err422("LIVE bot başlatılamadı: aktif kasa anahtarı bulunamadı"))?;
+            (Some(guard), Some(credentials))
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
     let mut rts = app.runtimes.lock().await;
     let rt = rts.get_mut(&id).ok_or_else(|| err422("bot not found"))?;
     match req.action.as_str() {
         "START" => {
+            if rt.mode == "LIVE" {
+                rt.credentials = Some(start_credentials.take().ok_or_else(|| err422("LIVE bot başlatılamadı: aktif kasa anahtarı bulunamadı"))?);
+            }
             rt.status = "RUNNING".into();
         }
         "PAUSE" => {
@@ -3946,36 +4027,30 @@ struct TradingViewWebhookReq {
 
 async fn tradingview_webhook(
     State(app): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    connect_info: Option<axum::extract::ConnectInfo<SocketAddr>>,
     Json(req): Json<TradingViewWebhookReq>,
 ) -> axum::response::Response {
     // Faz 22 (P2-10 dilim): webhook rate-limit — IP bazlı sabit pencere
     // (60 sn / 60 istek). Secret doğrulamasından ÖNCE kapatılır: flood
     // denemeleri DB/runtime kilidine hiç dokunmaz.
     {
-        let ip: String = headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
-            .map(str::trim)
-            .map(|s| s.chars().take(45).collect())
+        let ip = connect_info
+            .map(|peer| peer.0.ip().to_string())
             .unwrap_or_else(|| "unknown".into());
         let now = crate::state::now_ms();
         const WINDOW_MS: i64 = 60_000;
         const WINDOW_MAX: u32 = 60;
+        const MAX_BUCKETS: usize = 2_000;
         let mut rate = app.webhook_rate.lock().await;
-        // SEC-FIND-05: Süresi dolmuş pencereleri temizle (bellek sızıntısı önleme)
-        if rate.len() > 100 {
-            rate.retain(|_, (t, _)| now - *t < WINDOW_MS);
-        }
-        if rate.len() > 2000 {
-            rate.clear();
+        rate.retain(|_, (started, _)| now.saturating_sub(*started) < WINDOW_MS);
+        if !rate.contains_key(&ip) && rate.len() >= MAX_BUCKETS {
+            return (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": "rate limit capacity exceeded"}))).into_response();
         }
         let entry = rate.entry(ip).or_insert((now, 0u32));
-        if now - entry.0 > WINDOW_MS {
+        if now.saturating_sub(entry.0) >= WINDOW_MS {
             *entry = (now, 0);
         }
-        entry.1 += 1;
+        entry.1 = entry.1.saturating_add(1);
         if entry.1 > WINDOW_MAX {
             drop(rate);
             return (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": "rate limit exceeded"}))).into_response();
@@ -3986,7 +4061,8 @@ async fn tradingview_webhook(
     let expected_secret = rts.get(&req.bot_id).map(|r| r.webhook_secret.clone()).unwrap_or_default();
     let is_valid = !expected_secret.is_empty() && constant_time_eq_str(&req.secret, &expected_secret);
     if !is_valid {
-        crate::state::persist_event(&app, &req.bot_id, "WARN", "WEBHOOK", "rejected: invalid secret or unknown bot").await;
+        drop(rts);
+        tracing::warn!("TradingView webhook rejected: invalid secret or unknown bot");
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "UNAUTHORIZED"}))).into_response();
     }
     let Some(rt) = rts.get_mut(&req.bot_id) else {
@@ -4343,20 +4419,29 @@ async fn remove_key(State(app): State<Arc<AppState>>, Path(id): Path<String>) ->
         let conn = app.db.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.query_row("SELECT venue FROM vault_keys WHERE id=?1", [&id], |r| r.get::<_, String>(0)).ok()
     };
+    let mut poll_guards: Vec<tokio::sync::OwnedMutexGuard<()>> = Vec::new();
     if let Some(venue) = venue {
         let venue_uc = venue.to_uppercase();
-        let to_stop: Vec<String> = {
+        let mut to_stop: Vec<String> = {
             let rts = app.runtimes.lock().await;
             rts.iter()
                 .filter(|(_, rt)| rt.mode == "LIVE" && rt.venue.to_uppercase() == venue_uc)
                 .map(|(id, _)| id.clone())
                 .collect()
         };
+        to_stop.sort();
         for bot_id in to_stop {
+            // Wait for any in-flight order cascade before dropping its last
+            // credential copy. Keep this guard until the DB row is deleted so
+            // START cannot reload the key in the middle of removal.
+            poll_guards.push(acquire_bot_poll_guard(&app, &bot_id).await);
             {
                 let mut rts = app.runtimes.lock().await;
                 if let Some(existing) = rts.get_mut(&bot_id) {
                     existing.status = "STOPPED".into();
+                    existing.credentials = None;
+                    existing.pending_engine_actions.clear();
+                    existing.webhook_start_requested = false;
                 }
             }
             state::persist_status(&*app, &bot_id, "STOPPED");
@@ -4376,6 +4461,8 @@ async fn remove_key(State(app): State<Arc<AppState>>, Path(id): Path<String>) ->
     }
     let conn = app.db.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute("DELETE FROM vault_keys WHERE id=?1", [&id]);
+    drop(conn);
+    drop(poll_guards);
     Json(json!({"ok": true}))
 }
 
@@ -4480,4 +4567,54 @@ fn async_stream_wrapper(
             }
         },
     )
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{HeaderValue, Request};
+
+    #[test]
+    fn rate_limit_identity_ignores_client_supplied_forwarded_headers() {
+        let peer = SocketAddr::from(([127, 0, 0, 1], 45_000));
+        let mut first = Request::new(Body::empty());
+        first.headers_mut().insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.1"),
+        );
+        first.extensions_mut().insert(ConnectInfo(peer));
+
+        let mut second = Request::new(Body::empty());
+        second.headers_mut().insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.2"),
+        );
+        second.extensions_mut().insert(ConnectInfo(peer));
+
+        assert_eq!(rate_limit_key(&first), rate_limit_key(&second));
+        assert_eq!(rate_limit_key(&first), "127.0.0.1");
+    }
+
+    #[test]
+    fn rate_limiter_never_grows_beyond_its_bucket_limit() {
+        let mut limiter = RateLimiter::default();
+        for index in 0..RATE_LIMIT_MAX_BUCKETS {
+            assert!(limiter.check(&format!("peer-{index}")));
+        }
+
+        assert!(!limiter.check("one-more-peer"));
+        assert_eq!(limiter.buckets.len(), RATE_LIMIT_MAX_BUCKETS);
+    }
+
+    #[test]
+    fn restored_order_roles_keep_reduce_semantics_and_bot_ownership() {
+        use dca_kernel::OrderKind;
+        assert_eq!(restored_order_semantics("b-1234abcd", "b-1234abcd-7-TPL-0"), Some(("TP", OrderKind::Reduce)));
+        assert_eq!(restored_order_semantics("b-1234abcd", "b-1234abcd-7-GRID_CLOSE-4294967296"), Some(("GRID_CLOSE", OrderKind::Reduce)));
+        assert_eq!(restored_order_semantics("b-1234abcd", "b-1234abcd-7-SAFETY-2"), Some(("SAFETY", OrderKind::Add)));
+        assert_eq!(restored_order_semantics("b-1234abcd", "b-9876abcd-7-TPL-0"), None);
+        assert_eq!(restored_order_semantics("b-1234abcd", "b-1234abcd-7-UNKNOWN-0"), None);
+    }
 }

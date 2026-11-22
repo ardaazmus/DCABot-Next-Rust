@@ -81,7 +81,7 @@ function SlideField({
 
 /* ---------------- Liquidation thermometer ---------------- */
 
-function LiquidationBar({ anchor, liq, leverage }: { anchor: number; liq: number | null; leverage: number }) {
+function LiquidationBar({ anchor, liq, leverage, direction }: { anchor: number; liq: number | null; leverage: number; direction: "long" | "short" }) {
   if (!liq || liq <= 0 || anchor <= 0) {
     return (
       <div className="rounded-lg border border-border bg-surface p-3 text-xs text-slate-500">
@@ -89,10 +89,12 @@ function LiquidationBar({ anchor, liq, leverage }: { anchor: number; liq: number
       </div>
     );
   }
+  const min = Math.min(anchor, liq) * 0.85;
   const max = Math.max(anchor, liq) * 1.15;
-  const liqPct = (liq / max) * 100;
-  const anchorPct = (anchor / max) * 100;
-  const bufferPct = Math.max(0, ((anchor - liq) / anchor) * 100);
+  const range = max - min || anchor;
+  const liqPct = ((liq - min) / range) * 100;
+  const anchorPct = ((anchor - min) / range) * 100;
+  const bufferPct = Math.max(0, (direction === "short" ? (liq - anchor) : (anchor - liq)) / anchor * 100);
   return (
     <div className="rounded-lg border border-border bg-surface p-4">
       <div className="mb-2 flex items-center justify-between text-xs">
@@ -104,8 +106,8 @@ function LiquidationBar({ anchor, liq, leverage }: { anchor: number; liq: number
       </div>
       <div className="relative h-7 w-full overflow-hidden rounded-full bg-secondary" role="img" aria-label="Likidasyon mesafesi">
         <div
-          className="absolute inset-y-0 left-0 bg-gradient-to-r from-rose-600/80 to-rose-500/40"
-          style={{ width: `${liqPct}%` }}
+          className={cn("absolute inset-y-0 bg-gradient-to-r from-rose-600/80 to-rose-500/40", direction === "long" ? "left-0" : "")}
+          style={direction === "long" ? { width: `${liqPct}%` } : { left: `${liqPct}%`, width: `${100 - liqPct}%` }}
         />
         <div className="absolute inset-y-0 w-0.5 bg-slate-100" style={{ left: `${anchorPct}%` }} />
         <span className="num absolute left-2 top-1/2 -translate-y-1/2 text-[10px] font-bold text-white/90">
@@ -476,17 +478,17 @@ function DcaCalc({
                 /* Faz 25 (UIX-31): SL altı seviyeler artık kırmızı alarm DEĞİL —
                     "SL ALTINDA" nötr (beklenen davranış); kırmızı yalnız gerçek
                     çatışma için. */
-                slPrice={slOn ? (fracToNum(anchor) ?? 0) * (1 - sl / 100) : null}
-                dir="long"
+                slPrice={slOn ? (fracToNum(anchor) ?? 0) * (direction === "short" ? 1 + sl / 100 : 1 - sl / 100) : null}
+                dir={direction}
               />
               {m20From !== null && (
                 <p className="px-2 pb-1 pt-2 text-[11px] text-rose-400">
                   <AlertTriangle className="mr-1 inline h-3 w-3" aria-hidden />
-                  L{m20From}&apos;den itibaren seviyeler SL öncesinde erişilemez: SL altındakiler nötr &quot;SL ALTINDA&quot;, geride kalan gerçek çatışmalar kırmızı işaretlenir.
+                  L{m20From}&apos;den itibaren seviyeler SL öncesinde erişilemez: yön dışındaki SL tarafında kalan seviyeler nötr, erişilebilirlik çatışmaları kırmızı işaretlenir.
                 </p>
               )}
             </Panel>
-            {market === "linear" && <LiquidationBar anchor={fracToNum(anchor) ?? 0} liq={res.liquidationPrice ? fracToNum(res.liquidationPrice) : null} leverage={leverage} />}
+            {market === "linear" && <LiquidationBar anchor={fracToNum(anchor) ?? 0} liq={res.liquidationPrice ? fracToNum(res.liquidationPrice) : null} leverage={leverage} direction={direction} />}
             {market === "linear" && <BracketsPanel symbol={symbol} />}
           </>
         )}

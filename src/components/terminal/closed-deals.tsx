@@ -27,6 +27,15 @@ interface ClosedDealsProps {
 
 type QuickDateFilter = "all" | "today" | "yesterday" | "7d" | "30d" | "custom";
 
+const EXIT_REASON_LABEL: Record<ClosedDeal["reason"], string> = {
+  TP: "KÂR AL (TP)",
+  SL: "ZARAR DURDUR (SL)",
+  LIQUIDATION: "LİKİDASYON",
+  MANUAL: "ELLE KAPATMA",
+  TRAIL: "TRAILING ÇIKIŞ",
+  CLOSE: "KAPANIŞ (NEDEN BELİRSİZ)",
+};
+
 function getTodayStr(): string {
   const d = new Date();
   return d.toISOString().slice(0, 10);
@@ -297,7 +306,7 @@ export function ClosedDealsLedger({ selectedDate, onClearDate, className }: Clos
                         ? "text-cyan-400"
                         : "text-rose-400"
                   )}
-                  title="Profit Factor: Toplam Brüt Kazanç / Toplam Brüt Kayıp"
+                  title="Profit Factor: net kârlı işlemler toplamı / net zararlı işlemler toplamı (ücret ve funding sonrası)"
                 >
                   {summary.profitFactor > 99 ? "∞" : summary.profitFactor.toFixed(2)}
                 </span>
@@ -357,7 +366,8 @@ export function ClosedDealsLedger({ selectedDate, onClearDate, className }: Clos
             </thead>
             <tbody className="divide-y divide-border/40">
               {deals.map((deal) => {
-                const isWin = deal.netPnl >= 0;
+                const isWin = deal.netPnl > 0;
+                const isRiskExit = deal.reason === "SL" || deal.reason === "LIQUIDATION";
                 return (
                   <tr key={deal.id} className="transition-colors hover:bg-surface-2/60">
                     {/* Timestamp */}
@@ -385,21 +395,21 @@ export function ClosedDealsLedger({ selectedDate, onClearDate, className }: Clos
                           "inline-flex items-center gap-1 rounded px-2 py-0.5 text-[10px] font-bold uppercase",
                           deal.reason === "TP"
                             ? "bg-emerald-500/15 text-emerald-400"
-                            : deal.reason === "LIQUIDATION"
-                              ? "bg-rose-500/20 text-rose-300"
-                              : "bg-rose-500/15 text-rose-400"
+                            : isRiskExit
+                              ? deal.reason === "LIQUIDATION"
+                                ? "bg-rose-500/20 text-rose-300"
+                                : "bg-rose-500/15 text-rose-400"
+                              : deal.reason === "TRAIL"
+                                ? "bg-cyan-500/15 text-cyan-300"
+                                : "bg-slate-500/15 text-slate-300"
                         )}
                       >
                         {deal.reason === "TP" ? (
                           <CheckCircle2 className="h-3 w-3" />
-                        ) : (
+                        ) : isRiskExit ? (
                           <XCircle className="h-3 w-3" />
-                        )}
-                        {deal.reason === "TP"
-                          ? "KÂR AL (TP)"
-                          : deal.reason === "LIQUIDATION"
-                            ? "LİKİDASYON"
-                            : "ZARAR DURDUR (SL)"}
+                        ) : null}
+                        {EXIT_REASON_LABEL[deal.reason]}
                       </span>
                     </td>
 

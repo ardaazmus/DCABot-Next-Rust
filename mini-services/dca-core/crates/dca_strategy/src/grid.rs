@@ -196,7 +196,9 @@ impl GridEngine {
         format!("{}-{}", self.bot_id, self.seq)
     }
 
-    /// Initial placement: buys below mark, sells above mark (neutral split M15).
+    /// Initial placement: buys below mark; futures may also sell above mark.
+    /// Spot grids must acquire inventory before placing sells, so their upper
+    /// levels are armed only after a buy opener fills and creates a close.
     /// Marks the start-condition gate as open (called only when the trigger passes).
     pub fn bootstrap(&mut self, mark: &Fraction) -> Vec<Action> {
         self.gate_open = true;
@@ -208,6 +210,9 @@ impl GridEngine {
             .enumerate()
             .filter_map(|(idx, p)| {
                 let is_buy = dca_math::Fraction::cmp(p, mark) == std::cmp::Ordering::Less;
+                if !is_buy && self.kind == StrategyKind::SpotGrid {
+                    return None;
+                }
                 let qty = dca_math::m02::qty_down(&notional_per_level.div(p).unwrap_or_else(|_| Fraction::zero()), &self.inst.step_size)
                     .unwrap_or_else(|_| Fraction::zero());
                 if qty.is_zero() {
@@ -449,6 +454,18 @@ mod start_condition_tests {
         assert!(!acts.is_empty(), "mesh orders placed");
         assert!(g.gate_open);
         assert!(g.snapshot().entry_trigger_met);
+    }
+
+    #[test]
+    fn spot_grid_bootstrap_never_sells_unowned_inventory() {
+        let mut cfg = cfg_with(EntryTrigger::Instant);
+        cfg.base_order_size = "100".into();
+        let mut grid = GridEngine::new("spot-grid-test", cfg, Instrument::default(), &Fraction::from_u64(100)).unwrap();
+
+        let actions = grid.bootstrap(&Fraction::from_u64(100));
+        assert!(!actions.is_empty(), "spot grid should seed buy levels below mark");
+        assert!(actions.iter().all(|action| matches!(action, Action::PlaceLimit { side: dca_math::Side::Buy, .. })));
+        assert_eq!(grid.level_armed.iter().filter(|armed| **armed).count(), actions.len());
     }
 
     #[test]

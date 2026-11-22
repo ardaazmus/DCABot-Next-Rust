@@ -430,8 +430,7 @@ export function SettingsView() {
                         </AlertDialogCancel>
                         <AlertDialogAction
                           className="bg-rose-500 text-white hover:bg-rose-600"
-                          onClick={(e) => {
-                            e.preventDefault();
+                          onClick={() => {
                             void removeKey(k.id);
                           }}
                         >

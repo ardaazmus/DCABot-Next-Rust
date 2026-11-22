@@ -27,6 +27,7 @@
 
 use axum::extract::State;
 use axum::Json;
+use dca_math::fraction::Fraction;
 use dca_exchange::VenueAdapter;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -177,6 +178,12 @@ fn f8(x: f64) -> String {
     format!("{x:.8}")
 }
 
+fn fraction_to_finite_f64(value: &str) -> Option<f64> {
+    let parsed = Fraction::from_any_str(value).ok()?;
+    let number = parsed.to_f64_display();
+    number.is_finite().then_some(number)
+}
+
 pub async fn fleet_risk(State(app): State<Arc<AppState>>) -> Json<Value> {
     // Acik pozisyonlar: runtime snapshot'lari, sembol bazinda grupla.
     // nav = Σ |qty| × mark (mark = yerel last_close; yoksa dislanir).
@@ -194,13 +201,12 @@ pub async fn fleet_risk(State(app): State<Arc<AppState>>) -> Json<Value> {
                 .stepper
                 .last_close
                 .as_deref()
-                .and_then(|s| s.parse::<f64>().ok())
+                .and_then(fraction_to_finite_f64)
                 .filter(|m| *m > 0.0 && m.is_finite());
             let qty = snap
                 .position_qty
-                .split('/')
-                .next()
-                .and_then(|s| s.trim().parse::<f64>().ok())
+                .as_str();
+            let qty = fraction_to_finite_f64(qty)
                 .map(|q| q.abs())
                 .unwrap_or(0.0);
             match (mark, qty > 0.0) {
@@ -328,6 +334,13 @@ mod risk_tests {
 
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() <= 1e-9 * b.abs().max(1.0)
+    }
+
+    #[test]
+    fn rational_quantity_and_mark_keep_the_denominator() {
+        assert_eq!(fraction_to_finite_f64("1/100"), Some(0.01));
+        assert_eq!(fraction_to_finite_f64("123/10"), Some(12.3));
+        assert_eq!(fraction_to_finite_f64("NaN"), None);
     }
 
     #[test]

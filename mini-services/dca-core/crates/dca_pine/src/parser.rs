@@ -6,6 +6,9 @@
 use crate::lexer::{lex, Line, Tok};
 use std::collections::BTreeSet;
 
+const MAX_NESTING_DEPTH: usize = 64;
+const MAX_EXPRESSION_TOKENS: usize = 512;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinKind {
     Add,
@@ -116,6 +119,7 @@ pub fn compile(src: &str) -> Result<Program, String> {
         functions_used: BTreeSet::new(),
         decl: None,
         notes: Vec::new(),
+        block_depth: 0,
     };
     let stmts = p.parse_block(0, true)?;
     if p.pos < p.lines.len() {
@@ -280,10 +284,22 @@ struct Parser {
     functions_used: BTreeSet<String>,
     decl: Option<ScriptDecl>,
     notes: Vec<String>,
+    block_depth: usize,
 }
 
 impl Parser {
     fn parse_block(&mut self, min_indent: usize, at_top: bool) -> Result<Vec<Stmt>, String> {
+        if self.block_depth >= MAX_NESTING_DEPTH {
+            let line = self.lines.get(self.pos).map(|l| l.no).unwrap_or(0);
+            return Err(format!("satır {line}: blok iç içe geçme sınırı ({MAX_NESTING_DEPTH}) aşıldı"));
+        }
+        self.block_depth += 1;
+        let result = self.parse_block_inner(min_indent, at_top);
+        self.block_depth -= 1;
+        result
+    }
+
+    fn parse_block_inner(&mut self, min_indent: usize, at_top: bool) -> Result<Vec<Stmt>, String> {
         // Blok: min_indent'ten büyük girintili ardışık satırlar; top-level'da
         // girinti 0 (= min_indent) serbest.
         let first_indent = self.lines.get(self.pos).map(|l| l.indent).unwrap_or(0);
@@ -441,7 +457,10 @@ impl Parser {
     }
 
     fn parse_expr_line(&mut self, toks: &[Tok], start: usize, no: usize) -> Result<Expr, String> {
-        let mut p = ExprParser { toks, pos: start, no, owner: self };
+        if toks.len().saturating_sub(start) > MAX_EXPRESSION_TOKENS {
+            return Err(format!("satır {no}: ifade token sınırı ({MAX_EXPRESSION_TOKENS}) aşıldı"));
+        }
+        let mut p = ExprParser { toks, pos: start, no, owner: self, depth: 0 };
         let e = p.parse_ternary()?;
         if !matches!(p.peek(), None | Some(Tok::Newline)) {
             return Err(format!("satır {no}: ifadenin sonunda beklenmeyen token"));
@@ -511,6 +530,7 @@ struct ExprParser<'a> {
     pos: usize,
     no: usize,
     owner: &'a mut Parser,
+    depth: usize,
 }
 
 impl<'a> ExprParser<'a> {
@@ -538,6 +558,16 @@ impl<'a> ExprParser<'a> {
 
     /// ternary → or → and → cmp → add → mul → unary → postfix(hist) → primary
     fn parse_ternary(&mut self) -> Result<Expr, String> {
+        if self.depth >= MAX_NESTING_DEPTH {
+            return Err(format!("satır {}: ifade iç içe geçme sınırı ({MAX_NESTING_DEPTH}) aşıldı", self.no));
+        }
+        self.depth += 1;
+        let result = self.parse_ternary_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_ternary_inner(&mut self) -> Result<Expr, String> {
         let cond = self.parse_or()?;
         if self.eat_op("?") {
             let a = self.parse_ternary()?;
@@ -552,7 +582,7 @@ impl<'a> ExprParser<'a> {
         let mut left = self.parse_and()?;
         loop {
             if let Some(Tok::Ident(id)) = self.peek() {
-                if id == "and" {
+                if id == "or" {
                     self.pos += 1;
                     let right = self.parse_and()?;
                     left = Expr::Bin(BinKind::Or, Box::new(left), Box::new(right));
@@ -568,7 +598,7 @@ impl<'a> ExprParser<'a> {
         let mut left = self.parse_cmp()?;
         loop {
             if let Some(Tok::Ident(id)) = self.peek() {
-                if id == "or" {
+                if id == "and" {
                     self.pos += 1;
                     let right = self.parse_cmp()?;
                     left = Expr::Bin(BinKind::And, Box::new(left), Box::new(right));
@@ -634,18 +664,24 @@ impl<'a> ExprParser<'a> {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, String> {
-        if self.eat_op("-") {
-            let e = self.parse_unary()?;
-            return Ok(Expr::Un(UnKind::Neg, Box::new(e)));
-        }
-        if let Some(Tok::Ident(id)) = self.peek() {
-            if id == "not" {
-                self.pos += 1;
-                let e = self.parse_unary()?;
-                return Ok(Expr::Un(UnKind::Not, Box::new(e)));
+        let mut prefixes = Vec::new();
+        loop {
+            if self.eat_op("-") {
+                prefixes.push(UnKind::Neg);
+                continue;
             }
+            if matches!(self.peek(), Some(Tok::Ident(id)) if id == "not") {
+                self.pos += 1;
+                prefixes.push(UnKind::Not);
+                continue;
+            }
+            break;
         }
-        self.parse_postfix()
+        let mut expr = self.parse_postfix()?;
+        for kind in prefixes.into_iter().rev() {
+            expr = Expr::Un(kind, Box::new(expr));
+        }
+        Ok(expr)
     }
 
     fn parse_postfix(&mut self) -> Result<Expr, String> {
@@ -705,7 +741,8 @@ impl<'a> ExprParser<'a> {
                         loop {
                             // isimli argüman tespiti: `ident = expr` (izleyen token '='
                             // ve ondan sonra operatör DEĞİL ise)
-                            let is_named = matches!(self.toks.get(self.pos + 1), Some(Tok::Op(o)) if o == "=")
+                            let is_named = matches!(self.peek(), Some(Tok::Ident(_)))
+                                && matches!(self.toks.get(self.pos + 1), Some(Tok::Op(o)) if o == "=")
                                 && !matches!(self.toks.get(self.pos + 2), Some(Tok::Op(_)));
                             let name = if is_named {
                                 let n = match self.peek() {
@@ -788,6 +825,41 @@ plot("Fast EMA")
     fn parses_ternary_and_history() {
         let src = "prev = close[1]\nd = close - close[2]\ns = close > prev ? 1 : 0\n";
         compile(src).unwrap();
+    }
+
+    #[test]
+    fn logical_operators_keep_their_names_and_precedence() {
+        let program = compile("x = true or false and true\n").unwrap();
+        let Stmt::Declare { expr, .. } = &program.stmts[0] else { panic!("expected declaration") };
+        let Expr::Bin(BinKind::Or, left, right) = expr else { panic!("expected top-level OR") };
+        assert!(matches!(left.as_ref(), Expr::Bool(true)));
+        assert!(matches!(right.as_ref(), Expr::Bin(BinKind::And, _, _)));
+
+        let program = compile("x = true and false\ny = true or false\n").unwrap();
+        let Stmt::Declare { expr: and_expr, .. } = &program.stmts[0] else { panic!("expected declaration") };
+        let Stmt::Declare { expr: or_expr, .. } = &program.stmts[1] else { panic!("expected declaration") };
+        assert!(matches!(and_expr, Expr::Bin(BinKind::And, _, _)));
+        assert!(matches!(or_expr, Expr::Bin(BinKind::Or, _, _)));
+    }
+
+    #[test]
+    fn malformed_named_argument_returns_error_instead_of_panicking() {
+        assert!(compile("x = foo(1 = 2)\n").is_err());
+    }
+
+    #[test]
+    fn nested_expressions_and_blocks_are_bounded() {
+        let deep_expr = format!("x = {}true{}\n", "(".repeat(MAX_NESTING_DEPTH + 1), ")".repeat(MAX_NESTING_DEPTH + 1));
+        assert!(compile(&deep_expr).unwrap_err().contains("iç içe geçme sınırı"));
+
+        let mut deep_if = String::new();
+        for depth in 0..=MAX_NESTING_DEPTH {
+            deep_if.push_str(&" ".repeat(depth * 4));
+            deep_if.push_str("if true\n");
+        }
+        deep_if.push_str(&" ".repeat((MAX_NESTING_DEPTH + 1) * 4));
+        deep_if.push_str("x = true\n");
+        assert!(compile(&deep_if).unwrap_err().contains("blok iç içe geçme sınırı"));
     }
 
     #[test]

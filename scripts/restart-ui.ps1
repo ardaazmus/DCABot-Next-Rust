@@ -4,8 +4,9 @@
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $runtimeDirectory = Join-Path $projectRoot '.local-runtime'
+$processFile = Join-Path $runtimeDirectory 'processes.json'
 
-# Keys: same persistent file as start-local.ps1 (NEXT_PUBLIC_ for the browser bundle).
+# Keys: same persistent server-side file as start-local.ps1.
 $keysFile = Join-Path $runtimeDirectory 'local-keys.env'
 if (Test-Path -LiteralPath $keysFile) {
     Get-Content -LiteralPath $keysFile | ForEach-Object {
@@ -16,13 +17,30 @@ if (Test-Path -LiteralPath $keysFile) {
     }
 }
 
-$old = Get-NetTCPConnection -State Listen -LocalPort 3000 -ErrorAction SilentlyContinue
-if ($old) {
-    foreach ($c in $old) {
-        & taskkill.exe /PID $c.OwningProcess /T /F 2>$null | Out-Null
-    }
-    Start-Sleep -Milliseconds 800
+$records = @()
+if (Test-Path -LiteralPath $processFile) {
+    try { $records = @(Get-Content -LiteralPath $processFile -Raw | ConvertFrom-Json) } catch { throw 'Invalid local process record; UI was not stopped.' }
 }
+$nextEntry = (Join-Path $projectRoot 'node_modules/next/dist/bin/next').Replace('/', '\')
+$old = Get-NetTCPConnection -State Listen -LocalPort 3000 -ErrorAction SilentlyContinue
+foreach ($listener in $old) {
+    $processId = [int]$listener.OwningProcess
+    $record = $records | Where-Object { [int]$_.Id -eq $processId } | Select-Object -First 1
+    $processInfo = Get-CimInstance Win32_Process -Filter ("ProcessId={0}" -f $processId) -ErrorAction SilentlyContinue
+    $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+    $matchesRecord = $false
+    if ($record -and $processInfo -and $process -and $processInfo.Name -eq 'node.exe') {
+        try { $matchesRecord = [long]$record.Started -eq [long]$process.StartTime.ToUniversalTime().Ticks } catch { $matchesRecord = $false }
+    }
+    $normalizedCommand = ([string]$processInfo.CommandLine).Replace('/', '\')
+    $isThisNext = $normalizedCommand.IndexOf($nextEntry, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+        $normalizedCommand.IndexOf('node_modules\next\dist\bin\next', [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    if (-not $matchesRecord -or -not $isThisNext) {
+        throw ("Port 3000 is occupied by an unverified process (PID {0}); refusing to stop it." -f $processId)
+    }
+    Stop-Process -Id $processId -Force
+}
+if ($old) { Start-Sleep -Milliseconds 800 }
 
 $env:NODE_OPTIONS = '--max-old-space-size=1024'
 $env:RAYON_NUM_THREADS = '2'
@@ -38,5 +56,14 @@ do {
     Start-Sleep -Milliseconds 500
     $null = & curl.exe --noproxy '*' --silent --fail --max-time 30 http://127.0.0.1:3000/ 2>$null
 } until ($LASTEXITCODE -eq 0 -or [DateTime]::UtcNow -gt $deadline)
-if ($LASTEXITCODE -ne 0) { throw "ui hazir olmadi - ui.stderr.log dosyasina bakin" }
+if ($LASTEXITCODE -ne 0) {
+    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    throw "ui hazir olmadi - ui.stderr.log dosyasina bakin"
+}
+
+New-Item -ItemType Directory -Force -Path $runtimeDirectory | Out-Null
+$process = Get-Process -Id $proc.Id
+$records = @($records | Where-Object { $_.Name -ne 'node' })
+$records += @{ Id = $proc.Id; Name = $proc.ProcessName; Started = $process.StartTime.ToUniversalTime().Ticks }
+$records | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $processFile -Encoding UTF8
 Write-Output "ui restarted (PID $($proc.Id))"

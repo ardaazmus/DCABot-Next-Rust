@@ -116,6 +116,11 @@ impl HedgeEngine {
     /// All leg actions are merged in order; the runner dispatches them.
     pub fn process_bar(&mut self, ctx: &BarContext) -> Vec<Action> {
         let mut acts = Vec::new();
+        // Re-arm before calling each leg's on_bar. With zero cooldown, a leg
+        // can leave Cooldown and submit a new base order during that call; if
+        // we wait until the end of this method, Closing never observes both
+        // legs flat in Cooldown.
+        self.rearm_completed_close();
         // Task 21 — panel snapshot'ı için mark saklanır (snapshot mark-temelli unrealized hesabı).
         self.last_mark = Some(ctx.mark.clone());
         // 1) main leg (DCA long) — its own gates / TP / SL / trailing.
@@ -160,12 +165,39 @@ impl HedgeEngine {
         acts
     }
 
-    /// Current PnL of one leg: realized gross + unrealized gross at the mark
-    /// (zero-float; both from the leg's own WAC mirror).
+    /// Current deal PnL of one leg: realized + unrealized gross less actual
+    /// deal fees and funding (zero-float; based on the leg's own WAC mirror).
     fn leg_pnl(&self, leg: &DcaEngine, mark: &Fraction) -> Fraction {
         let realized = leg.mirror.realized_gross.clone();
         let unreal = leg.mirror.unrealized_gross(mark).unwrap_or_else(|_| Fraction::zero());
-        realized.add(&unreal).unwrap_or(realized)
+        realized
+            .add(&unreal)
+            .and_then(|gross| gross.sub(&leg.deal_fees))
+            .and_then(|net| net.sub(&leg.funding_deal))
+            .unwrap_or(realized)
+    }
+
+    fn rearm_completed_close(&mut self) -> bool {
+        if self.phase != HedgePhase::Closing {
+            return false;
+        }
+        let main_flat = self.main.mirror.qty.is_zero() && self.main.phase == crate::dca::DcaPhase::Cooldown;
+        let hedge_flat = match &self.hedge {
+            Some(h) => h.mirror.qty.is_zero() && h.phase == crate::dca::DcaPhase::Cooldown,
+            None => true,
+        };
+        if !main_flat || !hedge_flat {
+            return false;
+        }
+        if self.cfg.kind == StrategyKind::HedgeDual {
+            self.phase = HedgePhase::HedgeActive;
+        } else {
+            self.phase = HedgePhase::MainOnly;
+            self.hedge = None;
+            self.last_combined_pnl = Fraction::zero();
+        }
+        self.push_event("COMBINED EXIT complete — cycle re-armed".into());
+        true
     }
 
     /// Protective spawn: when main leg drawdown from peak reaches the threshold
@@ -191,8 +223,15 @@ impl HedgeEngine {
         }
         let mut hedge_cfg = self.cfg.clone();
         hedge_cfg.kind = StrategyKind::DcaShort;
-        let mut h = DcaEngine::new(&format!("{}-hedge", self.bot_id), hedge_cfg, self.main.inst.clone())
-            .expect("hedge engine");
+        let mut h = match DcaEngine::new(&format!("{}-hedge", self.bot_id), hedge_cfg, self.main.inst.clone()) {
+            Ok(engine) => engine,
+            Err(error) => {
+                let message = format!("HEDGE SPAWN FAILED: protective leg configuration rejected: {error}");
+                self.push_event(message.clone());
+                acts.push(Action::Log { level: "ERROR", message });
+                return acts;
+            }
+        };
         let seq = h.next_seq();
         let id = format!("{}-hedge-{}", self.bot_id, seq);
         h.phase = crate::dca::DcaPhase::BasePending;
@@ -219,26 +258,6 @@ impl HedgeEngine {
     /// Combined exit check (M18): Pi_main + Pi_hedge >= T → close both legs.
     pub fn combined_exit_check(&mut self, pnl_main: &Fraction, pnl_hedge: &Fraction) -> Vec<Action> {
         let mut acts = Vec::new();
-        // Faz 23 (derin inceleme): Closing artık ÖLÜM DEĞİL — her iki bacak
-        // düzleşip deal döngüleri Cooldown'a düşünce faz geri açılır. Eski
-        // davranışta Closing kalıcıydı: ikinci döngüde combined exit hiç
-        // çalışmaz, bacaklar birleşik kâr hedefi OLMADAN işlemeye devam
-        // ederdi (bot ömrü boyunca tek çıkış).
-        if self.phase == HedgePhase::Closing {
-            let main_flat = self.main.mirror.qty.is_zero() && self.main.phase == crate::dca::DcaPhase::Cooldown;
-            let hedge_flat = match &self.hedge {
-                Some(h) => h.mirror.qty.is_zero() && h.phase == crate::dca::DcaPhase::Cooldown,
-                None => true,
-            };
-            if main_flat && hedge_flat {
-                self.phase = if self.cfg.kind == StrategyKind::HedgeDual {
-                    HedgePhase::HedgeActive
-                } else {
-                    HedgePhase::MainOnly
-                };
-                self.push_event("COMBINED EXIT complete — cycle re-armed".into());
-            }
-        }
         if self.phase != HedgePhase::HedgeActive {
             return acts;
         }
@@ -497,6 +516,40 @@ mod hedge_tests {
         let has_buy_close = acts4.iter().any(|a| matches!(a, Action::PlaceMarket { side: dca_math::Side::Buy, role: "MANUAL", .. }));
         let has_sell_close = acts4.iter().any(|a| matches!(a, Action::PlaceMarket { side: dca_math::Side::Sell, role: "MANUAL", .. }));
         assert!(has_buy_close && has_sell_close, "long leg sells, short leg buys");
+    }
+
+    #[test]
+    fn protective_close_rearms_before_zero_cooldown_leg_reopens() {
+        let mut cfg = hedge_cfg(StrategyKind::HedgeProtective, "0.5", "5");
+        cfg.cooldown_bars = 0;
+        let mut e = HedgeEngine::new("hp12345678", cfg.clone(), Instrument::default()).unwrap();
+        let mut hedge_cfg = cfg;
+        hedge_cfg.kind = StrategyKind::DcaShort;
+        e.hedge = Some(DcaEngine::new("hp12345678-hedge", hedge_cfg, Instrument::default()).unwrap());
+        e.phase = HedgePhase::Closing;
+        e.main.phase = crate::dca::DcaPhase::Cooldown;
+        e.hedge.as_mut().unwrap().phase = crate::dca::DcaPhase::Cooldown;
+
+        let bar = bar(1, "100");
+        let _ = e.process_bar(&ctx(&bar, Fraction::from_u64(100)));
+
+        assert_eq!(e.phase, HedgePhase::MainOnly);
+        assert!(e.hedge.is_none(), "completed protective leg must be cleared so a later drawdown can spawn another");
+    }
+
+    #[test]
+    fn combined_leg_pnl_deducts_fees_and_funding() {
+        let mut e = HedgeEngine::new(
+            "hn12345678",
+            hedge_cfg(StrategyKind::HedgeDual, "0.5", "1000000"),
+            Instrument::default(),
+        )
+        .unwrap();
+        e.on_fill_leg(&fill("hn12345678-main-1-BASE-1", "BASE", dca_math::Side::Buy, OrderKind::Add, "100", "1"));
+        e.main.deal_fees = Fraction::from_u64(1);
+        e.main.funding_deal = Fraction::from_decimal_str("0.5").unwrap();
+        let pnl = e.leg_pnl(&e.main, &Fraction::from_u64(110));
+        assert_eq!(pnl.to_string(), "17/2", "gross +10 less fee 1 and funding 0.5 must be net +8.5");
     }
 
     /// (4) Fill routing: legs only react to their own prefixed fills; unknown

@@ -53,8 +53,10 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
   /* Borsa-içi sembol seçici: venue+kategori Sembol hücresinin içinden; ayrı alan yok. */
   const [venue, setVenue] = useState<Venue>("BYBIT");
   const [category, setCategory] = useState<"spot" | "linear">("spot");
-  const [instruments, setInstruments] = useState<Instrument[]>([]);
-  const [marketsBusy, setMarketsBusy] = useState(false);
+  const marketKey = `${venue}|${category}`;
+  const [marketState, setMarketState] = useState<{ key: string; instruments: Instrument[] }>({ key: "", instruments: [] });
+  const instruments = marketState.key === marketKey ? marketState.instruments : [];
+  const marketsBusy = marketState.key !== marketKey;
   const [dropOpen, setDropOpen] = useState(false);
   const [bars, setBars] = useState(500);
   const [startCash, setStartCash] = useState("100000");
@@ -66,29 +68,20 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
   /* Task 16: Gate 5 dolum gerçekçiliği — REALISTIC (1-tick penetrasyon şartı) vs OPTIMISTIC (teğet fitil dolar). */
   const [fillModel, setFillModel] = useState<FillModel>("REALISTIC");
 
-  /* Tür değişince kategori önerisi (kullanıcı elle değiştirebilir). */
-  useEffect(() => {
-    setCategory(kind === "DCA_SHORT" || kind === "FUTURES_DCA" ? "linear" : "spot");
-  }, [kind]);
-
   /* Borsa listesi: venue+kategoriye göre canlı enstrümanlar (Bybit Linear ~500 çift). */
   useEffect(() => {
     let alive = true;
-    setMarketsBusy(true);
     apiMarkets(category, undefined, venue)
       .then((r) => {
-        if (alive) setInstruments(r.instruments);
+        if (alive) setMarketState({ key: marketKey, instruments: r.instruments });
       })
       .catch(() => {
-        if (alive) setInstruments([]);
-      })
-      .finally(() => {
-        if (alive) setMarketsBusy(false);
+        if (alive) setMarketState({ key: marketKey, instruments: [] });
       });
     return () => {
       alive = false;
     };
-  }, [venue, category]);
+  }, [venue, category, marketKey]);
 
   const selectedInstrument = useMemo(
     () => instruments.find((i) => i.symbol === symbol.trim().toUpperCase()) ?? null,
@@ -142,16 +135,18 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
   }, [symbol, venue, category]);
 
   /* P4-3d vadeli durum kartı — yalnız FUTURES_DCA seçiliyken (BYBIT/OKX tam kart; BINANCE dürüst 422 → kart gizlenir). */
-  const [fs, setFs] = useState<FuturesStateResult | null>(null);
+  const futuresKey = `${kind}|${symbol.trim().toUpperCase() || "BTCUSDT"}|${venue}`;
+  const [futuresState, setFuturesState] = useState<{ key: string; value: FuturesStateResult | null }>({ key: "", value: null });
+  const fs = kind === "FUTURES_DCA" && futuresState.key === futuresKey ? futuresState.value : null;
   useEffect(() => {
-    if (kind !== "FUTURES_DCA") { setFs(null); return; }
+    if (kind !== "FUTURES_DCA") return;
     let alive = true;
     const sym = symbol.trim().toUpperCase() || "BTCUSDT";
     apiFuturesState(sym, venue)
-      .then((r) => { if (alive) setFs(r); })
-      .catch(() => { if (alive) setFs(null); });
+      .then((r) => { if (alive) setFuturesState({ key: futuresKey, value: r }); })
+      .catch(() => { if (alive) setFuturesState({ key: futuresKey, value: null }); });
     return () => { alive = false; };
-  }, [kind, symbol, venue]);
+  }, [kind, symbol, venue, futuresKey]);
 
   /* P4-1 haberler — sembol değişince tazelenir. Faz 25 (UIX-22): liste
      Lab'dan ÇIKARILDI (sonuçları ekranın altına itiyordu); delisting uyarısı —
@@ -230,6 +225,8 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
     }
   };
   const [certBusy, setCertBusy] = useState(false);
+  const [certError, setCertError] = useState<string | null>(null);
+  const [cert, setCert] = useState<BacktestCertResult | null>(null);
   // Faz 22 (P0-10 kalanı): kullanıcının gerçek deneme sayısı — DSR söndürmesi
   // bunu kullanır (dahili 9 varyant alt sınır; sertleştirme buradan).
   const [certAttempts, setCertAttempts] = useState(0);
@@ -253,9 +250,6 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
     },
     [],
   );
-  const [certError, setCertError] = useState<string | null>(null);
-  const [cert, setCert] = useState<BacktestCertResult | null>(null);
-
   const buildConfig = () => {
     /* P4-3d: koşu bu venue'ün market verisiyle yapılır (run/runCert'te venue parametresi). */
     const config = defaultDcaConfig(kind, symbol.trim().toUpperCase() || "BTCUSDT");
@@ -346,7 +340,10 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
               {(["DCA_LONG", "DCA_SHORT", "FUTURES_DCA"] as BotKind[]).map((k) => (
                 <button
                   key={k}
-                  onClick={() => setKind(k)}
+                  onClick={() => {
+                    setKind(k);
+                    setCategory(k === "DCA_SHORT" || k === "FUTURES_DCA" ? "linear" : "spot");
+                  }}
                   className={cn(
                     "min-h-11 flex-1 rounded-lg border px-2 py-2 text-[11px] font-bold",
                     kind === k

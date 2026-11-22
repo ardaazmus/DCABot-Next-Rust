@@ -10,9 +10,9 @@ npm run local:start
 
 Arayüz: http://127.0.0.1:3000. Başlatıcı önce güncel Rust motorunu derler, ardından motoru ve Next.js'i gizli arka plan süreçlerinde başlatır; iki servisin HTTP yanıtını kontrol eder. Derleme paralelliği ve SWC iş parçacığı sayısı sınırlıdır. 3000/3002 portları boş olmalıdır.
 
-**Kimlik doğrulama (SEC-01/C-1/C-2):** Motor tüm yönetim uçlarında `Authorization: Bearer <DCA_API_KEY>` zorunlu tutar (yalnız `/api/health` açıktır). Başlatıcı ilk çalıştırmada rastgele `DCA_API_KEY` + `DCA_VAULT_KEY` üretir ve `.local-runtime/local-keys.env` içinde saklar; Faz 21 (P0-9): UI anahtarı ASLA gömmez — tüm motor çağrıları aynı-origin `/api/engine/*` middleware proxy'sinden geçer ve Bearer YALNIZ sunucu tarafında (`ENGINE_API_KEY` env) eklenir. SSE (`EventSource` başlık koyamaz) `/api/stream` route handler'ı üzerinden sunucu tarafında proxy'lenir. `NEXT_PUBLIC_ENGINE_API_KEY` adı kullanımdan kaldırıldı (paket sızıntı tuzağı). Anahtarlar yerel çalışma içindir, depoya girmez.
+**Kimlik doğrulama (SEC-01/C-1/C-2):** Motor tüm yönetim uçlarında `Authorization: Bearer <DCA_API_KEY>` zorunlu tutar (yalnız `/api/health` açıktır). Başlatıcı ilk çalıştırmada rastgele `DCA_API_KEY`, `DCA_VAULT_KEY` ve ayrı `DCA_SESSION_SECRET` üretir; üçünü de `.local-runtime/local-keys.env` içinde saklar. Üretimde UI erişimi daima oturum doğrulamasına tabidir; parola (`DCA_UI_PASSWORD`) ve en az 32 baytlık imza anahtarı (`DCA_SESSION_SECRET`) ayarlanmalıdır. Yerel tek-kullanıcı arayüzü yalnız `127.0.0.1` üzerinde dinler; isteğe bağlı `DCA_UI_PASSWORD` ile giriş koruması açılabilir. Faz 21 (P0-9): UI anahtarı ASLA gömmez — tüm motor çağrıları aynı-origin `/api/engine/*` middleware proxy'sinden geçer ve Bearer YALNIZ sunucu tarafında (`ENGINE_API_KEY` env) eklenir. SSE (`EventSource` başlık koyamaz) `/api/stream` route handler'ı üzerinden sunucu tarafında proxy'lenir. `NEXT_PUBLIC_ENGINE_API_KEY` adı kullanımdan kaldırıldı (paket sızıntı tuzağı). Anahtarlar yerel çalışma içindir, depoya girmez.
 
-Yerel çalıştırma `.local-runtime/paper.sqlite3` veritabanını kullanır; mevcut `db/dca-core.sqlite3` dosyasındaki botları veya anahtarları yüklemez. Bybit testnet varsayılanı kullanılır; `.env` içindeki özel Bybit base URL ayarları adapter tarafından öncelikli değerlendirilir. Gerçek hesap anahtarı eklemeyin; inceleme raporundaki LIVE işlem engelleri halen geçerlidir. Motor 3002 portunu yalnız 127.0.0.1 üzerinde dinler.
+Yerel çalıştırma `.local-runtime/paper.sqlite3` veritabanını kullanır; mevcut `db/dca-core.sqlite3` dosyasındaki botları veya anahtarları yüklemez. Bybit ve Binance testnet, OKX demo modu etkin başlar. Özel endpoint değerleri exact-host allowlist ve mainnet kapılarından geçer. Gerçek hesap anahtarı eklemeyin; yerel başlatma betikleri PAPER veritabanıyla çalışır. Motor 3002 portunu yalnız 127.0.0.1 üzerinde dinler.
 
 Günlükler `.local-runtime/` içindedir. Durdurmak için:
 
@@ -203,7 +203,7 @@ Port sabit: **3002** (Motor) ve **3000** (Next.js UI). UI tüm motor çağrılar
 ## 8. Güvenlik
 
 - **Zero-Withdrawal Hard Gate:** çekim yetkili anahtar anında 422 ile reddedilir — aşılamaz
-- **AES-256-GCM Vault:** anahtarlar 12-byte rastgele nonce ile şifreli; master key env (`DCA_VAULT_KEY`) veya otomatik üretim + SQLite'ta saklanır
+- **AES-256-GCM Vault:** anahtarlar 12 bayt rastgele nonce ile şifrelenir; master key zorunlu `DCA_VAULT_KEY` ortam değişkeninden gelir ve SQLite'a yazılmaz. Yeni kayıtlar Argon2id tabanlı, sürümlü zarf kullanır; eski kayıtlar geçiş için okunabilir.
 - **Sıfır-Float:** tüm fiyat/miktar/ücret/PnL hesapları `Fraction` (BigInt num/den); JSON'da exact `"n/d"` string
 - **Fail-Closed:** belirsiz/eksik durumda emir ASLA gönderilmez
 - **Portföy Notional Kapısı (Faz 27/İ-1):** filo-geneli brüt açık notional + aday

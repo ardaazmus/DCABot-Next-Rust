@@ -5,6 +5,7 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $runtimeDirectory = Join-Path $projectRoot '.local-runtime'
 $coreBinary = Join-Path $projectRoot 'mini-services/dca-core/target/debug/dca_server.exe'
+$processFile = Join-Path $runtimeDirectory 'processes.json'
 
 # Keys: same persistent file as start-local.ps1.
 $keysFile = Join-Path $runtimeDirectory 'local-keys.env'
@@ -17,17 +18,29 @@ Get-Content -LiteralPath $keysFile | ForEach-Object {
 }
 if (-not $env:DCA_API_KEY -or -not $env:DCA_VAULT_KEY) { throw "anahtarlar okunamadi" }
 
-$old = Get-NetTCPConnection -State Listen -LocalPort 3002 -ErrorAction SilentlyContinue
-if ($old) {
-    foreach ($c in $old) {
-        & taskkill.exe /PID $c.OwningProcess /T /F 2>$null | Out-Null
-    }
-    Start-Sleep -Milliseconds 800
+$records = @()
+if (Test-Path -LiteralPath $processFile) {
+    try { $records = @(Get-Content -LiteralPath $processFile -Raw | ConvertFrom-Json) } catch { throw 'Invalid local process record; engine was not stopped.' }
 }
+$expectedBinary = [System.IO.Path]::GetFullPath($coreBinary)
+$old = Get-NetTCPConnection -State Listen -LocalPort 3002 -ErrorAction SilentlyContinue
+foreach ($listener in $old) {
+    $processId = [int]$listener.OwningProcess
+    $processInfo = Get-CimInstance Win32_Process -Filter ("ProcessId={0}" -f $processId) -ErrorAction SilentlyContinue
+    if (-not $processInfo -or $processInfo.Name -ne 'dca_server.exe' -or
+        -not $processInfo.ExecutablePath -or [System.IO.Path]::GetFullPath($processInfo.ExecutablePath) -ine $expectedBinary) {
+        throw ("Port 3002 is occupied by an unverified process (PID {0}); refusing to stop it." -f $processId)
+    }
+    Stop-Process -Id $processId -Force
+}
+if ($old) { Start-Sleep -Milliseconds 800 }
 
 $env:DCA_DB_PATH = Join-Path $runtimeDirectory 'paper.sqlite3'
 $env:DCA_BYBIT_TESTNET = '1'
 $env:DCA_OKX_DEMO = '1'
+$env:DCA_BINANCE_TESTNET = '1'
+$env:BINANCE_SPOT_BASE = 'https://testnet.binance.vision'
+$env:BINANCE_FUTURES_TESTNET_BASE = 'https://testnet.binancefuture.com'
 $env:RUST_LOG = 'info'
 $env:NEXT_TELEMETRY_DISABLED = '1'
 
@@ -40,5 +53,14 @@ do {
     Start-Sleep -Milliseconds 300
     $null = & curl.exe --noproxy '*' --silent --fail --max-time 5 http://127.0.0.1:3002/api/health 2>$null
 } until ($LASTEXITCODE -eq 0 -or [DateTime]::UtcNow -gt $deadline)
-if ($LASTEXITCODE -ne 0) { throw "engine hazir olmadi - core.stderr.log dosyasina bakin" }
+if ($LASTEXITCODE -ne 0) {
+    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    throw "engine hazir olmadi - core.stderr.log dosyasina bakin"
+}
+
+New-Item -ItemType Directory -Force -Path $runtimeDirectory | Out-Null
+$started = Get-Process -Id $proc.Id
+$records = @($records | Where-Object { $_.Name -ne 'dca_server' })
+$records += @{ Id = $proc.Id; Name = $proc.ProcessName; Started = $started.StartTime.ToUniversalTime().Ticks }
+$records | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $processFile -Encoding UTF8
 Write-Output "engine restarted (PID $($proc.Id))"

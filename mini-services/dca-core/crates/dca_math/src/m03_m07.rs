@@ -214,22 +214,34 @@ pub fn liquidation_price(
     brackets: &[MmrBracket],
     extra_funding_buffer: &Fraction,
 ) -> Result<Option<Fraction>, MathError> {
+    if !matches!(direction, 1 | -1) {
+        return Err(MathError::DomainViolation("M07: direction must be +1 (long) or -1 (short)".into()));
+    }
     if qty.is_zero() {
         return Ok(None);
+    }
+    if qty.is_negative() || avg_price.is_zero() || avg_price.is_negative() || wallet_margin.is_negative() || extra_funding_buffer.is_negative() {
+        return Err(MathError::DomainViolation("M07: qty/price/margin/funding buffer outside valid domain".into()));
     }
     let mut candidate = lookup_bracket(brackets, &qty.mul(avg_price)?);
     for _ in 0..8 {
         let r = &candidate.mmr;
-        let d = &candidate.deduction.add(extra_funding_buffer)?;
+        // A funding expense consumes wallet margin. It must move a long's
+        // liquidation price upward and a short's downward (toward the mark).
         let root = if direction == 1 {
-            let num = qty.mul(avg_price)?.sub(wallet_margin)?.sub(d)?;
+            let effective_wallet = wallet_margin.sub(extra_funding_buffer)?;
+            let num = qty.mul(avg_price)?.sub(&effective_wallet)?.sub(&candidate.deduction)?;
             let den = qty.mul(&Fraction::one().sub(r)?)?;
             num.div(&den)?
         } else {
-            let num = qty.mul(avg_price)?.add(wallet_margin)?.add(d)?;
+            let effective_wallet = wallet_margin.sub(extra_funding_buffer)?;
+            let num = qty.mul(avg_price)?.add(&effective_wallet)?.add(&candidate.deduction)?;
             let den = qty.mul(&Fraction::one().add(r)?)?;
             num.div(&den)?
         };
+        if !root.is_positive() {
+            return Ok(None);
+        }
         let pos_notional = qty.mul(&root)?;
         let in_tier = pos_notional >= candidate.min_notional && pos_notional < candidate.max_notional;
         if in_tier {
@@ -337,6 +349,35 @@ mod tests {
         }];
         let liq = liquidation_price(-1, &f("1"), &f("100"), &f("10"), &brackets, &f("0")).unwrap().unwrap();
         assert_eq!(liq.to_half_even_display(6), "109.452736");
+    }
+
+    #[test]
+    fn liquidation_funding_buffer_moves_boundary_toward_market() {
+        let brackets = vec![MmrBracket {
+            min_notional: f("0"),
+            max_notional: f("1000000"),
+            mmr: f("0.005"),
+            deduction: f("0"),
+        }];
+        let long = liquidation_price(1, &f("1"), &f("100"), &f("10"), &brackets, &f("0")).unwrap().unwrap();
+        let long_buffered = liquidation_price(1, &f("1"), &f("100"), &f("10"), &brackets, &f("2")).unwrap().unwrap();
+        assert!(long_buffered > long, "long funding expense raises its liquidation boundary");
+
+        let short = liquidation_price(-1, &f("1"), &f("100"), &f("10"), &brackets, &f("0")).unwrap().unwrap();
+        let short_buffered = liquidation_price(-1, &f("1"), &f("100"), &f("10"), &brackets, &f("2")).unwrap().unwrap();
+        assert!(short_buffered < short, "short funding expense lowers its liquidation boundary");
+    }
+
+    #[test]
+    fn liquidation_returns_none_for_non_positive_boundary() {
+        let brackets = vec![MmrBracket {
+            min_notional: f("0"),
+            max_notional: f("1000000"),
+            mmr: f("0.005"),
+            deduction: f("0"),
+        }];
+        let liq = liquidation_price(1, &f("1"), &f("100"), &f("200"), &brackets, &f("0")).unwrap();
+        assert!(liq.is_none(), "a long with a negative theoretical boundary is not liquidatable at a positive price");
     }
 
     #[test]

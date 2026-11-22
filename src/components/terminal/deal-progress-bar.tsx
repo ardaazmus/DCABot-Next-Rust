@@ -20,6 +20,8 @@ import { fmtFrac, fmtUsdSigned, fracToNum } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { LadderRow } from "@/lib/engine-types";
 
+export const CRITICAL_LIQUIDATION_DISTANCE_PCT = 15;
+
 export interface DealProgressBarProps {
   phase: string; // "Open" | "Idle" | "Closing"
   safetyTriggered: number;
@@ -131,7 +133,7 @@ export function DealProgressBar({
       liqTier =
         clampedDist >= 30
           ? { label: "Güvenli", color: "text-emerald-400", border: "border-emerald-500/40", bg: "bg-emerald-500/10" }
-          : clampedDist >= 15
+          : clampedDist >= CRITICAL_LIQUIDATION_DISTANCE_PCT
             ? { label: "Dikkat", color: "text-amber-400", border: "border-amber-500/40", bg: "bg-amber-500/10" }
             : { label: "KRİTİK LİKİDASYON RİSKİ", color: "text-rose-400 animate-pulse font-black", border: "border-rose-500/60", bg: "bg-rose-500/20" };
     }
@@ -670,15 +672,15 @@ export function DealProgressBar({
             <Info className="h-3.5 w-3.5 text-cyan-400 shrink-0" />
             <span>
               {metrics.isProfitable
-                ? `Fiyat maliyetin %${Math.abs(metrics.devFromAvgPct).toFixed(2)} üzerinde ($${fmtFrac(metrics.cur)}). TP hedefine %${metrics.distToTpPct?.toFixed(2) ?? "0"} kaldı.${
-                    marginMode && metrics.liqDistFromCurPct != null ? ` Likidasyona %${metrics.liqDistFromCurPct.toFixed(1)} güvenli mesafe var.` : ""
+                ? `Fiyat maliyetin %${Math.abs(metrics.devFromAvgPct).toFixed(2)} ${isShort ? "altında" : "üzerinde"} ($${fmtFrac(metrics.cur)}). TP hedefine %${metrics.distToTpPct?.toFixed(2) ?? "0"} kaldı.${
+                    marginMode && metrics.liqDistFromCurPct != null ? ` Likidasyon fiyatına %${metrics.liqDistFromCurPct.toFixed(1)} mesafe var (${metrics.liqTier?.label ?? "durum belirsiz"}).` : ""
                   }`
-                : `Fiyat maliyetin %${Math.abs(metrics.devFromAvgPct).toFixed(2)} altında seyrediyor ($${fmtFrac(metrics.cur)}).${
+                : `Fiyat maliyetin %${Math.abs(metrics.devFromAvgPct).toFixed(2)} ${isShort ? "üzerinde" : "altında"} seyrediyor ($${fmtFrac(metrics.cur)}).${
                     metrics.nextSo > 0 && !isBagHolding
-                      ? ` Sonraki kademe (SO${nextSafetyLevel ?? safetyTriggered + 1}) %${metrics.nextSoDistPct?.toFixed(2)} düşüş kaldığında ($${fmtFrac(metrics.nextSo)}) tetiklenecek.`
+                      ? ` Sonraki kademe (SO${nextSafetyLevel ?? safetyTriggered + 1}) fiyat %${metrics.nextSoDistPct?.toFixed(2)} ${isShort ? "yükseldiğinde" : "düştüğünde"} ($${fmtFrac(metrics.nextSo)}) tetiklenecek.`
                       : " Tüm güvenlik kademeleri devrede."
                   }${
-                    marginMode && metrics.liqDistFromCurPct != null ? ` Likidasyon seviyesine (%${metrics.liqDistFromCurPct.toFixed(1)}) güvenli mesafe bulunmaktadır.` : ""
+                    marginMode && metrics.liqDistFromCurPct != null ? ` Likidasyon fiyatına %${metrics.liqDistFromCurPct.toFixed(1)} mesafe var (${metrics.liqTier?.label ?? "durum belirsiz"}).` : ""
                   }`}
             </span>
           </div>

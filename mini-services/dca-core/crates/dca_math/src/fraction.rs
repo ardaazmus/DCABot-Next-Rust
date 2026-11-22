@@ -119,7 +119,7 @@ impl Fraction {
         // "1e4294967297" sessizce 10'a düşüyordu (exactness sözleşmesi ihlali)
         // ve aşırı büyük üs parse anında ~GB'lık BigInt ayırıyordu (DoS).
         // 4096-bit sınır için |üs| > 1233 yeterli; aşılırsa dürüst hata.
-        if exp_val.abs() > 1233 {
+        if !(-1233..=1233).contains(&exp_val) {
             return Err(MathError::InvalidDecimalString(s.to_string()));
         }
         if exp_val > 0 {
@@ -196,8 +196,8 @@ impl Fraction {
     }
 
     /// Integer exponentiation (exp >= 0). 0^0 = 1 by convention.
-    /// SEC-04: eks parantezli gigantik üsler ile bellek tüketimi saldırısı
-    /// engellenir — üst sınır 10_000 (≈ 40KB temel BigInt boyutunda).
+    /// SEC-04: exponent and result bit limits are checked before unbounded
+    /// intermediate BigInts can be allocated.
     pub fn pow_u(&self, exp: u32) -> Result<Self, MathError> {
         if exp == 0 {
             return Ok(Self::one());
@@ -207,7 +207,28 @@ impl Fraction {
                 "exponent {exp} exceeds SEC-04 limit 10_000"
             )));
         }
-        Self::new(self.num.pow(exp), self.den.pow(exp))
+        fn bounded_pow(base: &BigInt, mut exponent: u32) -> Result<BigInt, MathError> {
+            let mut result = BigInt::one();
+            let mut factor = base.clone();
+            while exponent > 0 {
+                if exponent & 1 == 1 {
+                    result *= &factor;
+                    if result.bits() > MAX_BITS {
+                        return Err(MathError::BitLimitExceeded);
+                    }
+                }
+                exponent >>= 1;
+                if exponent > 0 {
+                    factor = &factor * &factor;
+                    if factor.bits() > MAX_BITS {
+                        return Err(MathError::BitLimitExceeded);
+                    }
+                }
+            }
+            Ok(result)
+        }
+
+        Self::new(bounded_pow(&self.num, exp)?, bounded_pow(&self.den, exp)?)
     }
 
     /// Exact floor division: returns floor(self / other) as BigInt.
@@ -388,6 +409,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_minimum_i64_exponent_without_panicking() {
+        let parsed = std::panic::catch_unwind(|| {
+            Fraction::from_decimal_str("1e-9223372036854775808")
+        });
+        assert!(parsed.is_ok(), "an extreme exponent must not panic the request task");
+        assert!(parsed.unwrap().is_err());
+    }
+
+    #[test]
     fn arithmetic_exact() {
         let a = f("0.1");
         let b = f("0.2");
@@ -462,6 +492,13 @@ mod tests {
     #[test]
     fn pow_exact() {
         assert_eq!(f("1.1").pow_u(3).unwrap().to_string(), "1331/1000");
+    }
+
+    #[test]
+    fn pow_rejects_oversized_result_before_materializing_it() {
+        let largest_allowed = BigInt::from(2u32).pow((MAX_BITS - 1) as u32);
+        let value = Fraction::new(largest_allowed, BigInt::one()).unwrap();
+        assert_eq!(value.pow_u(2).unwrap_err(), MathError::BitLimitExceeded);
     }
 
     #[test]

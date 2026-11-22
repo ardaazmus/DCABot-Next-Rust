@@ -23,6 +23,9 @@ if ($old) {
 $env:DCA_DB_PATH = Join-Path $runtimeDirectory 'paper.sqlite3'
 $env:DCA_BYBIT_TESTNET = '1'
 $env:DCA_OKX_DEMO = '1'
+$env:DCA_BINANCE_TESTNET = '1'
+$env:BINANCE_SPOT_BASE = 'https://testnet.binance.vision'
+$env:BINANCE_FUTURES_TESTNET_BASE = 'https://testnet.binancefuture.com'
 $env:RUST_LOG = 'info'
 $env:NEXT_TELEMETRY_DISABLED = '1'
 

@@ -51,7 +51,7 @@ import { apiBotAction, apiDeleteBot, apiPatchBot, useBots, useFleetTape } from "
 import { fmtFrac, fmtTimeShort, fmtTs, fmtUsd, fmtUsdSigned, fracToNum, kindLabel } from "@/lib/format";
 import { toast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
-import { DealProgressBar } from "@/components/terminal/deal-progress-bar";
+import { CRITICAL_LIQUIDATION_DISTANCE_PCT, DealProgressBar } from "@/components/terminal/deal-progress-bar";
 import type { Bot as BotRow } from "@/lib/engine-types";
 
 /* Task 16 — compact risk-policy chips for fleet cards/table (max 2). */
@@ -88,6 +88,25 @@ function MarginErodeBadge({ bot }: { bot: BotRow }) {
       {danger && " — LİKİDASYONA YAKIN (M07)"}
     </div>
   );
+}
+
+function hasLiquidationRisk(bot: BotRow): boolean {
+  if (bot.stats.phase !== "Open" || !bot.marginMode) return false;
+
+  const im = fracToNum(bot.imUsed) ?? 0;
+  const unreal = fracToNum(bot.unrealizedNow) ?? 0;
+  const marginErodeDanger = im > 0 && unreal < 0 && (-unreal / im) * 100 >= 50;
+
+  const liq = fracToNum(bot.liqPrice) ?? 0;
+  const current = fracToNum(bot.markPrice) ?? 0;
+  let criticalPriceDistance = false;
+  if (liq > 0 && current > 0) {
+    const isShort = bot.kind === "DCA_SHORT";
+    const distancePct = Math.max(0, isShort ? ((liq - current) / current) * 100 : ((current - liq) / current) * 100);
+    criticalPriceDistance = distancePct < CRITICAL_LIQUIDATION_DISTANCE_PCT;
+  }
+
+  return marginErodeDanger || criticalPriceDistance;
 }
 
 function RiskWarningBadge({ bot, className }: { bot: BotRow; className?: string }) {
@@ -201,8 +220,7 @@ function DeleteBotDialog({ bot, onRemove, triggerClassName, disabled, withLabel 
           </AlertDialogCancel>
           <AlertDialogAction
             className="bg-rose-500 text-white hover:bg-rose-600"
-            onClick={(e) => {
-              e.preventDefault();
+            onClick={() => {
               void onRemove(bot);
             }}
           >
@@ -236,8 +254,7 @@ function CloseAllDialog({ bot, onClose, triggerClassName, disabled }: { bot: imp
           </AlertDialogCancel>
           <AlertDialogAction
             className="bg-rose-500 text-white hover:bg-rose-600"
-            onClick={(e) => {
-              e.preventDefault();
+            onClick={() => {
               void onClose(bot);
             }}
           >
@@ -316,11 +333,7 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
     ).length;
   }, [bots]);
   const riskMarginCount = useMemo(() => {
-    return bots.filter((b) => {
-      const im = fracToNum(b.imUsed) ?? 0;
-      const unreal = fracToNum(b.unrealizedNow) ?? 0;
-      return im > 0 && unreal < 0 && (-unreal / im) * 100 >= 50;
-    }).length;
+    return bots.filter(hasLiquidationRisk).length;
   }, [bots]);
   const haltWarnCount = useMemo(() => bots.filter((b) => b.kernelHalted || (b.warnings?.length ?? 0) > 0).length, [bots]);
   const stoppedCount = useMemo(() => bots.filter((b) => b.status === "STOPPED").length, [bots]);
@@ -341,11 +354,7 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
       );
     }
     else if (smartF === "RISK_MARGIN") {
-      list = list.filter((b) => {
-        const im = fracToNum(b.imUsed) ?? 0;
-        const unreal = fracToNum(b.unrealizedNow) ?? 0;
-        return im > 0 && unreal < 0 && (-unreal / im) * 100 >= 50;
-      });
+      list = list.filter(hasLiquidationRisk);
     } else if (smartF === "HALT_WARN") {
       list = list.filter((b) => b.kernelHalted || (b.warnings?.length ?? 0) > 0);
     } else if (smartF === "STOPPED") {

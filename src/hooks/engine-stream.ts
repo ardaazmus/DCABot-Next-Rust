@@ -108,6 +108,8 @@ const DATA_EVENT_TYPES = new Set([
   "FUNDING",
   "LIQUIDATION",
   "WEBHOOK_START",
+  "KILL_SWITCH",
+  "FREEZE",
 ]);
 
 export const useEngineStream = create<EngineStreamState>((set) => ({
@@ -122,6 +124,8 @@ export const useEngineStream = create<EngineStreamState>((set) => ({
 let es: EventSource | null = null;
 let refCount = 0;
 let evtId = 0;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let reconnectAttempts = 0;
 
 function pushEvent(type: string, payload: Record<string, unknown>) {
   evtId += 1;
@@ -135,8 +139,10 @@ function pushEvent(type: string, payload: Record<string, unknown>) {
 
 function ensureStream() {
   if (es) return;
+  let source: EventSource;
   try {
-    es = new EventSource(engineUrl("/api/stream"));
+    source = new EventSource(engineUrl("/api/stream"));
+    es = source;
   } catch {
     es = null;
     useEngineStream.setState({ connected: false });
@@ -170,16 +176,40 @@ function ensureStream() {
     "FREEZE",
     "PING",
   ]) {
-    es.addEventListener(t, handle(t) as EventListener);
+    source.addEventListener(t, handle(t) as EventListener);
   }
-  es.onopen = () => useEngineStream.setState({ connected: true });
-  es.onerror = () => useEngineStream.setState({ connected: false });
+  source.onopen = () => {
+    reconnectAttempts = 0;
+    useEngineStream.setState({ connected: true });
+  };
+  source.onerror = () => {
+    useEngineStream.setState({ connected: false });
+    // EventSource retries transient network failures itself. CLOSED means the
+    // server rejected/closed the stream (for example 401/403); drop the dead
+    // instance and create another one with bounded exponential backoff.
+    if (es !== source || source.readyState !== EventSource.CLOSED || refCount <= 0 || reconnectTimer) return;
+    source.close();
+    es = null;
+    const delay = Math.min(30_000, 500 * 2 ** Math.min(reconnectAttempts, 6));
+    reconnectAttempts += 1;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      if (refCount > 0) ensureStream();
+    }, delay);
+  };
 }
 
 function teardownStreamIfIdle() {
-  if (refCount <= 0 && es) {
-    es.close();
-    es = null;
+  if (refCount <= 0) {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    reconnectAttempts = 0;
+    if (es) {
+      es.close();
+      es = null;
+    }
     useEngineStream.setState({ connected: false });
   }
 }

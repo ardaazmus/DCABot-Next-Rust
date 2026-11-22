@@ -14,6 +14,42 @@ pub mod paper;
 use dca_math::fraction::Fraction;
 use dca_math::Instrument;
 use serde::{Deserialize, Serialize};
+use std::fmt;
+
+fn normalize_venue_base_url(raw: &str, venue: &str, allowed_hosts: &[&str]) -> Result<(String, String), String> {
+    let url = reqwest::Url::parse(raw).map_err(|_| format!("{venue} base URL geçersiz"))?;
+    let host = url.host_str().ok_or_else(|| format!("{venue} base URL ana makine içermiyor"))?.to_ascii_lowercase();
+    if url.scheme() != "https"
+        || url.port_or_known_default() != Some(443)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        return Err(format!("{venue} base URL yalnızca temiz HTTPS kök adresi olabilir"));
+    }
+    if !allowed_hosts.iter().any(|allowed| host == *allowed) {
+        return Err(format!("{venue} base URL izinli borsa alan adında değil"));
+    }
+    Ok((format!("https://{host}"), host))
+}
+
+/// Resolve exchange endpoints to known HTTPS origins and require an explicit
+/// opt-in before a release binary can target a mainnet host.
+pub fn guarded_venue_base_url(raw: &str, venue: &str, allowed_hosts: &[&str], mainnet_hosts: &[&str], demo_or_testnet: bool) -> String {
+    let (url, host) = normalize_venue_base_url(raw, venue, allowed_hosts)
+        .unwrap_or_else(|error| panic!("unsafe exchange endpoint: {error}"));
+    let test_runner = cfg!(test)
+        || std::env::current_exe()
+            .map(|path| path.to_string_lossy().contains("deps"))
+            .unwrap_or(false);
+    let is_mainnet = mainnet_hosts.iter().any(|mainnet| host == *mainnet);
+    if is_mainnet && !demo_or_testnet && !test_runner && std::env::var("DCA_ALLOW_MAINNET").as_deref() != Ok("1") {
+        panic!("CRITICAL SAFETY VIOLATION: {venue} mainnet requires DCA_ALLOW_MAINNET=1; select demo/testnet for local use.");
+    }
+    url
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Kline {
@@ -152,11 +188,32 @@ pub struct OrderBook {
 /// (v3 OkxCredentials {key, secret, passphrase} karşılığı); Bybit/Binance
 /// için passphrase None'dır. Secret/passphrase asla loglanmaz — imza
 /// yardımcıları Zeroizing zarfında kopyayla çalışır (P3-4 deseni).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VenueCreds {
     pub key: String,
     pub secret: String,
     pub passphrase: Option<String>,
+}
+
+impl fmt::Debug for VenueCreds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VenueCreds")
+            .field("key", &"[REDACTED]")
+            .field("secret", &"[REDACTED]")
+            .field("passphrase", &self.passphrase.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+impl Drop for VenueCreds {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.key.zeroize();
+        self.secret.zeroize();
+        if let Some(passphrase) = &mut self.passphrase {
+            passphrase.zeroize();
+        }
+    }
 }
 
 impl From<(String, String)> for VenueCreds {
@@ -518,5 +575,38 @@ mod live_sweep_tests {
         let creds = VenueCreds { key: "k".into(), secret: "s".into(), passphrase: None };
         let missing = sweep_missing_fills(&adapter, &creds, "spot", "TESTUSDT", &tracked).await.unwrap();
         assert!(missing.is_empty(), "iptal edilmiş emir fill üretmez (EX-03)");
+    }
+}
+
+#[cfg(test)]
+mod endpoint_and_secret_tests {
+    use super::*;
+
+    #[test]
+    fn venue_endpoint_validation_rejects_custom_hosts_and_non_https_urls() {
+        let allowed = ["api.bybit.com", "api-testnet.bybit.com"];
+        assert_eq!(
+            normalize_venue_base_url("https://api-testnet.bybit.com/", "Bybit", &allowed).unwrap().0,
+            "https://api-testnet.bybit.com"
+        );
+        assert!(normalize_venue_base_url("http://api-testnet.bybit.com", "Bybit", &allowed).is_err());
+        assert!(normalize_venue_base_url("https://api.bybit.com.evil.test", "Bybit", &allowed).is_err());
+        assert!(normalize_venue_base_url("https://user:pass@api.bybit.com", "Bybit", &allowed).is_err());
+        assert!(normalize_venue_base_url("https://api.bybit.com/path", "Bybit", &allowed).is_err());
+        assert!(normalize_venue_base_url("https://api.bybit.com:8443", "Bybit", &allowed).is_err());
+    }
+
+    #[test]
+    fn venue_credentials_debug_is_redacted() {
+        let creds = VenueCreds {
+            key: "visible-key-must-not-appear".into(),
+            secret: "visible-secret-must-not-appear".into(),
+            passphrase: Some("visible-pass-must-not-appear".into()),
+        };
+        let debug = format!("{creds:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("visible-key-must-not-appear"));
+        assert!(!debug.contains("visible-secret-must-not-appear"));
+        assert!(!debug.contains("visible-pass-must-not-appear"));
     }
 }

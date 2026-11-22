@@ -192,7 +192,7 @@ pub enum IntentOutcome {
     MarketOpen { id: String, side: dca_math::Side, kind: dca_kernel::OrderKind, role: String, price: Fraction, qty: Fraction },
     MarketQueryFailed { id: String, err: String },
     GateBlocked { id: String, reason: String },
-    PlaceFailed { id: String, err: String },
+    PlaceFailed { id: String, err: String, is_close: bool },
     Cancelled { cancelled: Vec<String>, failed: Vec<String> },
 }
 
@@ -330,8 +330,6 @@ pub struct AppState {
     pub webhook_rate: Mutex<HashMap<String, (i64, u32)>>,
     /// P4-1 haber HTTP istemcisi (8 sn zaman aşımı, beyaz-liste konaklar).
     pub news_http: reqwest::Client,
-    /// P4-2 YZ sağlayıcı HTTP istemcisi (35 sn zaman aşımı — LLM yanıtları).
-    pub ai_http: reqwest::Client,
     /// P4-2 haber TR-özet önbelleği: news item id → özet (öğe başına bir kez).
     pub news_ai_cache: Mutex<HashMap<String, String>>,
     /// Faz 0.2 — global kill-switch (v3 engage/release; TV ENTRY dahil durdurur).
@@ -393,11 +391,6 @@ impl AppState {
                 .user_agent("dcabot-news/1.0 (+internal)")
                 .build()
                 .expect("news http client"),
-            ai_http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(35))
-                .user_agent("dcabot-ai/1.0 (+internal)")
-                .build()
-                .expect("ai http client"),
             news_ai_cache: Mutex::new(HashMap::new()),
             kill: Mutex::new(HaltState::default()),
             freeze: Mutex::new(HaltState::default()),

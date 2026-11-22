@@ -272,7 +272,13 @@ pub fn certify(
         return Err("certify: all trial backtests failed".into());
     }
 
-    let n_bars = trials[0].per_bar_returns.len();
+    let n_bars = trials.iter().map(|trial| trial.per_bar_returns.len()).min().unwrap_or(0);
+    if trials.iter().any(|trial| trial.per_bar_returns.len() != n_bars) {
+        warnings.push(format!("trial bar getirileri CSCV için ortak en kısa pencereye ({n_bars}) hizalandı"));
+        for trial in &mut trials {
+            trial.per_bar_returns.truncate(n_bars);
+        }
+    }
     // ---- CSCV: PBO + WFE ----
     let s = if n_bars >= 60 { 6 } else if n_bars >= 40 { 4 } else { 0 };
     let mut pbo = f64::NAN;

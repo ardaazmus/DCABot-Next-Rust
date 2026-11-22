@@ -38,34 +38,15 @@ impl OkxAdapter {
     pub fn new() -> Self {
         let is_demo = std::env::var("DCA_OKX_DEMO").as_deref() == Ok("1")
             || std::env::var("DCA_OKX_TESTNET").as_deref() == Ok("1");
-
-        // Faz 0.5 (B-6): MAINNET fail-closed kapısı — demo değilse ve DCA_ALLOW_MAINNET=1 yoksa engelle
-        // Faz 26 (CI düzeltmesi): is_test_runner artık derleme-zamanı
-        // cfg!(test) + exe-path heuristiği (ikisi OR) — Linux CI'da
-        // current_exe() heuristiği tutmadığında birim testler mainnet
-        // kapısına takılıyordu. cfg!(test) birim testlerde kesindir.
-        // Faz 26 (CI final): kapının amacı RELEASE üretimi korumak —
-        // debug ikililer (cargo test, yerel dev) yalnız simülasyona gider.
-        // cfg!(test) yalnız kendi crate'i kapsar; dca_server bin testleri
-        // dca_exchange'i cfg(test) OLMADAN derler. Linux'ta yeni cargo test
-        // ikililerini deps/ dışına koyar → exe heuristiği de yetmez.
-        // Robust: cfg!(test) || cfg!(debug_assertions) || exe-path.
-        let is_test_runner = cfg!(test)
-            || cfg!(debug_assertions)
-            || std::env::current_exe()
-                .map(|p| p.to_string_lossy().contains("deps"))
-                .unwrap_or(false);
-        if !is_demo && !is_test_runner && std::env::var("DCA_ALLOW_MAINNET").as_deref() != Ok("1") {
-            panic!("CRITICAL SAFETY VIOLATION: Attempted OKX MAINNET connection without DCA_ALLOW_MAINNET=1! Set DCA_OKX_DEMO=1 for demo or explicitly set DCA_ALLOW_MAINNET=1.");
-        }
-
-        let base_url = std::env::var("OKX_BASE_URL")
+        let raw_base_url = std::env::var("OKX_BASE_URL")
             .or_else(|_| std::env::var("DCA_OKX_BASE_URL"))
             .unwrap_or_else(|_| MAINNET.into());
+        let base_url = super::guarded_venue_base_url(&raw_base_url, "OKX", &["www.okx.com"], &["www.okx.com"], is_demo);
         Self {
             base_url,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("reqwest"),
             is_demo,
@@ -293,6 +274,52 @@ fn first_data(v: &Value) -> Option<&Value> {
     v.as_array()?.first()
 }
 
+fn normalize_contract_qty(qty: &Fraction, ct_val: &Fraction) -> Result<Fraction, String> {
+    if !ct_val.is_positive() {
+        return Err("okx: ctVal must be positive to normalize contract quantity".into());
+    }
+    qty.mul(ct_val).map_err(|e| format!("okx contract quantity conversion failed: {e}"))
+}
+
+fn normalize_okx_fee(raw: Option<&str>) -> Option<Fraction> {
+    raw.and_then(|value| Fraction::from_any_str(value).ok())
+        .and_then(|fee| fee.neg().ok())
+}
+
+fn parse_key_permissions(v: &Value) -> Result<KeyPermissions, String> {
+    let config = first_data(v).ok_or("okx account config: no data")?;
+    let permission_text = config
+        .get("perm")
+        .and_then(Value::as_str)
+        .ok_or("okx account config: permission field missing or malformed")?;
+    if permission_text.trim().is_empty() {
+        return Err("okx account config: empty permission field".into());
+    }
+    let permissions: Vec<&str> = permission_text.split(',').map(str::trim).collect();
+    let can_withdraw = permissions.contains(&"withdraw");
+    let has_trade = permissions.contains(&"trade");
+    // OKX's `read_only` token means the key has Read permission; it does not
+    // mean the key is restricted to reading. The Trade token is authoritative.
+    let read_only = !has_trade;
+    let ips = config
+        .get("ip")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|ip| !ip.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok(KeyPermissions {
+        read_only,
+        can_withdraw,
+        spot_trade: has_trade,
+        contract_trade: has_trade,
+        ips,
+        note: format!("okx account config permissions: read_only={read_only}, trade={has_trade}, withdraw={can_withdraw}"),
+    })
+}
+
 #[async_trait::async_trait]
 impl VenueAdapter for OkxAdapter {
     fn name(&self) -> &'static str {
@@ -500,28 +527,11 @@ impl VenueAdapter for OkxAdapter {
         })
     }
 
-    /// OKX izin introspectsiyonu: /api/v5/account/get-api-key ile anahtar
-    /// izinlerini gerçekten okur. can_withdraw açıksa hard-fail (SEC-03).
+    /// OKX /api/v5/account/config exposes the current key's comma-separated
+    /// permissions. Missing or malformed permission data must fail closed.
     async fn key_permissions(&self, creds: &VenueCreds) -> Result<KeyPermissions, String> {
-        let v = self.private_get(creds, "/api/v5/account/get-api-key", "").await?;
-        let list = v.get("data").and_then(|x| x.as_array()).and_then(|a| a.first()).ok_or("okx get-api-key: no data")?;
-        let read_only = list.get("readOnly").and_then(|x| x.as_str()).map(|s| s == "true").unwrap_or(false);
-        let can_withdraw = list.get("canWithdraw").and_then(|x| x.as_str()).map(|s| s == "true").unwrap_or(false);
-        // OKX don't expose spot/contract trade flags separately in get-api-key;
-        // assume trade enabled if not read-only and not withdraw-only.
-        let spot_trade = !read_only && !can_withdraw;
-        let contract_trade = !read_only && !can_withdraw;
-        let ips: Vec<String> = list.get("ipList").and_then(|x| x.as_array()).map(|a| {
-            a.iter().filter_map(|i| i.get("ip").and_then(|x| x.as_str()).map(String::from)).collect()
-        }).unwrap_or_default();
-        Ok(KeyPermissions {
-            read_only,
-            can_withdraw,
-            spot_trade,
-            contract_trade,
-            ips,
-            note: format!("okx: readOnly={read_only} canWithdraw={can_withdraw} (real API introspection)"),
-        })
+        let v = self.private_get(creds, "/api/v5/account/config", "").await?;
+        parse_key_permissions(&v)
     }
 
     async fn wallet(&self, creds: &VenueCreds, coin: &str) -> Result<WalletSnapshot, String> {
@@ -564,7 +574,7 @@ impl VenueAdapter for OkxAdapter {
             "side": match req.side { dca_math::Side::Buy => "buy", dca_math::Side::Sell => "sell" },
             "ordType": if req.is_market { "market" } else { "limit" },
             "sz": sz,
-            "clOrdId": req.order_link_id,
+            "clOrdId": encode_okx_client_id(&req.order_link_id)?,
         });
         if let Some(ps) = pos_side {
             body["posSide"] = Value::String(ps.to_string());
@@ -591,7 +601,7 @@ impl VenueAdapter for OkxAdapter {
 
     async fn cancel_order(&self, creds: &VenueCreds, category: &str, symbol: &str, order_link_id: &str) -> Result<(), String> {
         let inst_id = okx_inst_id(symbol, category)?;
-        let body = serde_json::json!({"instId": inst_id, "clOrdId": order_link_id});
+        let body = serde_json::json!({"instId": inst_id, "clOrdId": encode_okx_client_id(order_link_id)?});
         let body_str = serde_json::to_string(&body).map_err(|e| e.to_string())?;
         let v = self.private_post(creds, "/api/v5/trade/cancel-order", &body_str).await?;
         let d = first_data(&v);
@@ -614,17 +624,26 @@ impl VenueAdapter for OkxAdapter {
         // Faz 4 (M-2): swap emirlerinde sz/accFillSz KONTRAT cinsindendir —
         // ctVal ile coin cinsine normalize edilir (ctVal okunamazsa ham bırakılır).
         let ct = if category == "linear" {
-            self.instrument_ct_val(&inst_id).await.unwrap_or_else(|_| Fraction::one())
+            self.instrument_ct_val(&inst_id).await?
         } else {
             Fraction::one()
         };
-        let norm = |x: Fraction| -> Fraction { if ct.is_zero() { x } else { x.div(&ct).unwrap_or(x) } };
+        if !ct.is_positive() {
+            return Err("okx: ctVal must be positive for linear order normalization".into());
+        }
+        let norm = |x: Fraction| -> Result<Fraction, String> {
+            if category == "linear" { normalize_contract_qty(&x, &ct) } else { Ok(x) }
+        };
         let mut out = Vec::new();
         if let Some(list) = v.as_array() {
             for item in list {
                 out.push(VenueOrderState {
                     order_id: item.get("ordId").and_then(|x| x.as_str()).unwrap_or("").into(),
-                    order_link_id: item.get("clOrdId").and_then(|x| x.as_str()).unwrap_or("").into(),
+                    order_link_id: item
+                        .get("clOrdId")
+                        .and_then(|x| x.as_str())
+                        .map(decode_okx_client_id)
+                        .unwrap_or_default(),
                     symbol: symbol.into(),
                     side: match item.get("side").and_then(|x| x.as_str()).unwrap_or("") {
                         "buy" => "Buy".into(),
@@ -632,9 +651,9 @@ impl VenueAdapter for OkxAdapter {
                         other => other.into(),
                     },
                     price: item.get("px").and_then(|x| x.as_str()).and_then(|s| Fraction::from_decimal_str(s).ok()),
-                    qty: norm(Fraction::from_any_str(item.get("sz").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero())),
-                    cum_exec_qty: norm(Fraction::from_any_str(item.get("accFillSz").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero())),
-                    cum_exec_fee: item.get("accFillFee").and_then(|x| x.as_str()).and_then(|f| Fraction::from_any_str(f).ok()),
+                    qty: norm(Fraction::from_any_str(item.get("sz").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()))?,
+                    cum_exec_qty: norm(Fraction::from_any_str(item.get("accFillSz").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()))?,
+                    cum_exec_fee: normalize_okx_fee(item.get("accFillFee").and_then(|x| x.as_str())),
                     status: map_okx_state(item.get("state").and_then(|x| x.as_str()).unwrap_or("")).into(),
                 });
             }
@@ -644,7 +663,8 @@ impl VenueAdapter for OkxAdapter {
 
     async fn query_order(&self, creds: &VenueCreds, category: &str, symbol: &str, order_link_id: &str) -> Result<Option<VenueOrderState>, String> {
         let inst_id = okx_inst_id(symbol, category)?;
-        let v = self.private_get(creds, "/api/v5/trade/order", &format!("instId={inst_id}&clOrdId={order_link_id}")).await?;
+        let venue_id = encode_okx_client_id(order_link_id)?;
+        let v = self.private_get(creds, "/api/v5/trade/order", &format!("instId={inst_id}&clOrdId={venue_id}")).await?;
         let d = match first_data(&v) {
             Some(d) => d,
             None => return Ok(None),
@@ -663,19 +683,19 @@ impl VenueAdapter for OkxAdapter {
         let raw_fill = Fraction::from_any_str(d.get("accFillSz").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero());
         let (qty, cum_exec_qty) = if category == "linear" {
             // ctVal okunamıyorsa raw değer kullanılır (fail-safe:Contract boyutu bilinmiyor).
-            let ct = self.instrument_ct_val(&inst_id).await.unwrap_or_else(|_| Fraction::one());
-            if ct.is_zero() {
-                (raw_qty, raw_fill)
-            } else {
-                (raw_qty.div(&ct).unwrap_or(raw_qty), raw_fill.div(&ct).unwrap_or(raw_fill))
-            }
+            let ct = self.instrument_ct_val(&inst_id).await?;
+            (normalize_contract_qty(&raw_qty, &ct)?, normalize_contract_qty(&raw_fill, &ct)?)
         } else {
             (raw_qty, raw_fill)
         };
         Ok(Some(VenueOrderState {
-            cum_exec_fee: d.get("accFillFee").and_then(|x| x.as_str()).and_then(|f| Fraction::from_any_str(f).ok()),
+            cum_exec_fee: normalize_okx_fee(d.get("accFillFee").and_then(|x| x.as_str())),
             order_id: d.get("ordId").and_then(|x| x.as_str()).unwrap_or("").into(),
-            order_link_id: d.get("clOrdId").and_then(|x| x.as_str()).unwrap_or(order_link_id).into(),
+            order_link_id: d
+                .get("clOrdId")
+                .and_then(|x| x.as_str())
+                .map(decode_okx_client_id)
+                .unwrap_or_else(|| order_link_id.to_string()),
             symbol: symbol.into(),
             side: match d.get("side").and_then(|x| x.as_str()).unwrap_or("") {
                 "buy" => "Buy".into(),
@@ -703,7 +723,11 @@ impl VenueAdapter for OkxAdapter {
                 if pos == "0" || pos.is_empty() {
                     continue;
                 }
-                let side_raw = item.get("side").and_then(|x| x.as_str()).unwrap_or("net");
+                let side_raw = item
+                    .get("posSide")
+                    .and_then(|x| x.as_str())
+                    .or_else(|| item.get("side").and_then(|x| x.as_str()))
+                    .unwrap_or("net");
                 let side = match side_raw {
                     "long" => "Buy",
                     "short" => "Sell",
@@ -716,7 +740,12 @@ impl VenueAdapter for OkxAdapter {
                     symbol: symbol.into(),
                     side: side.into(),
                     position_idx: None,
-                    size: f("pos"),
+                    size: {
+                        let raw = f("pos");
+                        let absolute = if raw.is_negative() { raw.neg().unwrap_or_else(|_| Fraction::zero()) } else { raw };
+                        let ct = self.instrument_ct_val(&inst_id).await?;
+                        normalize_contract_qty(&absolute, &ct)?
+                    },
                     avg_price: f("avgPx"),
                     mark_price: f("markPx"),
                     unrealized_pnl: f("upl"),
@@ -788,9 +817,54 @@ impl OkxAdapter {
     async fn instrument_ct_val(&self, inst_id: &str) -> Result<Fraction, String> {
         let v = self.public_get("/api/v5/public/instruments", &format!("instType=SWAP&instId={inst_id}")).await?;
         let row = first_data(&v).ok_or("okx instrument spec yok")?;
-        let ct_str = row.get("ctVal").and_then(|x| x.as_str()).unwrap_or("1");
-        Fraction::from_decimal_str(ct_str).map_err(|e| format!("okx ctVal parse: {e}"))
+        let ct_str = row.get("ctVal").and_then(|x| x.as_str()).ok_or("okx ctVal alanı yok")?;
+        let ct_val = Fraction::from_decimal_str(ct_str).map_err(|e| format!("okx ctVal parse: {e}"))?;
+        if !ct_val.is_positive() {
+            return Err("okx ctVal must be positive".into());
+        }
+        Ok(ct_val)
     }
+}
+
+/// OKX `clOrdId` accepts only alphanumeric characters (max 32), while the
+/// engine's stable order IDs contain separators. Bot IDs are `b-` followed by
+/// an eight-character hex ID; map that prefix to `D`, dashes to reserved `z`,
+/// and underscores to reserved `y`, so the venue ID remains reversible. The
+/// long `GRID_CLOSE` role is compacted to stay within OKX's limit.
+fn encode_okx_client_id(internal: &str) -> Result<String, String> {
+    let body = internal
+        .strip_prefix("b-")
+        .ok_or_else(|| "OKX clOrdId: engine order ID must start with b-".to_string())?;
+    if body.len() < 8 || !body.as_bytes()[..8].iter().all(u8::is_ascii_hexdigit) {
+        return Err("OKX clOrdId: bot ID must contain eight hex characters".into());
+    }
+    if body.bytes().any(|c| {
+        !(c.is_ascii_alphanumeric() || c == b'-' || c == b'_') || c == b'y' || c == b'z'
+    }) {
+        return Err("OKX clOrdId: unsupported character in engine order ID".into());
+    }
+    let compact = body
+        .replace("-GRID_CLOSE-", "zXz")
+        .replace('-', "z")
+        .replace('_', "y");
+    let venue_id = format!("D{compact}");
+    if venue_id.len() > 32 {
+        return Err("OKX clOrdId exceeds the 32-character venue limit".into());
+    }
+    Ok(venue_id)
+}
+
+/// Reverse IDs emitted by `encode_okx_client_id`. Unrecognized client IDs are
+/// left untouched so unrelated account orders cannot be mistaken for ours.
+fn decode_okx_client_id(venue_id: &str) -> String {
+    let Some(body) = venue_id.strip_prefix('D') else {
+        return venue_id.into();
+    };
+    if body.len() < 8 || !body.as_bytes()[..8].iter().all(u8::is_ascii_hexdigit) {
+        return venue_id.into();
+    }
+    let internal_body = body.replace("zXz", "-GRID_CLOSE-").replace('z', "-").replace('y', "_");
+    format!("b-{internal_body}")
 }
 
 fn map_okx_state(s: &str) -> &'static str {
@@ -854,6 +928,32 @@ mod okx_tests {
     }
 
     #[test]
+    fn swap_contracts_convert_to_coin_and_okx_fee_sign_is_reversed() {
+        assert_eq!(normalize_contract_qty(&Fraction::from_u64(10_000), &Fraction::from_decimal_str("0.01").unwrap()).unwrap().to_string(), "100");
+        assert_eq!(normalize_okx_fee(Some("-0.25")).unwrap().to_string(), "1/4");
+        assert_eq!(normalize_okx_fee(Some("0.1")).unwrap().to_string(), "-1/10");
+        assert!(normalize_contract_qty(&Fraction::one(), &Fraction::zero()).is_err());
+    }
+
+    #[test]
+    fn okx_client_order_ids_are_alphanumeric_reversible_and_bounded() {
+        let ids = [
+            "b-0123abcd-1-TPL-0",
+            "b-0123abcd-1-GRID_CLOSE-4294967296",
+            "b-0123abcd-hedge-main-7-BASE-0",
+        ];
+        for internal in ids {
+            let venue = encode_okx_client_id(internal).unwrap();
+            assert!(venue.len() <= 32);
+            assert!(venue.bytes().all(|c| c.is_ascii_alphanumeric()));
+            assert_eq!(decode_okx_client_id(&venue), internal);
+        }
+        assert_eq!(decode_okx_client_id("OTHER1234zXz"), "OTHER1234zXz");
+        assert!(encode_okx_client_id("b-0123abcd-1-GRID_CLOSE-4294967296").unwrap().len() <= 32);
+        assert!(encode_okx_client_id("b-0123abcd-1-z_ROLE-0").is_err());
+    }
+
+    #[test]
     fn state_mapping_covers_okx_lifecycle() {
         assert_eq!(map_okx_state("live"), "New");
         assert_eq!(map_okx_state("partially_filled"), "PartiallyFilled");
@@ -881,5 +981,31 @@ mod okx_tests {
         // Açılışta: Buy -> "long", Sell -> "short"
         assert_eq!(resolve_okx_pos_side("linear", 0, dca_math::Side::Buy, false), Some("long"));
         assert_eq!(resolve_okx_pos_side("linear", 0, dca_math::Side::Sell, false), Some("short"));
+    }
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    #[test]
+    fn account_config_permissions_are_parsed_from_the_unwrapped_data_array() {
+        let parsed = parse_key_permissions(&serde_json::json!([
+            {"perm": "read_only,trade", "ip": "192.0.2.1, 2001:db8::1"}
+        ])).unwrap();
+        assert!(!parsed.read_only);
+        assert!(!parsed.can_withdraw);
+        assert!(parsed.spot_trade && parsed.contract_trade);
+        assert_eq!(parsed.ips, vec!["192.0.2.1", "2001:db8::1"]);
+    }
+
+    #[test]
+    fn missing_or_malformed_account_permission_data_fails_closed() {
+        assert!(parse_key_permissions(&serde_json::json!([])).is_err());
+        assert!(parse_key_permissions(&serde_json::json!([{"perm": ""}])).is_err());
+        assert!(parse_key_permissions(&serde_json::json!([{"perm": true}])).is_err());
+        let parsed = parse_key_permissions(&serde_json::json!([{"perm": "read_only,withdraw"}])).unwrap();
+        assert!(parsed.read_only && parsed.can_withdraw);
+        assert!(!parsed.spot_trade && !parsed.contract_trade);
     }
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { use, useEffect, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import {
   BookOpen,
@@ -35,6 +35,10 @@ import { fmtDur } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 type View = "dashboard" | "fleet" | "studio" | "wizard" | "calc" | "backtest" | "knowledge" | "settings";
+type PageSearchParams = Promise<{ [key: string]: string | string[] | undefined }>;
+
+const isView = (value: unknown): value is View =>
+  typeof value === "string" && ["dashboard", "fleet", "studio", "wizard", "calc", "backtest", "knowledge", "settings"].includes(value);
 
 const NAV: { id: View; label: string; icon: React.ElementType }[] = [
   { id: "dashboard", label: "Kokpit", icon: LayoutDashboard },
@@ -91,20 +95,13 @@ function DataFreshness({ lastUpdatedAt, offline }: { lastUpdatedAt: number | nul
   );
 }
 
-export default function Page() {
-  const [view, setView] = useState<View>(() => {
-    if (typeof window === "undefined") return "dashboard";
-    const p = new URLSearchParams(window.location.search);
-    const v = p.get("view") as View | null;
-    return v && ["dashboard", "fleet", "studio", "wizard", "calc", "backtest", "knowledge", "settings"].includes(v)
-      ? v
-      : "dashboard";
-  });
-  const [botId, setBotId] = useState<string | null>(() => {
-    if (typeof window === "undefined") return null;
-    const p = new URLSearchParams(window.location.search);
-    return p.get("botId");
-  });
+export default function Page({ searchParams }: { searchParams: PageSearchParams }) {
+  const query = use(searchParams);
+  const requestedView = Array.isArray(query.view) ? query.view[0] : query.view;
+  const initialView: View = isView(requestedView) ? requestedView : "dashboard";
+  const initialBotId = typeof query.botId === "string" ? query.botId : null;
+  const [view, setView] = useState<View>(initialView);
+  const [botId, setBotId] = useState<string | null>(initialBotId);
   const [authLocked, setAuthLocked] = useState(false);
   /* P1 + P6 */
   const [moreOpen, setMoreOpen] = useState(false);

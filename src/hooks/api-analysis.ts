@@ -125,7 +125,7 @@ export interface ClosedDeal {
   wins: number;
   losses: number;
   result: "WIN" | "LOSS";
-  reason: "TP" | "SL" | "LIQUIDATION" | "MANUAL";
+  reason: "TP" | "SL" | "LIQUIDATION" | "MANUAL" | "TRAIL" | "CLOSE";
 }
 
 export interface DealsSummary {

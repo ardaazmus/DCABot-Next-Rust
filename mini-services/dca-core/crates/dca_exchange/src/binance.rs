@@ -13,6 +13,29 @@ pub const MAINNET: &str = "https://api.binance.com";
 /// ortam (Bybit DCA_BYBIT_TESTNET deseniyle aynı).
 pub const TESTNET: &str = "https://testnet.binance.vision";
 
+fn parse_account_restrictions(v: &Value) -> Result<KeyPermissions, String> {
+    let required_bool = |field: &str| {
+        v.get(field)
+            .and_then(Value::as_bool)
+            .ok_or_else(|| format!("binance permission response missing boolean '{field}'"))
+    };
+    let can_withdraw = required_bool("enableWithdrawals")?;
+    let spot_trade = required_bool("enableSpotAndMarginTrading")?;
+    let contract_trade = required_bool("enableFutures")?;
+    let can_read = required_bool("enableReading")?;
+    let ip_restrict = required_bool("ipRestrict")?;
+    let read_only = can_read && !spot_trade && !contract_trade;
+    let ips = if ip_restrict { vec!["IP_RESTRICTED".into()] } else { vec![] };
+    Ok(KeyPermissions {
+        read_only,
+        can_withdraw,
+        spot_trade,
+        contract_trade,
+        ips,
+        note: format!("binance /sapi/v1/account/apiRestrictions: can_withdraw={can_withdraw}, spot={spot_trade}, futures={contract_trade}"),
+    })
+}
+
 pub struct BinanceAdapter {
     pub base_url: String,
     pub http: reqwest::Client,
@@ -20,16 +43,27 @@ pub struct BinanceAdapter {
 
 impl BinanceAdapter {
     pub fn new() -> Self {
-        let base = if let Ok(u) = std::env::var("BINANCE_SPOT_BASE").or_else(|_| std::env::var("DCA_BINANCE_BASE_URL")) {
+        let raw_base = if let Ok(u) = std::env::var("BINANCE_SPOT_BASE").or_else(|_| std::env::var("DCA_BINANCE_BASE_URL")) {
             u
         } else if std::env::var("DCA_BINANCE_TESTNET").as_deref() == Ok("1") {
             TESTNET.to_string()
         } else {
             MAINNET.to_string()
         };
+        let base = super::guarded_venue_base_url(
+            &raw_base,
+            "Binance Spot",
+            &["api.binance.com", "testnet.binance.vision"],
+            &["api.binance.com"],
+            false,
+        );
         Self {
             base_url: base,
-            http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).build().expect("reqwest"),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("reqwest"),
         }
     }
 
@@ -205,73 +239,24 @@ impl VenueAdapter for BinanceAdapter {
     }
 
     async fn key_permissions(&self, creds: &VenueCreds) -> Result<KeyPermissions, String> {
-        // 1. Try /sapi/v1/account/apiRestrictions first (official endpoint for checking withdrawal and trade permissions)
+        // This is the authoritative endpoint for withdrawal and trade flags.
+        // Missing fields or an unsupported testnet endpoint must fail closed.
         let q = self.signed_query("recvWindow=5000", &creds.secret);
         let sapi_url = format!("{}/sapi/v1/account/apiRestrictions?{}", self.base_url, q);
-        let sapi_res = self
+        let resp = self
             .http
             .get(&sapi_url)
             .header("X-MBX-APIKEY", &creds.key)
             .send()
-            .await;
-
-        if let Ok(resp) = sapi_res {
-            if resp.status().is_success() {
-                if let Ok(v) = resp.json::<Value>().await {
-                    let can_withdraw = v.get("enableWithdrawals").and_then(|x| x.as_bool()).unwrap_or(false);
-                    let spot_trade = v.get("enableSpotAndMarginTrading").and_then(|x| x.as_bool()).unwrap_or(true);
-                    let contract_trade = v.get("enableFutures").and_then(|x| x.as_bool()).unwrap_or(false);
-                    let read_only = v.get("enableReading").and_then(|x| x.as_bool()).map(|r| r && !spot_trade && !contract_trade).unwrap_or(false);
-                    let ip_restrict = v.get("ipRestrict").and_then(|x| x.as_bool()).unwrap_or(false);
-                    let ips = if ip_restrict { vec!["IP_RESTRICTED".into()] } else { vec![] };
-                    return Ok(KeyPermissions {
-                        read_only,
-                        can_withdraw,
-                        spot_trade,
-                        contract_trade,
-                        ips,
-                        note: format!("binance /sapi/v1/account/apiRestrictions: can_withdraw={can_withdraw}, spot={spot_trade}, futures={contract_trade}"),
-                    });
-                }
-            }
-        }
-
-        // 2. Fallback to /api/v3/account (standard spot account endpoint, works on mainnet & testnet/demo)
-        let q = self.signed_query("recvWindow=5000", &creds.secret);
-        let acc_url = format!("{}/api/v3/account?{}", self.base_url, q);
-        let resp = self
-            .http
-            .get(&acc_url)
-            .header("X-MBX-APIKEY", &creds.key)
-            .send()
             .await
-            .map_err(|e| format!("binance network error: {e}"))?;
+            .map_err(|e| format!("binance permission check network failure: {}", e.without_url()))?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let err_body = resp.text().await.unwrap_or_default();
-            return Err(format!("binance account check failed ({status}): {err_body}"));
+            return Err(format!("binance permission check failed ({})", resp.status()));
         }
 
         let v: Value = resp.json().await.map_err(|e| format!("binance response parse error: {e}"))?;
-        let can_withdraw = v.get("canWithdraw").and_then(|x| x.as_bool()).unwrap_or(false);
-        let can_trade = v.get("canTrade").and_then(|x| x.as_bool()).unwrap_or(false);
-        let perms: Vec<String> = v
-            .get("permissions")
-            .and_then(|x| x.as_array())
-            .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
-            .unwrap_or_default();
-        let spot_trade = can_trade && (perms.is_empty() || perms.iter().any(|p| p == "SPOT" || p == "TRD_GRP_002"));
-        let contract_trade = perms.iter().any(|p| p == "FUTURES" || p == "LEVERAGED");
-
-        Ok(KeyPermissions {
-            read_only: !can_trade,
-            can_withdraw,
-            spot_trade,
-            contract_trade,
-            ips: vec![],
-            note: format!("binance /api/v3/account: canWithdraw={can_withdraw}, canTrade={can_trade}, perms={perms:?}"),
-        })
+        parse_account_restrictions(&v)
     }
 
     async fn wallet(&self, creds: &VenueCreds, coin: &str) -> Result<WalletSnapshot, String> {
@@ -440,7 +425,7 @@ impl VenueAdapter for BinanceAdapter {
             qty: Fraction::from_any_str(v.get("origQty").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero()),
             cum_exec_qty: executed,
             cum_exec_fee: None,
-            status: v.get("status").and_then(|x| x.as_str()).unwrap_or("").into(),
+            status: normalize_binance_order_status(v.get("status").and_then(|x| x.as_str()).unwrap_or("")),
         }))
     }
 
@@ -492,13 +477,36 @@ impl VenueAdapter for BinanceAdapter {
     }
 }
 
+/// Normalize Binance's REST enum into the venue-neutral states consumed by
+/// `sweep_missing_fills`. Unknown values remain unknown so reconciliation
+/// fails closed instead of inventing a fill.
+fn normalize_binance_order_status(status: &str) -> String {
+    match status {
+        "NEW" => "New".into(),
+        "PARTIALLY_FILLED" => "PartiallyFilled".into(),
+        "FILLED" => "Filled".into(),
+        "CANCELED" => "Cancelled".into(),
+        "PENDING_CANCEL" => "PendingCancel".into(),
+        "REJECTED" => "Rejected".into(),
+        "EXPIRED" | "EXPIRED_IN_MATCH" => "Expired".into(),
+        other => other.into(),
+    }
+}
+
 /// Faz 2.7 — futures tabanı (spot tabanından ayrı; testnet bayrağı paralel).
 fn futures_base() -> String {
-    if std::env::var("DCA_BINANCE_TESTNET").as_deref() == Ok("1") {
+    let raw = if std::env::var("DCA_BINANCE_TESTNET").as_deref() == Ok("1") {
         std::env::var("BINANCE_FUTURES_TESTNET_BASE").unwrap_or_else(|_| "https://testnet.binancefuture.com".into())
     } else {
         std::env::var("BINANCE_FUTURES_BASE").unwrap_or_else(|_| "https://fapi.binance.com".into())
-    }
+    };
+    super::guarded_venue_base_url(
+        &raw,
+        "Binance Futures",
+        &["fapi.binance.com", "testnet.binancefuture.com"],
+        &["fapi.binance.com"],
+        false,
+    )
 }
 
 /// Faz 2.7 — saf: Binance `leverageBracket` yanıtını M07 kademelerine
@@ -596,5 +604,59 @@ mod binance_sign_tests {
         let mut expected = Hmac::<Sha256>::new_from_slice(b"Jefe").unwrap();
         expected.update(format!("{payload}&timestamp=1700000000000").as_bytes());
         assert_eq!(sig, hex::encode_upper(expected.finalize().into_bytes()), "signature must cover params + timestamp");
+    }
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    #[test]
+    fn missing_restriction_fields_fail_closed() {
+        assert!(parse_account_restrictions(&serde_json::json!({})).is_err());
+        assert!(parse_account_restrictions(&serde_json::json!({
+            "enableWithdrawals": false,
+            "enableSpotAndMarginTrading": false,
+            "enableFutures": false,
+            "enableReading": true
+        })).is_err());
+    }
+
+    #[test]
+    fn withdrawal_and_trade_permissions_are_taken_from_authoritative_fields() {
+        let safe = parse_account_restrictions(&serde_json::json!({
+            "enableWithdrawals": false,
+            "enableSpotAndMarginTrading": true,
+            "enableFutures": false,
+            "enableReading": true,
+            "ipRestrict": true
+        })).unwrap();
+        assert!(!safe.can_withdraw);
+        assert!(safe.spot_trade);
+        assert!(!safe.contract_trade);
+        assert_eq!(safe.ips, vec!["IP_RESTRICTED"]);
+
+        let unsafe_key = parse_account_restrictions(&serde_json::json!({
+            "enableWithdrawals": true,
+            "enableSpotAndMarginTrading": true,
+            "enableFutures": false,
+            "enableReading": true,
+            "ipRestrict": false
+        })).unwrap();
+        assert!(unsafe_key.can_withdraw);
+    }
+}
+
+#[cfg(test)]
+mod order_status_tests {
+    use super::normalize_binance_order_status;
+
+    #[test]
+    fn normalizes_terminal_and_partial_binance_order_states() {
+        assert_eq!(normalize_binance_order_status("FILLED"), "Filled");
+        assert_eq!(normalize_binance_order_status("PARTIALLY_FILLED"), "PartiallyFilled");
+        assert_eq!(normalize_binance_order_status("CANCELED"), "Cancelled");
+        assert_eq!(normalize_binance_order_status("EXPIRED_IN_MATCH"), "Expired");
+        assert_eq!(normalize_binance_order_status("SOME_FUTURE_STATE"), "SOME_FUTURE_STATE");
     }
 }

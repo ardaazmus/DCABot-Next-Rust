@@ -162,7 +162,9 @@ fn closer_pending_reserved(
     fill_price: &Fraction,
     is_buy_ladder: bool,
     taker_fee_rate: &Fraction,
-) -> Fraction {
+    leverage: &Fraction,
+    is_spot: bool,
+) -> Result<Fraction, String> {
     let mut acc = Fraction::zero();
     for p in pending {
         if p.kind != OrderKind::Add {
@@ -177,15 +179,18 @@ fn closer_pending_reserved(
         if !closer {
             continue;
         }
-        let with_fee = p
-            .qty
-            .mul(pp)
-            .and_then(|n| n.mul(taker_fee_rate).and_then(|f| n.add(&f)));
-        if let Ok(v) = with_fee {
-            acc = v.add(&acc).unwrap_or(acc);
-        }
+        let notional = p.qty.mul(pp).map_err(|e| e.to_string())?;
+        let fee = notional.mul(taker_fee_rate).map_err(|e| e.to_string())?;
+        let principal = if is_spot {
+            notional
+        } else {
+            let effective_leverage = if leverage.is_positive() { leverage.clone() } else { Fraction::one() };
+            notional.div(&effective_leverage).map_err(|e| e.to_string())?
+        };
+        let required = principal.add(&fee).map_err(|e| e.to_string())?;
+        acc = acc.add(&required).map_err(|e| e.to_string())?;
     }
-    acc
+    Ok(acc)
 }
 
 impl SimulationStepper {
@@ -384,7 +389,7 @@ impl SimulationStepper {
 
         // Intrabar evaluation of resting limit orders (penetration + realism + capital)
         let remaining = std::mem::take(&mut self.pending);
-        'orders: for order in remaining {
+        'orders: for (order_index, order) in remaining.iter().cloned().enumerate() {
             let Some(target) = &order.price else {
                 // market orders scheduled for this bar open (Gate 4 eligible)
                 if order.decision_ts > bar.t {
@@ -550,12 +555,19 @@ impl SimulationStepper {
             // bekler — kör ilk-gelen-alır değil, öncelikli tahsis).
             if order.kind == OrderKind::Add {
                 let fee = order.qty.mul(&fill_price).map_err(|e| e.to_string())?.mul(&self.instrument.taker_fee_rate).map_err(|e| e.to_string())?;
+                // self.pending contains already-deferred orders; remaining
+                // contains later orders that have not yet been visited. Both
+                // groups must reserve closer Add capital for this fill.
+                let mut reserve_candidates = self.pending.clone();
+                reserve_candidates.extend(remaining.iter().skip(order_index + 1).cloned());
                 let reserved = closer_pending_reserved(
-                    &self.pending,
+                    &reserve_candidates,
                     &fill_price,
                     order.side == Side::Buy,
                     &self.instrument.taker_fee_rate,
-                );
+                    &self.cfg.leverage,
+                    self.cfg.is_spot,
+                )?;
                 let available = self.cash.sub(&reserved).unwrap_or_else(|_| Fraction::zero());
                 let g6 = gate6_capital_guard(
                     &order.qty,
@@ -1018,6 +1030,31 @@ mod tests {
 
     fn f(s: &str) -> Fraction {
         F::from_decimal_str(s).unwrap()
+    }
+
+    fn add_intent(price: &str, qty: &str, side: Side) -> OrderIntent {
+        OrderIntent {
+            id: "reserve-test".into(),
+            side,
+            kind: OrderKind::Add,
+            price: Some(f(price)),
+            qty: f(qty),
+            decision_ts: 1,
+            role: "BASE".into(),
+            placement_ref_price: Some(f(price)),
+            quote_notional: None,
+        }
+    }
+
+    #[test]
+    fn closer_reservation_uses_future_orders_and_futures_margin() {
+        let buy_ladder = vec![add_intent("95", "1", Side::Buy), add_intent("85", "1", Side::Buy)];
+        let reserved = closer_pending_reserved(&buy_ladder, &f("90"), true, &f("0.01"), &f("5"), false).unwrap();
+        // Only the 95 order is closer: initial margin 95/5 + fee 0.95.
+        assert_eq!(reserved.to_string(), "399/20");
+
+        let spot_reserved = closer_pending_reserved(&buy_ladder[..1], &f("90"), true, &f("0.01"), &f("5"), true).unwrap();
+        assert_eq!(spot_reserved.to_string(), "1919/20");
     }
 
     fn inst() -> Instrument {

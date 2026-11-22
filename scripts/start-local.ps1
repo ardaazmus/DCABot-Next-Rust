@@ -14,17 +14,31 @@ $processFile = Join-Path $runtimeDirectory 'processes.json'
 # Sabit/bilinen dev anahtar dönemi kapandı. local-keys.env yalnız yerel
 # çalışma içindir; depoya girmez (gitignore: .local-runtime).
 $keysFile = Join-Path $runtimeDirectory 'local-keys.env'
+function New-LocalSecret([int]$ByteCount = 48) {
+    $bytes = New-Object byte[] $ByteCount
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    [Convert]::ToBase64String($bytes)
+}
+
 if (-not (Test-Path -LiteralPath $keysFile)) {
     New-Item -ItemType Directory -Force -Path $runtimeDirectory | Out-Null
     $api  = ('k-' + [System.Guid]::NewGuid().ToString('N') + [System.Guid]::NewGuid().ToString('N'))
     $vault = ('v-' + [System.Guid]::NewGuid().ToString('N') + [System.Guid]::NewGuid().ToString('N'))
+    $session = New-LocalSecret
     # BOM'suz yazim: PowerShell 5.1'in `Set-Content -Encoding UTF8`'i BOM ekler,
     # BOM ise ilk satirin regex eslesmesini bozar. Anahtarlar ASCII'dir.
     [System.IO.File]::WriteAllLines($keysFile, @(
         "DCA_API_KEY=$api",
-        "DCA_VAULT_KEY=$vault"
+        "DCA_VAULT_KEY=$vault",
+        "DCA_SESSION_SECRET=$session"
     ))
     Write-Output "Generated local auth keys: $keysFile"
+}
+$keyLines = [System.IO.File]::ReadAllLines($keysFile)
+if (-not ($keyLines | Where-Object { $_ -cmatch '^DCA_SESSION_SECRET=.{32,}$' })) {
+    $keyLines += "DCA_SESSION_SECRET=$(New-LocalSecret)"
+    [System.IO.File]::WriteAllLines($keysFile, $keyLines)
 }
 Get-Content -LiteralPath $keysFile | ForEach-Object {
     $line = $_.TrimStart([char]0xFEFF)
@@ -70,6 +84,11 @@ if (-not (Test-Path -LiteralPath $coreBinary)) {
 $env:DCA_DB_PATH = Join-Path $runtimeDirectory 'paper.sqlite3'
 $env:DCA_BYBIT_TESTNET = '1'
 $env:DCA_OKX_DEMO = '1'
+$env:DCA_BINANCE_TESTNET = '1'
+# Ignore any .env Binance endpoint overrides in local mode. The Binance spot
+# demo host used by older templates is not the signed Spot Testnet endpoint.
+$env:BINANCE_SPOT_BASE = 'https://testnet.binance.vision'
+$env:BINANCE_FUTURES_TESTNET_BASE = 'https://testnet.binancefuture.com'
 $env:RUST_LOG = 'info'
 $env:NODE_OPTIONS = '--max-old-space-size=1024'
 $env:RAYON_NUM_THREADS = '2'

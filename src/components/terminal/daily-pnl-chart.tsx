@@ -141,7 +141,7 @@ export function DailyPnlChart({ selectedDate, onSelectDate, className }: DailyPn
                       ? "text-cyan-400"
                       : "text-rose-400"
                 )}
-                title="Profit Factor: Brüt Kazanç / Brüt Kayıp"
+                title="Profit Factor: seçili dönemdeki net kârlı işlem toplamı / net zararlı işlem toplamı"
               >
                 {summary.profitFactor > 99 ? "∞" : summary.profitFactor.toFixed(2)}
               </span>

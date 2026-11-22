@@ -242,6 +242,33 @@ impl DcaEngine {
         }
     }
 
+    fn compute_sl(&self) -> Result<Option<Fraction>, String> {
+        let Some(raw_pct) = self.cfg.stop_loss_pct.as_deref().filter(|value| !value.trim().is_empty()) else {
+            return Ok(None);
+        };
+        let pct = Fraction::from_decimal_str(raw_pct).map_err(|e| e.to_string())?;
+        if !pct.is_positive() || (self.direction == Direction::Long && pct >= Fraction::one()) {
+            return Err("SL percent is outside the valid range".into());
+        }
+        let avg = self.mirror.avg_price.as_ref().ok_or("SL requires an open average price")?;
+        if !avg.is_positive() {
+            return Err("SL average price must be positive".into());
+        }
+        let factor = if self.direction == Direction::Long {
+            Fraction::one().sub(&pct).map_err(|e| e.to_string())?
+        } else {
+            Fraction::one().add(&pct).map_err(|e| e.to_string())?
+        };
+        let trigger = avg.mul(&factor).map_err(|e| e.to_string())?;
+        let aligned = if self.direction == Direction::Long {
+            dca_math::m02::tick_down(&trigger, &self.inst.tick_size)
+        } else {
+            dca_math::m02::tick_up(&trigger, &self.inst.tick_size)
+        }
+        .map_err(|e| e.to_string())?;
+        Ok(Some(aligned))
+    }
+
     /// Begin a new deal: market base order at next bar (instant) or trigger-based.
     pub fn try_open_deal(&mut self, ctx: &BarContext) -> Vec<Action> {
         let mut acts = Vec::new();
@@ -521,23 +548,9 @@ impl DcaEngine {
                 Ok(tp) => self.tp_price = tp,
                 Err(e) => acts.push(Action::Log { level: "ERROR", message: e }),
             }
-            if let Some(sl_pct) = &self.cfg.stop_loss_pct {
-                // Parse failure here is unreachable for deals opened after the
-                // try_open_deal gate below, but a zero/negative SL must never
-                // silently disable the stop — log loudly instead.
-                let sl = Fraction::from_decimal_str(sl_pct).unwrap_or_else(|_| Fraction::zero());
-                if !sl.is_zero() {
-                    let trig = if self.direction == Direction::Long {
-                        avg.mul(&Fraction::one().sub(&sl).unwrap_or_else(|_| Fraction::zero()))
-                    } else {
-                        avg.mul(&Fraction::one().add(&sl).unwrap_or_else(|_| Fraction::zero()))
-                    };
-                    self.sl_price = trig.ok().map(|x| if self.direction == Direction::Long {
-                        dca_math::m02::tick_down(&x, &self.inst.tick_size).unwrap_or_else(|_| x)
-                    } else {
-                        dca_math::m02::tick_up(&x, &self.inst.tick_size).unwrap_or_else(|_| x)
-                    });
-                }
+            match self.compute_sl() {
+                Ok(sl) => self.sl_price = sl,
+                Err(e) => acts.push(Action::Log { level: "ERROR", message: format!("SL calculation failed: {e}") }),
             }
         }
         acts
@@ -607,21 +620,7 @@ impl DcaEngine {
         }
         if let Some(sl) = stop_loss_pct {
             self.cfg.stop_loss_pct = sl.clone();
-            self.sl_price = None;
-            if let (Some(pct), Some(avg)) = (&sl, &self.mirror.avg_price) {
-                let p = Fraction::from_decimal_str(pct).map_err(|e| e.to_string())?;
-                let trig = if self.direction == Direction::Long {
-                    avg.mul(&Fraction::one().sub(&p).map_err(|e| e.to_string())?)
-                } else {
-                    avg.mul(&Fraction::one().add(&p).map_err(|e| e.to_string())?)
-                }
-                .map_err(|e| e.to_string())?;
-                self.sl_price = Some(if self.direction == Direction::Long {
-                    dca_math::m02::tick_down(&trig, &self.inst.tick_size).map_err(|e| e.to_string())?
-                } else {
-                    dca_math::m02::tick_up(&trig, &self.inst.tick_size).map_err(|e| e.to_string())?
-                });
-            }
+            self.sl_price = self.compute_sl()?;
         }
         if let Some(t) = trailing_enabled {
             self.cfg.trailing_enabled = t;
@@ -775,7 +774,13 @@ impl DcaEngine {
                 // reduce-only LIMIT olarak bekler; dolum gerçekçi modelden gelir
                 // (Maker, 1-tick penetrasyon + hacim payı). WAC değişince
                 // (safety dolumu → yeni TP/adet) iptal + yeniden yazılır.
-                if let Some(tp) = self.tp_price.clone() {
+                if self.cfg.trailing_enabled {
+                    // Trailing owns profit exits once enabled; a fixed resting
+                    // TP would close first and make the trailing state inert.
+                    if let Some(rt) = self.resting_tp.take() {
+                        acts.push(Action::CancelResting { id: rt.order_id });
+                    }
+                } else if let Some(tp) = self.tp_price.clone() {
                     if self.mirror.qty.is_zero() {
                         if let Some(rt) = self.resting_tp.take() {
                             acts.push(Action::CancelResting { id: rt.order_id });
@@ -941,11 +946,33 @@ impl DcaEngine {
                 acts.push(act);
                 self.next_level_to_place += 1;
             }
-            // TP recomputation after each fill (WAC changed)
+            // TP/SL recomputation after each fill (WAC changed). Replace the
+            // resting TP immediately so it cannot retain the old close qty.
             let q = self.mirror.qty.clone();
             if let Some(avg) = &self.mirror.avg_price {
-                if let Ok(tp) = self.compute_tp(&q, avg) {
-                    self.tp_price = tp;
+                match self.compute_tp(&q, avg) {
+                    Ok(tp) => self.tp_price = tp,
+                    Err(error) => acts.push(Action::Log { level: "ERROR", message: format!("TP recalculation after safety fill failed: {error}") }),
+                }
+                match self.compute_sl() {
+                    Ok(sl) => self.sl_price = sl,
+                    Err(error) => acts.push(Action::Log { level: "ERROR", message: format!("SL recalculation after safety fill failed: {error}") }),
+                }
+            }
+            if let Some(old) = self.resting_tp.take() {
+                acts.push(Action::CancelResting { id: old.order_id });
+            }
+            if !self.cfg.trailing_enabled && !q.is_zero() {
+                if let Some(tp) = self.tp_price.clone() {
+                    let id = order_id(&self.next_seq_id(), "TPL", 0);
+                    acts.push(Action::PlaceLimit {
+                        id: id.clone(),
+                        side: if self.direction == Direction::Long { dca_math::Side::Sell } else { dca_math::Side::Buy },
+                        price: tp.clone(),
+                        qty: q.clone(),
+                        role: "TP",
+                    });
+                    self.resting_tp = Some(RestingTp { order_id: id, price: tp, qty: q });
                 }
             }
         }
@@ -974,6 +1001,14 @@ impl DcaEngine {
                 .sub(&self.deal_fees)
                 .and_then(|x| x.sub(&self.funding_deal))
                 .unwrap_or_else(|_| realized.clone());
+            let exit_reason = match fill.role.as_str() {
+                "SL" => "SL",
+                "MANUAL" => "MANUAL",
+                "LIQ" => "LIQUIDATION",
+                "TP" if fill.order_id.contains("TRAIL") => "TRAIL",
+                "TP" => "TP",
+                _ => "CLOSE",
+            };
             if dca_math::Fraction::cmp(&net, &Fraction::zero()) == std::cmp::Ordering::Greater {
                 self.wins += 1;
             } else {
@@ -989,11 +1024,12 @@ impl DcaEngine {
             acts.push(Action::Log {
                 level: "INFO",
                 message: format!(
-                    "deal closed gross={} fees={} funding={} net={} wins={} losses={}",
+                    "deal closed gross={} fees={} funding={} net={} reason={} wins={} losses={}",
                     realized.to_half_even_display(8),
                     self.deal_fees.to_half_even_display(8),
                     self.funding_deal.to_half_even_display(8),
                     net.to_half_even_display(8),
+                    exit_reason,
                     self.wins,
                     self.losses
                 ),
@@ -1009,7 +1045,7 @@ impl DcaEngine {
                 funding: self.funding_deal.to_half_even_display(8),
                 net_pnl: net.to_half_even_display(8),
                 safety_triggered: self.filled_safety,
-                reason: "TP/SL/Manual".into(),
+                reason: exit_reason.into(),
             });
         }
         acts
@@ -1681,15 +1717,14 @@ mod m17_realized_ledger_tests {
         let _ = tpl;
 
         // Safety dolumu WAC'ı düşürür → TP değişir → CancelResting + yeni TPL.
-        e.on_fill(&fill("s1", "SAFETY", Side::Buy, OrderKind::Add, "95", "1", 1_002));
-        let acts = e.on_bar(&ctx(&bar(1_003, "96"), Fraction::from_decimal_str("96").unwrap()));
+        let acts = e.on_fill(&fill("s1", "SAFETY", Side::Buy, OrderKind::Add, "95", "1", 1_002));
         assert!(
             acts.iter().any(|a| matches!(a, Action::CancelResting { .. })),
-            "WAC değişince eski TPL iptal edilmeli"
+            "WAC değişince eski TPL aynı fill içinde iptal edilmeli"
         );
         assert!(
             acts.iter().any(|a| matches!(a, Action::PlaceLimit { role: "TP", .. })),
-            "yeni TPL yeniden yazılmalı"
+            "yeni miktarlı TPL aynı fill içinde yazılmalı"
         );
 
         // Yüksek TP'yi 1-tick aşıyor (Maker penetrasyon dolumu) → deal kapanır.
@@ -1710,6 +1745,46 @@ mod m17_realized_ledger_tests {
             "kapanışta artık TPL iptal niyeti yayılmalı"
         );
         assert_eq!(e.wins, 1, "net pozitif deal kazanç");
+    }
+
+    #[test]
+    fn safety_fill_recomputes_sl_and_replaces_tp_quantity_immediately() {
+        let mut cfg = BotConfig::default();
+        cfg.stop_loss_pct = Some("0.1".into());
+        let mut e = DcaEngine::new("sl-safety", cfg, Instrument::default()).unwrap();
+        let acts = e.on_bar(&ctx(&bar(1_000, "100"), Fraction::from_u64(100)));
+        let base_id = acts.iter().find_map(|a| match a {
+            Action::PlaceMarket { id, role: "BASE", .. } => Some(id.clone()),
+            _ => None,
+        }).unwrap();
+        e.on_fill(&fill(&base_id, "BASE", Side::Buy, OrderKind::Add, "100", "1", 1_000));
+        assert_eq!(e.sl_price.as_ref().unwrap().to_string(), "90");
+
+        e.on_bar(&ctx(&bar(1_001, "100"), Fraction::from_u64(100)));
+        let old_tp = e.resting_tp.as_ref().unwrap().order_id.clone();
+        assert_eq!(e.resting_tp.as_ref().unwrap().qty.to_string(), "1");
+
+        let acts = e.on_fill(&fill("safety-1", "SAFETY", Side::Buy, OrderKind::Add, "80", "1", 1_002));
+        assert_eq!(e.sl_price.as_ref().unwrap().to_string(), "81", "SL must follow the safety-adjusted WAC");
+        assert!(acts.iter().any(|a| matches!(a, Action::CancelResting { id } if id == &old_tp)));
+        assert!(acts.iter().any(|a| matches!(a, Action::PlaceLimit { role: "TP", qty, .. } if qty == &Fraction::from_u64(2))));
+        assert_eq!(e.resting_tp.as_ref().unwrap().qty, Fraction::from_u64(2));
+    }
+
+    #[test]
+    fn trailing_mode_does_not_place_a_fixed_tp_limit() {
+        let mut cfg = BotConfig::default();
+        cfg.trailing_enabled = true;
+        let mut e = DcaEngine::new("trail-no-fixed-tp", cfg, Instrument::default()).unwrap();
+        let acts = e.on_bar(&ctx(&bar(1_000, "100"), Fraction::from_u64(100)));
+        let base_id = acts.iter().find_map(|a| match a {
+            Action::PlaceMarket { id, role: "BASE", .. } => Some(id.clone()),
+            _ => None,
+        }).unwrap();
+        e.on_fill(&fill(&base_id, "BASE", Side::Buy, OrderKind::Add, "100", "1", 1_000));
+        let acts = e.on_bar(&ctx(&bar(1_001, "102"), Fraction::from_u64(102)));
+        assert!(!acts.iter().any(|a| matches!(a, Action::PlaceLimit { role: "TP", .. })));
+        assert!(e.resting_tp.is_none());
     }
 
     #[test]

@@ -20,6 +20,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, LazyLock};
 
 // ---------------- Sağlayıcı kataloğu (v3 AI_PROVIDERS ile aynı kimlikler) ---
@@ -37,7 +38,7 @@ pub const AI_PROVIDERS: &[AiProviderInfo] = &[
     AiProviderInfo { id: "builtin", label: "Yerleşik (paketlenmedi)", models: &["yok"], needs_key: false, default_base_url: None, note: "v3'teki Z.ai konteyner SDK'sı bu kurulumda yok — başka sağlayıcı seçin." },
     AiProviderInfo { id: "openai", label: "OpenAI", models: &["gpt-4o", "gpt-4o-mini"], needs_key: true, default_base_url: Some("https://api.openai.com/v1"), note: "api.openai.com — Bearer anahtar." },
     AiProviderInfo { id: "anthropic", label: "Anthropic", models: &["claude-3-5-sonnet-latest"], needs_key: true, default_base_url: None, note: "api.anthropic.com — x-api-key + anthropic-version başlığı." },
-    AiProviderInfo { id: "gemini", label: "Google Gemini", models: &["gemini-2.0-flash"], needs_key: true, default_base_url: None, note: "generativelanguage.googleapis.com — ?key= sorgusu." },
+    AiProviderInfo { id: "gemini", label: "Google Gemini", models: &["gemini-2.0-flash"], needs_key: true, default_base_url: None, note: "generativelanguage.googleapis.com — x-goog-api-key başlığı." },
     AiProviderInfo { id: "deepseek", label: "DeepSeek", models: &["deepseek-chat", "deepseek-reasoner"], needs_key: true, default_base_url: Some("https://api.deepseek.com"), note: "api.deepseek.com — OpenAI-uyumlu şema." },
     AiProviderInfo { id: "ollama", label: "Yerel Ollama", models: &["llama3.1", "qwen2.5"], needs_key: false, default_base_url: Some("http://localhost:11434"), note: "Yerel makine — /api/chat (stream kapalı)." },
 ];
@@ -306,55 +307,139 @@ pub fn validate_ai_base_url(url: &str, provider_id: &str) -> Result<String, Stri
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("geçersiz base_url: {e}"))?;
     let scheme = parsed.scheme();
     let host = parsed.host_str().ok_or_else(|| "URL ana makine içermiyor".to_string())?;
+    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("güvenlik kuralı: URL kimlik bilgisi, sorgu veya fragment içeremez".into());
+    }
 
     if provider_id == "ollama" {
-        if scheme != "http" && scheme != "https" {
-            return Err("Ollama yalnızca http veya https protokolü destekler".into());
+        if scheme != "http" {
+            return Err("Ollama yalnızca yerel HTTP bağlantısını destekler".into());
         }
-        let is_loopback = host == "localhost" || host == "127.0.0.1" || host == "::1";
+        if parsed.port_or_known_default() != Some(11434) {
+            return Err("Ollama güvenliği: yalnızca 11434 portuna izin verilir".into());
+        }
+        let ip_host = parse_ip_host(host);
+        let is_loopback = host.eq_ignore_ascii_case("localhost") || ip_host.is_some_and(|ip| ip.is_loopback());
         if !is_loopback {
             return Err("Ollama güvenliği: yalnızca yerel makine (localhost / 127.0.0.1) adreslerine izin verilir".into());
         }
-        return Ok(url.trim_end_matches('/').to_string());
+        return Ok(parsed.as_str().trim_end_matches('/').to_string());
     }
 
     if scheme != "https" {
         return Err("güvenlik kuralı: harici AI sağlayıcıları yalnızca HTTPS protokolü kullanmalıdır".into());
     }
+    if parsed.port_or_known_default() != Some(443) {
+        return Err("güvenlik kuralı: harici AI sağlayıcıları yalnızca 443 portunu kullanabilir".into());
+    }
 
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        let is_private_or_restricted = match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_broadcast()
-                    || v4.is_documentation()
-                    || v4.octets()[0] == 0
-                    || (v4.octets()[0] == 169 && v4.octets()[1] == 254)
-                    || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
-                    || (v4.octets()[0] == 198 && (v4.octets()[1] & 0xFE) == 18)
-            }
-            std::net::IpAddr::V6(v6) => {
-                v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00
-            }
-        };
-        if is_private_or_restricted {
+    if let Some(ip) = parse_ip_host(host) {
+        if !is_public_ip(ip) {
             return Err("güvenlik kuralı: dahili veya metadata IP adreslerine istek yapılamaz (SSRF koruması)".into());
         }
     }
 
-    if host == "localhost"
+    if host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost")
         || host.ends_with(".internal")
         || host.ends_with(".local")
         || host.ends_with(".lan")
+        || host.ends_with(".home")
         || host == "metadata.google.internal"
         || host == "instance-data"
     {
         return Err("güvenlik kuralı: dahili ana makine adlarına istek yapılamaz (SSRF koruması)".into());
     }
 
-    Ok(url.trim_end_matches('/').to_string())
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+
+fn parse_ip_host(host: &str) -> Option<IpAddr> {
+    host.strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse()
+        .ok()
+}
+
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_public_ipv4(v4),
+        IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            // IPv4-compatible and IPv4-mapped IPv6 can route to private IPv4.
+            if segments[..6].iter().all(|part| *part == 0) {
+                let octets = v6.octets();
+                let embedded = Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
+                return is_public_ipv4(embedded);
+            }
+            // Only globally allocated 2000::/3 addresses are accepted. The
+            // documentation and 6to4 ranges are denied even within that block.
+            (segments[0] & 0xe000) == 0x2000
+                && segments[0] != 0x2002
+                && segments[0] != 0x3fff
+                && !(segments[0] == 0x2001 && segments[1] < 0x0200)
+                && !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6.is_multicast()
+        }
+    }
+}
+
+fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    let in_cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64;
+    let in_benchmark = octets[0] == 198 && (octets[1] & 0xfe) == 18;
+    let in_special_192 = octets[0] == 192 && octets[1] == 0 && octets[2] == 0;
+    let in_reserved = octets[0] >= 240;
+    !(ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || octets[0] == 0
+        || in_cgnat
+        || in_benchmark
+        || in_special_192
+        || in_reserved)
+}
+
+async fn checked_ai_client(base_url: &str, provider_id: &str) -> Result<reqwest::Client, String> {
+    let normalized = validate_ai_base_url(base_url, provider_id)?;
+    let parsed = reqwest::Url::parse(&normalized).map_err(|_| "geçersiz AI sağlayıcı URL'si".to_string())?;
+    let host = parsed.host_str().ok_or_else(|| "AI sağlayıcı ana makinesi eksik".to_string())?;
+    let port = parsed.port_or_known_default().ok_or_else(|| "AI sağlayıcı portu eksik".to_string())?;
+    let literal_ip = parse_ip_host(host);
+    let addresses: Vec<SocketAddr> = if let Some(ip) = literal_ip {
+        vec![SocketAddr::new(ip, port)]
+    } else {
+        tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|_| "AI sağlayıcı ana makinesi çözümlenemedi".to_string())?
+            .collect()
+    };
+    if addresses.is_empty() {
+        return Err("AI sağlayıcı ana makinesi adres döndürmedi".into());
+    }
+    for address in &addresses {
+        let ip = address.ip();
+        let allowed = if provider_id == "ollama" { ip.is_loopback() } else { is_public_ip(ip) };
+        if !allowed {
+            return Err("AI sağlayıcı ana makinesi dahili veya özel IP'ye çözümlendi (SSRF koruması)".into());
+        }
+    }
+
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(35))
+        .user_agent("dcabot-ai/1.0 (+internal)")
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
+    if literal_ip.is_none() {
+        builder = builder.resolve_to_addrs(host, &addresses);
+    }
+    builder.build().map_err(|_| "güvenli AI HTTP istemcisi oluşturulamadı".into())
 }
 
 pub(crate) fn resolve_call(cfg: Option<&AiCallConfig>) -> Result<ResolvedCall, String> {
@@ -373,14 +458,14 @@ pub(crate) fn resolve_call(cfg: Option<&AiCallConfig>) -> Result<ResolvedCall, S
     Ok(ResolvedCall { provider, model, api_key, base_url })
 }
 
-pub(crate) async fn call_provider(app: &AppState, rc: &ResolvedCall, system: &str, user: &str, history: &[(String, String)]) -> Result<String, String> {
-    let client = &app.ai_http;
+pub(crate) async fn call_provider(_app: &AppState, rc: &ResolvedCall, system: &str, user: &str, history: &[(String, String)]) -> Result<String, String> {
     match rc.provider.id {
         "builtin" => Err("yerleşik sağlayıcı bu kurulumda paketlenmedi (v3 Z.ai konteyner SDK'sı yok) — OpenAI / DeepSeek / Anthropic / Gemini / Yerel Ollama seçin".into()),
         "openai" | "deepseek" => {
             if rc.api_key.trim().is_empty() {
                 return Err("API anahtarı girilmedi (yalnız bu istekte kullanılır, saklanmaz)".into());
             }
+            let client = checked_ai_client(&rc.base_url, rc.provider.id).await?;
             let mut msgs = vec![json!({"role": "system", "content": system})];
             for (r, c) in history {
                 msgs.push(json!({"role": r, "content": c}));
@@ -393,7 +478,7 @@ pub(crate) async fn call_provider(app: &AppState, rc: &ResolvedCall, system: &st
                 .json(&json!({"model": rc.model, "messages": msgs, "temperature": 0.2}))
                 .send()
                 .await
-                .map_err(|e| format!("sağlayıcı erişilemedi: {e}"))?;
+                .map_err(|e| format!("sağlayıcı erişilemedi: {}", e.without_url()))?;
             if !resp.status().is_success() {
                 return Err(format!("sağlayıcı HTTP {}", resp.status()));
             }
@@ -404,6 +489,7 @@ pub(crate) async fn call_provider(app: &AppState, rc: &ResolvedCall, system: &st
             if rc.api_key.trim().is_empty() {
                 return Err("API anahtarı girilmedi (yalnız bu istekte kullanılır, saklanmaz)".into());
             }
+            let client = checked_ai_client("https://api.anthropic.com", "anthropic").await?;
             let mut msgs = Vec::new();
             for (r, c) in history {
                 msgs.push(json!({"role": r, "content": c}));
@@ -417,7 +503,7 @@ pub(crate) async fn call_provider(app: &AppState, rc: &ResolvedCall, system: &st
                 .json(&json!({"model": rc.model, "max_tokens": 1024, "system": system, "messages": msgs}))
                 .send()
                 .await
-                .map_err(|e| format!("sağlayıcı erişilemedi: {e}"))?;
+                .map_err(|e| format!("sağlayıcı erişilemedi: {}", e.without_url()))?;
             if !resp.status().is_success() {
                 return Err(format!("sağlayıcı HTTP {}", resp.status()));
             }
@@ -433,6 +519,7 @@ pub(crate) async fn call_provider(app: &AppState, rc: &ResolvedCall, system: &st
             if rc.api_key.trim().is_empty() {
                 return Err("API anahtarı girilmedi (yalnız bu istekte kullanılır, saklanmaz)".into());
             }
+            let client = checked_ai_client("https://generativelanguage.googleapis.com", "gemini").await?;
             let mut contents = Vec::new();
             for (r, c) in history {
                 let role = if r == "assistant" { "model" } else { "user" };
@@ -440,17 +527,17 @@ pub(crate) async fn call_provider(app: &AppState, rc: &ResolvedCall, system: &st
             }
             contents.push(json!({"role": "user", "parts": [{"text": user}]}));
             let url = format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-                urlenc(&rc.model),
-                urlenc(rc.api_key.trim())
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+                urlenc(&rc.model)
             );
             let resp = client
                 .post(url)
                 .header("Content-Type", "application/json")
+                .header("x-goog-api-key", rc.api_key.trim())
                 .json(&json!({"systemInstruction": {"parts": [{"text": system}]}, "contents": contents, "generationConfig": {"temperature": 0.2}}))
                 .send()
                 .await
-                .map_err(|e| format!("sağlayıcı erişilemedi: {e}"))?;
+                .map_err(|e| format!("sağlayıcı erişilemedi: {}", e.without_url()))?;
             if !resp.status().is_success() {
                 return Err(format!("sağlayıcı HTTP {}", resp.status()));
             }
@@ -464,6 +551,7 @@ pub(crate) async fn call_provider(app: &AppState, rc: &ResolvedCall, system: &st
         }
         "ollama" => {
             let base = if rc.base_url.is_empty() { "http://localhost:11434".to_string() } else { rc.base_url.clone() };
+            let client = checked_ai_client(&base, "ollama").await?;
             let mut msgs = vec![json!({"role": "system", "content": system})];
             for (r, c) in history {
                 msgs.push(json!({"role": r, "content": c}));
@@ -475,7 +563,7 @@ pub(crate) async fn call_provider(app: &AppState, rc: &ResolvedCall, system: &st
                 .json(&json!({"model": rc.model, "stream": false, "messages": msgs}))
                 .send()
                 .await
-                .map_err(|e| format!("Ollama erişilemedi ({base}): {e}"))?;
+                .map_err(|e| format!("Ollama erişilemedi: {}", e.without_url()))?;
             if !resp.status().is_success() {
                 return Err(format!("Ollama HTTP {}", resp.status()));
             }

@@ -64,19 +64,19 @@ fn parse_closed_deal_message(
         if let Some((k, v)) = token.split_once('=') {
             match k {
                 "net" => {
-                    if let Ok(val) = v.parse::<f64>() {
+                    if let Some(val) = v.parse::<f64>().ok().filter(|val| val.is_finite()) {
                         net = val;
                         has_net = true;
                     }
                 }
                 "gross" => {
-                    if let Ok(val) = v.parse::<f64>() {
+                    if let Some(val) = v.parse::<f64>().ok().filter(|val| val.is_finite()) {
                         gross = val;
                         has_gross = true;
                     }
                 }
                 "net_gross" => {
-                    if let Ok(val) = v.parse::<f64>() {
+                    if let Some(val) = v.parse::<f64>().ok().filter(|val| val.is_finite()) {
                         net = val;
                         gross = val;
                         has_net = true;
@@ -84,12 +84,12 @@ fn parse_closed_deal_message(
                     }
                 }
                 "fees" => {
-                    if let Ok(val) = v.parse::<f64>() {
+                    if let Some(val) = v.parse::<f64>().ok().filter(|val| val.is_finite()) {
                         fees = val;
                     }
                 }
                 "funding" => {
-                    if let Ok(val) = v.parse::<f64>() {
+                    if let Some(val) = v.parse::<f64>().ok().filter(|val| val.is_finite()) {
                         funding = val;
                     }
                 }
@@ -125,14 +125,13 @@ fn parse_closed_deal_message(
     let date = dt.format("%Y-%m-%d").to_string();
     let time = dt.format("%H:%M:%S").to_string();
 
-    let result = if net >= 0.0 { "WIN".to_string() } else { "LOSS".to_string() };
-    let reason = if net >= 0.0 {
-        "TP".to_string()
-    } else if msg.contains("force-closed") || msg.contains("LIQUIDATION") {
-        "LIQUIDATION".to_string()
-    } else {
-        "SL".to_string()
-    };
+    let result = if net > 0.0 { "WIN".to_string() } else { "LOSS".to_string() };
+    let reason = msg
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix("reason="))
+        .filter(|reason| matches!(*reason, "TP" | "SL" | "LIQUIDATION" | "MANUAL" | "TRAIL" | "CLOSE"))
+        .unwrap_or("CLOSE")
+        .to_string();
 
     ClosedDeal {
         id: format!("deal-{id}"),
@@ -211,12 +210,12 @@ pub fn fetch_all_closed_deals(conn: &rusqlite::Connection) -> Result<Vec<ClosedD
             for row in rows.flatten() {
                 let (id, bot_id, gross_str, fees_str, funding_str, ts) = row;
                 // Avoid duplicates if ts matches an existing deal
-                if deals.iter().any(|d| d.bot_id == bot_id && (d.closed_ts - ts).abs() < 1000) {
+                if deals.iter().any(|d| d.bot_id == bot_id && d.closed_ts.abs_diff(ts) < 1000) {
                     continue;
                 }
-                let gross = gross_str.parse::<f64>().unwrap_or(0.0);
-                let fees = fees_str.parse::<f64>().unwrap_or(0.0);
-                let funding = funding_str.parse::<f64>().unwrap_or(0.0);
+                let gross = gross_str.parse::<f64>().ok().filter(|v| v.is_finite()).unwrap_or(0.0);
+                let fees = fees_str.parse::<f64>().ok().filter(|v| v.is_finite()).unwrap_or(0.0);
+                let funding = funding_str.parse::<f64>().ok().filter(|v| v.is_finite()).unwrap_or(0.0);
                 let net = gross - fees - funding;
                 let meta = bot_map.get(&bot_id);
                 let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ts)
@@ -235,10 +234,10 @@ pub fn fetch_all_closed_deals(conn: &rusqlite::Connection) -> Result<Vec<ClosedD
                     fees,
                     funding,
                     net_pnl: net,
-                    wins: if net >= 0.0 { 1 } else { 0 },
-                    losses: if net < 0.0 { 1 } else { 0 },
-                    result: if net >= 0.0 { "WIN".to_string() } else { "LOSS".to_string() },
-                    reason: if net >= 0.0 { "TP".to_string() } else { "SL".to_string() },
+                    wins: if net > 0.0 { 1 } else { 0 },
+                    losses: if net <= 0.0 { 1 } else { 0 },
+                    result: if net > 0.0 { "WIN".to_string() } else { "LOSS".to_string() },
+                    reason: "CLOSE".to_string(),
                 });
             }
         }
@@ -247,6 +246,37 @@ pub fn fetch_all_closed_deals(conn: &rusqlite::Connection) -> Result<Vec<ClosedD
     // Sort by closed_ts descending
     deals.sort_by(|a, b| b.closed_ts.cmp(&a.closed_ts));
     Ok(deals)
+}
+
+/// Profit factor over individual trade net results: positive net sum divided
+/// by the absolute negative net sum (fees and funding are already included).
+fn profit_factor_from_net_values(values: impl IntoIterator<Item = f64>) -> f64 {
+    let mut positive_net = 0.0f64;
+    let mut negative_net = 0.0f64;
+    for value in values.into_iter().filter(|value| value.is_finite()) {
+        if value > 0.0 {
+            positive_net = (positive_net + value).min(f64::MAX);
+        } else if value < 0.0 {
+            negative_net = (negative_net + value.abs()).min(f64::MAX);
+        }
+    }
+    if negative_net > 0.0 {
+        let ratio = positive_net / negative_net;
+        if !ratio.is_finite() || ratio > 99.99 {
+            99.99
+        } else {
+            (ratio * 100.0).round() / 100.0
+        }
+    } else if positive_net > 0.0 {
+        99.99
+    } else {
+        0.0
+    }
+}
+
+fn deal_cutoff_ts(days: Option<i64>, now: i64) -> Option<i64> {
+    let days = days?.clamp(1, 3_650);
+    Some(now.saturating_sub(days.saturating_mul(86_400_000)))
 }
 
 /// GET /api/deals
@@ -282,7 +312,7 @@ pub async fn list_deals(
         .unwrap_or(200)
         .min(1000);
 
-    let cutoff_ts = days.map(|d| now_ms() - d * 86_400_000);
+    let cutoff_ts = deal_cutoff_ts(days, now_ms());
 
     let filtered: Vec<ClosedDeal> = all_deals
         .into_iter()
@@ -326,20 +356,16 @@ pub async fn list_deals(
     let mut total_funding = 0.0f64;
     let mut wins = 0usize;
     let mut losses = 0usize;
-    let mut wins_net_sum = 0.0f64;
-    let mut losses_net_sum = 0.0f64;
 
     for d in &filtered {
         total_net_pnl += d.net_pnl;
         total_gross_pnl += d.gross_pnl;
         total_fees += d.fees;
         total_funding += d.funding;
-        if d.net_pnl >= 0.0 {
+        if d.net_pnl > 0.0 {
             wins += 1;
-            wins_net_sum += d.net_pnl;
         } else {
             losses += 1;
-            losses_net_sum += d.net_pnl.abs();
         }
     }
 
@@ -349,13 +375,7 @@ pub async fn list_deals(
         0.0
     };
 
-    let profit_factor = if losses_net_sum > 0.0001 {
-        (wins_net_sum / losses_net_sum * 100.0).round() / 100.0
-    } else if wins_net_sum > 0.0 {
-        99.99
-    } else {
-        0.0
-    };
+    let profit_factor = profit_factor_from_net_values(filtered.iter().map(|d| d.net_pnl));
 
     let avg_deal_profit = if total > 0 {
         ((total_net_pnl / total as f64) * 100.0).round() / 100.0
@@ -454,7 +474,7 @@ pub async fn daily_pnl(
 
     // Group by calendar day string "YYYY-MM-DD"
     let mut day_map: HashMap<String, Vec<&ClosedDeal>> = HashMap::new();
-    for d in in_range_deals {
+    for &d in &in_range_deals {
         day_map.entry(d.date.clone()).or_default().push(d);
     }
 
@@ -493,7 +513,7 @@ pub async fn daily_pnl(
                 gross_sum += d.gross_pnl;
                 fees_sum += d.fees;
                 funding_sum += d.funding;
-                if d.net_pnl >= 0.0 {
+                if d.net_pnl > 0.0 {
                     wins += 1;
                 } else {
                     losses += 1;
@@ -558,22 +578,7 @@ pub async fn daily_pnl(
         .min_by(|a, b| a.net_pnl.partial_cmp(&b.net_pnl).unwrap_or(std::cmp::Ordering::Equal))
         .map(|b| json!({"date": b.date, "netPnl": b.net_pnl, "count": b.count}));
 
-    let mut wins_net_sum = 0.0f64;
-    let mut losses_net_sum = 0.0f64;
-    for b in &bars {
-        if b.net_pnl >= 0.0 {
-            wins_net_sum += b.net_pnl;
-        } else {
-            losses_net_sum += b.net_pnl.abs();
-        }
-    }
-    let profit_factor = if losses_net_sum > 0.0001 {
-        (wins_net_sum / losses_net_sum * 100.0).round() / 100.0
-    } else if wins_net_sum > 0.0 {
-        99.99
-    } else {
-        0.0
-    };
+    let profit_factor = profit_factor_from_net_values(in_range_deals.iter().map(|d| d.net_pnl));
 
     Ok(Json(json!({
         "days": bars,
@@ -588,4 +593,76 @@ pub async fn daily_pnl(
             "profitFactor": profit_factor
         }
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closed_deal_without_reason_is_not_mislabeled_as_take_profit() {
+        let deal = parse_closed_deal_message(
+            1,
+            "bot-1",
+            "deal closed gross=1 fees=0 funding=0 net=0.9 wins=1 losses=0",
+            1_700_000_000_000,
+            &HashMap::new(),
+        );
+        assert_eq!(deal.reason, "CLOSE");
+    }
+
+    #[test]
+    fn closed_deal_keeps_an_explicit_exit_reason() {
+        let deal = parse_closed_deal_message(
+            2,
+            "bot-1",
+            "deal closed gross=-1 fees=0 funding=0 net=-1 reason=TRAIL wins=0 losses=1",
+            1_700_000_000_000,
+            &HashMap::new(),
+        );
+        assert_eq!(deal.reason, "TRAIL");
+    }
+
+    #[test]
+    fn break_even_deal_is_not_counted_as_a_win() {
+        let deal = parse_closed_deal_message(
+            4,
+            "bot-1",
+            "deal closed gross=0 fees=0 funding=0 net=0 wins=0 losses=1 reason=MANUAL",
+            1_700_000_000_000,
+            &HashMap::new(),
+        );
+        assert_eq!(deal.result, "LOSS");
+    }
+
+    #[test]
+    fn malformed_nonfinite_pnl_is_ignored() {
+        let deal = parse_closed_deal_message(
+            3,
+            "bot-1",
+            "deal closed gross=1 fees=0 funding=0 net=NaN wins=0 losses=1",
+            1_700_000_000_000,
+            &HashMap::new(),
+        );
+        assert!(deal.net_pnl.is_finite());
+        assert_eq!(deal.net_pnl, 1.0);
+    }
+
+    #[test]
+    fn profit_factor_uses_each_trade_net_result_not_daily_net_totals() {
+        let factor = profit_factor_from_net_values([10.0, -9.0, -5.0]);
+        assert_eq!(factor, 0.71);
+    }
+
+    #[test]
+    fn profit_factor_caps_unrepresentable_extreme_ratios_for_json() {
+        assert_eq!(profit_factor_from_net_values([f64::MAX, -f64::MIN_POSITIVE]), 99.99);
+    }
+
+    #[test]
+    fn deal_date_filter_saturates_untrusted_day_counts() {
+        assert_eq!(deal_cutoff_ts(Some(i64::MAX), 1_800_000_000_000), Some(1_484_640_000_000));
+        assert_eq!(deal_cutoff_ts(Some(i64::MIN), 1_800_000_000_000), Some(1_799_913_600_000));
+        assert_eq!(deal_cutoff_ts(None, 1_800_000_000_000), None);
+    }
 }

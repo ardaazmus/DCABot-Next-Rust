@@ -19,6 +19,46 @@ use std::sync::atomic::{AtomicI64, Ordering};
 pub const MAINNET: &str = "https://api.bybit.com";
 pub const TESTNET: &str = "https://api-testnet.bybit.com";
 
+fn parse_key_permissions(v: &Value) -> Result<KeyPermissions, String> {
+    let read_only = match v.get("readOnly").and_then(|x| x.as_i64()) {
+        Some(0) => false,
+        Some(1) => true,
+        _ => return Err("bybit query-api: readOnly field missing or malformed".into()),
+    };
+    let required_permissions = |name: &str| -> Result<Vec<String>, String> {
+        let values = v
+            .pointer(&format!("/permissions/{name}"))
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| format!("bybit query-api: permissions.{name} missing or malformed"))?;
+        values
+            .iter()
+            .map(|value| value.as_str().map(str::to_string).ok_or_else(|| format!("bybit query-api: permissions.{name} contains a non-string value")))
+            .collect()
+    };
+    let wallet_perms = required_permissions("Wallet")?;
+    let spot_perms = required_permissions("Spot")?;
+    let contract_perms = required_permissions("ContractTrade")?;
+    let wallet_movement = wallet_perms.iter().any(|permission| {
+        matches!(permission.as_str(), "Withdraw" | "AccountTransfer" | "SubMemberTransfer" | "SubMemberTransferList")
+    });
+    let spot = spot_perms.iter().any(|permission| permission == "SpotTrade");
+    let contract = contract_perms.iter().any(|permission| permission == "Order")
+        && contract_perms.iter().any(|permission| permission == "Position");
+    let ips = v
+        .get("ips")
+        .and_then(|x| x.as_array())
+        .map(|values| values.iter().filter_map(|item| item.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    Ok(KeyPermissions {
+        read_only,
+        can_withdraw: wallet_movement,
+        spot_trade: spot,
+        contract_trade: contract,
+        ips,
+        note: format!("wallet_movement_permission={wallet_movement}, spot={spot}, contract={contract}"),
+    })
+}
+
 pub struct BybitAdapter {
     pub base_url: String,
     pub recv_window: String,
@@ -28,36 +68,27 @@ pub struct BybitAdapter {
 
 impl BybitAdapter {
     pub fn new(testnet: bool) -> Self {
-        let base_url = if let Ok(u) = std::env::var("BYBIT_BASE_URL").or_else(|_| std::env::var("DCA_BYBIT_BASE_URL")) {
+        let raw_base_url = if let Ok(u) = std::env::var("BYBIT_BASE_URL").or_else(|_| std::env::var("DCA_BYBIT_BASE_URL")) {
             u
         } else if testnet || std::env::var("DCA_BYBIT_TESTNET").as_deref() == Ok("1") {
             TESTNET.into()
         } else {
-            // Faz 0.5 (B-6): MAINNET fail-closed kapısı — DCA_ALLOW_MAINNET=1 olmadan
-            // gerçek emir hattına bağlanmak yapısal olarak engellenir (test ortamları hariç).
-            // Faz 26 (CI düzeltmesi): cfg!(test) OR exe-path — Linux CI güvencesi.
-            // Faz 26 (CI final): kapının amacı RELEASE üretimi korumak —
-            // debug ikililer (cargo test, yerel dev) yalnız simülasyona gider.
-            // cfg!(test) yalnız kendi crate'i kapsar; dca_server bin testleri
-            // dca_exchange'i cfg(test) OLMADAN derler. Linux'ta yeni cargo test
-            // ikililerini deps/ dışına koyar → exe heuristiği de yetmez.
-            // Robust: cfg!(test) || cfg!(debug_assertions) || exe-path.
-            let is_test_runner = cfg!(test)
-                || cfg!(debug_assertions)
-                || std::env::current_exe()
-                    .map(|p| p.to_string_lossy().contains("deps"))
-                    .unwrap_or(false);
-            if !is_test_runner && std::env::var("DCA_ALLOW_MAINNET").as_deref() != Ok("1") {
-                panic!("CRITICAL SAFETY VIOLATION: Attempted Bybit MAINNET connection without DCA_ALLOW_MAINNET=1! Set DCA_BYBIT_TESTNET=1 for paper/testnet or explicitly set DCA_ALLOW_MAINNET=1.");
-            }
             MAINNET.into()
         };
+        let base_url = super::guarded_venue_base_url(
+            &raw_base_url,
+            "Bybit",
+            &["api.bybit.com", "api-testnet.bybit.com", "api-demo.bybit.com"],
+            &["api.bybit.com"],
+            false,
+        );
         let recv_window = std::env::var("BYBIT_RECV_WINDOW").unwrap_or_else(|_| "5000".into());
         Self {
             base_url,
             recv_window,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("reqwest client"),
             time_offset_ms: AtomicI64::new(0),
@@ -554,32 +585,7 @@ impl VenueAdapter for BybitAdapter {
     /// GET /v5/user/query-api (live-verified; the old query-api-key path is 404).
     async fn key_permissions(&self, creds: &VenueCreds) -> Result<KeyPermissions, String> {
         let v = self.private_get(&creds.key, &creds.secret, "/v5/user/query-api", "").await?;
-        let read_only = v.get("readOnly").and_then(|x| x.as_i64()).unwrap_or(1) == 1;
-        // permissions.Wallet: array containing "Withdraw" => withdrawal enabled (MASTER keys)
-        let wallet_perms: Vec<String> = v
-            .pointer("/permissions/Wallet")
-            .and_then(|x| x.as_array())
-            .map(|a| a.iter().filter_map(|i| i.as_str().map(String::from)).collect())
-            .unwrap_or_default();
-        let spot = v.pointer("/permissions/Spot").and_then(|x| x.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
-        let contract = v
-            .pointer("/permissions/ContractTrade")
-            .and_then(|x| x.as_array())
-            .map(|a| a.iter().any(|i| i.as_str() == Some("Order")) && a.iter().any(|i| i.as_str() == Some("Position")))
-            .unwrap_or(false);
-        let ips: Vec<String> = v
-            .get("ips")
-            .and_then(|x| x.as_array())
-            .map(|a| a.iter().filter_map(|i| i.as_str().map(String::from)).collect())
-            .unwrap_or_default();
-        Ok(KeyPermissions {
-            read_only,
-            can_withdraw: wallet_perms.iter().any(|p| p == "Withdraw"),
-            spot_trade: spot,
-            contract_trade: contract,
-            ips,
-            note: format!("wallet_perms={wallet_perms:?}"),
-        })
+        parse_key_permissions(&v)
     }
 
     async fn wallet(&self, creds: &VenueCreds, coin: &str) -> Result<WalletSnapshot, String> {
@@ -712,6 +718,10 @@ impl VenueAdapter for BybitAdapter {
                 if exec_id.is_empty() {
                     continue;
                 }
+                let returned_link_id = item.get("orderLinkId").and_then(|x| x.as_str()).unwrap_or("");
+                if returned_link_id.is_empty() || returned_link_id != order_link_id {
+                    continue;
+                }
                 let exec_qty = Fraction::from_any_str(item.get("execQty").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero());
                 let exec_price = Fraction::from_any_str(item.get("execPrice").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_else(|_| Fraction::zero());
                 // H-4 (fee-coin): Bybit spot alışında ücret BASE cinsinden kesilir
@@ -725,7 +735,7 @@ impl VenueAdapter for BybitAdapter {
                     (f, _) => f,
                 };
                 out.push(ExecutionRecord {
-                    order_link_id: order_link_id.to_string(),
+                    order_link_id: returned_link_id.to_string(),
                     exec_id,
                     exec_qty,
                     exec_price,
@@ -998,5 +1008,42 @@ mod tests {
         adapter.time_offset_ms.store(5000, Ordering::Relaxed);
         let t2 = adapter.now_ms();
         assert!(t2 >= t1 + 4900, "now_ms with 5000ms offset should reflect clock adjustment");
+    }
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    fn permission_payload(wallet: Value) -> Value {
+        serde_json::json!({
+            "readOnly": 0,
+            "permissions": {
+                "Wallet": wallet,
+                "Spot": ["SpotTrade"],
+                "ContractTrade": ["Order", "Position"]
+            },
+            "ips": []
+        })
+    }
+
+    #[test]
+    fn missing_permission_schema_fails_closed() {
+        assert!(parse_key_permissions(&serde_json::json!({ "readOnly": 0 })).is_err());
+        assert!(parse_key_permissions(&serde_json::json!({
+            "permissions": {"Wallet": [], "Spot": [], "ContractTrade": []}
+        })).is_err());
+        assert!(parse_key_permissions(&permission_payload(serde_json::json!("Withdraw"))).is_err());
+    }
+
+    #[test]
+    fn wallet_withdrawal_and_internal_transfer_permissions_are_rejected() {
+        for permission in ["Withdraw", "AccountTransfer", "SubMemberTransfer", "SubMemberTransferList"] {
+            let parsed = parse_key_permissions(&permission_payload(serde_json::json!([permission]))).unwrap();
+            assert!(parsed.can_withdraw, "wallet permission {permission} must trip the hard gate");
+        }
+        let parsed = parse_key_permissions(&permission_payload(serde_json::json!([]))).unwrap();
+        assert!(!parsed.can_withdraw);
+        assert!(parsed.spot_trade && parsed.contract_trade);
     }
 }
