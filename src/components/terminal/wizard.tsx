@@ -117,16 +117,17 @@ import type {
 
 interface WizardProps {
   onCreated: (id: string) => void;
+  initialMode?: Mode;
 }
 
-export function Wizard({ onCreated }: WizardProps) {
+export function Wizard({ onCreated, initialMode = "PAPER" }: WizardProps) {
 
   /* step 1 */
   const [kind, setKind] = useState<BotKind | null>(null);
   const [cardKey, setCardKey] = useState<string | null>(null);
   /* step 2 */
   const [venue, setVenue] = useState<Venue>("BYBIT");
-  const [mode, setMode] = useState<Mode>("PAPER");
+  const [mode, setMode] = useState<Mode>(initialMode);
   const [symbolQuery, setSymbolQuery] = useState("");
   const [listOpen, setListOpen] = useState(false);
   const [symbol, setSymbol] = useState<string | null>(null);
@@ -1151,6 +1152,29 @@ export function Wizard({ onCreated }: WizardProps) {
     <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_400px] xl:grid-cols-[minmax(0,1fr)_440px]">
       {/* ============ LEFT: 3Commas-style single-column sections ============ */}
       <div className="min-w-0 space-y-4">
+        <div
+          role="status"
+          aria-live="polite"
+          className={cn(
+            "rounded-xl border px-3 py-2.5",
+            mode === "PAPER" ? "border-emerald-500/30 bg-emerald-500/5" : "border-amber-500/40 bg-amber-500/10",
+          )}
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Bot çalışma modu</span>
+            <span className={cn(
+              "rounded border px-2 py-0.5 text-[10px] font-extrabold tracking-wider",
+              mode === "PAPER" ? "border-emerald-500/40 text-emerald-300" : "border-amber-500/50 text-amber-300",
+            )}>
+              {mode === "PAPER" ? "PAPER · SİMÜLASYON" : "GERÇEK · LIVE"}
+            </span>
+          </div>
+          <p className={cn("mt-1 text-[11px]", mode === "PAPER" ? "text-emerald-200/80" : "text-amber-200/90")}>
+            {mode === "PAPER"
+              ? "Bu bot simülasyon emirleri kullanır; gerçek borsa emri göndermez."
+              : "Bot başlatıldığında gerçek borsa emirleri gönderebilir. Seçilen venue için kasa anahtarı ve risk kontrolleri gerekir."}
+          </p>
+        </div>
         <nav className="flex flex-wrap items-center gap-1.5" aria-label="Bölüm gezinmesi">
           {STEPS.map((label, i) => {
             const n = i + 1;
@@ -1274,17 +1298,33 @@ export function Wizard({ onCreated }: WizardProps) {
                     </button>
                   ))}
                 </div>
-                <div className="mt-4 flex items-center gap-2">
+                <div className="mt-4 border-t border-border pt-3">
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div>
+                      <div className="text-[11px] font-bold uppercase tracking-wider text-slate-200">Çalışma modu</div>
+                      <p className="mt-0.5 text-[10px] text-slate-500">Borsa seçimi venue&apos;yi, mod ise emirlerin simüle mi gerçek mi yürütüleceğini belirler.</p>
+                    </div>
+                    <span className={cn(
+                      "rounded border px-1.5 py-0.5 text-[9px] font-bold tracking-wider",
+                      mode === "PAPER" ? "border-emerald-500/30 bg-emerald-500/5 text-emerald-300" : "border-amber-500/40 bg-amber-500/10 text-amber-300",
+                    )}>
+                      {mode === "PAPER" ? "SİMÜLASYON" : "GERÇEK EMİR"}
+                    </span>
+                  </div>
+                  <div role="group" aria-label="Bot çalışma modu" className="mt-2 flex items-center gap-2">
                   <button
+                    type="button"
                     onClick={() => setMode("PAPER")}
+                    aria-pressed={mode === "PAPER"}
                     className={cn(
-                      "flex-1 rounded-lg border px-3 py-2.5 text-xs font-bold transition-colors",
+                      "min-h-11 flex-1 rounded-lg border px-3 py-2.5 text-xs font-bold transition-colors",
                       mode === "PAPER" ? "border-emerald-500/60 bg-emerald-500/10 text-emerald-300" : "border-border text-slate-500",
                     )}
                   >
-                    PAPER ✓
+                    PAPER · SİMÜLASYON
                   </button>
                   <button
+                    type="button"
                     onClick={() => {
                       if (venue === "PAPER") {
                         toast({
@@ -1298,17 +1338,19 @@ export function Wizard({ onCreated }: WizardProps) {
                     }}
                     disabled={venue === "PAPER"}
                     aria-disabled={venue === "PAPER"}
+                    aria-pressed={mode === "LIVE"}
                     className={cn(
-                      "flex-1 rounded-lg border px-3 py-2.5 text-xs font-bold transition-colors",
+                      "min-h-11 flex-1 rounded-lg border px-3 py-2.5 text-xs font-bold transition-colors",
                       mode === "LIVE"
                         ? "border-amber-500/60 bg-amber-500/10 text-amber-300"
                         : "border-border text-slate-500",
                       venue === "PAPER" && "cursor-not-allowed opacity-40",
                     )}
-                    title="LIVE — gercek borsa emri (3Commas: Real)"
+                    title="Gerçek LIVE modu — borsaya gerçek emir gönderir"
                   >
-                    REAL ⚠
+                    GERÇEK · LIVE ⚠
                   </button>
+                  </div>
                 </div>
                 {venue === "PAPER" && (
                   <p className="mt-1.5 text-[11px] text-amber-400">PAPER venue ile LIVE mod kullanılamaz — simülasyon hesabı gerçek emir göndermez.</p>

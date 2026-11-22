@@ -52,7 +52,7 @@ import { fmtFrac, fmtTimeShort, fmtTs, fmtUsd, fmtUsdSigned, fracToNum, kindLabe
 import { toast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
 import { CRITICAL_LIQUIDATION_DISTANCE_PCT, DealProgressBar } from "@/components/terminal/deal-progress-bar";
-import type { Bot as BotRow } from "@/lib/engine-types";
+import type { Bot as BotRow, Mode } from "@/lib/engine-types";
 
 /* Task 16 — compact risk-policy chips for fleet cards/table (max 2). */
 const GUARD_KEYS = [
@@ -305,7 +305,7 @@ export function FleetTape() {
   );
 }
 
-export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void; onNewBot: () => void }) {
+export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void; onNewBot: (mode?: Mode) => void }) {
   const { bots, loading, refetch } = useBots();
   const [view, setView] = useState<"cards" | "table">("cards");
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -326,9 +326,22 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
      sektör standardı (Bitsgap/3Commas) ve en büyük kayıp listede gömülü kalmasın. */
   const [query, setQuery] = useState("");
   const [statusF, setStatusF] = useState<"ALL" | "RUNNING" | "PAUSED" | "FROZEN" | "STOPPED">("ALL");
+  const [modeF, setModeF] = useState<Mode | "ALL">("ALL");
   type SmartFilter = "ALL" | "OPEN_DEAL" | "BAG_HOLDING" | "RISK_MARGIN" | "HALT_WARN" | "STOPPED";
   const [smartF, setSmartF] = useState<SmartFilter>("ALL");
   const [cardSort, setCardSort] = useState<"impact" | "pnl-asc" | "pnl-desc" | "name" | "symbol">("impact");
+  const modeCounts = useMemo(
+    () => ({
+      ALL: bots.length,
+      PAPER: bots.filter((b) => b.mode === "PAPER").length,
+      LIVE: bots.filter((b) => b.mode === "LIVE").length,
+    }),
+    [bots],
+  );
+  const changeModeFilter = (nextMode: Mode | "ALL") => {
+    if (nextMode !== modeF) setSelected(new Set());
+    setModeF(nextMode);
+  };
   const hedgeCount = bots.filter((b) => HEDGE_KINDS.has(b.kind)).length;
   const openDealsCount = useMemo(() => bots.filter((b) => b.stats.phase === "Open").length, [bots]);
   const bagHoldingCount = useMemo(() => {
@@ -350,6 +363,7 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
   const shown = useMemo(() => {
     const q = query.trim().toLocaleLowerCase("tr");
     let list = bots;
+    if (modeF !== "ALL") list = list.filter((b) => b.mode === modeF);
     if (hedgeOnly) list = list.filter((b) => HEDGE_KINDS.has(b.kind));
     if (smartF === "OPEN_DEAL") list = list.filter((b) => b.stats.phase === "Open");
     else if (smartF === "BAG_HOLDING") {
@@ -387,7 +401,7 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
       });
     }
     return list;
-  }, [bots, hedgeOnly, smartF, statusF, query, view, cardSort]);
+  }, [bots, modeF, hedgeOnly, smartF, statusF, query, view, cardSort]);
   /* P7 — tablo sıralaması (aria-sort). Kart görünümü etkilenmez. */
   const [sortKey, setSortKey] = useState<"name" | "status" | "pnl" | null>(null);
   const [sortDir, setSortDir] = useState<1 | -1>(1);
@@ -683,6 +697,43 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
             </div>
           </div>
         )}
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-surface/60 px-3 py-2.5">
+          <div className="min-w-44">
+            <div className="text-[10px] font-bold uppercase tracking-widest text-slate-300">Çalışma modu</div>
+            <p className="mt-0.5 text-[10px] text-slate-500">Filtre botların mevcut modunu değiştirmez.</p>
+          </div>
+          <div role="group" aria-label="Filo çalışma modu filtresi" className="flex flex-wrap items-center gap-1.5">
+            {([
+              { mode: "ALL", label: "Tümü", count: modeCounts.ALL },
+              { mode: "PAPER", label: "PAPER", count: modeCounts.PAPER },
+              { mode: "LIVE", label: "Gerçek · LIVE", count: modeCounts.LIVE },
+            ] as const).map((option) => {
+              const active = modeF === option.mode;
+              const tone = option.mode === "PAPER"
+                ? active
+                  ? "border-emerald-500/60 bg-emerald-500/15 text-emerald-300"
+                  : "border-emerald-500/25 text-emerald-400/80 hover:bg-emerald-500/5"
+                : option.mode === "LIVE"
+                  ? active
+                    ? "border-amber-500/60 bg-amber-500/15 text-amber-300"
+                    : "border-amber-500/25 text-amber-400/80 hover:bg-amber-500/5"
+                  : active
+                    ? "border-slate-400 bg-secondary text-slate-100"
+                    : "border-border text-slate-400 hover:text-slate-200";
+              return (
+                <button
+                  key={option.mode}
+                  type="button"
+                  aria-pressed={active}
+                  onClick={() => changeModeFilter(option.mode)}
+                  className={cn("rounded-lg border px-3 py-1.5 text-[11px] font-bold transition-colors", tone)}
+                >
+                  {option.label} <span className="num ml-1 opacity-80">{option.count}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
         {/* Faz 25: Akıllı durum filtre çipleri & Hızlı Toplu Yönetim */}
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2 text-xs">
           <div className="flex flex-wrap items-center gap-1.5">
@@ -805,17 +856,44 @@ export function Fleet({ onInspect, onNewBot }: { onInspect: (id: string) => void
             <Spinner className="h-6 w-6" />
           </div>
         ) : bots.length === 0 ? (
-          <EmptyState
-            icon={Bot}
-            title="Filo boş"
-            hint="Yeni Bot sihirbazından ilk stratejinizi kurun — DCA, Grid, Infinity veya Hedge."
-          />
+          <>
+            <EmptyState
+              icon={Bot}
+              title="Henüz bot yok"
+              hint="Simülasyon veya gerçek borsa modu için ayrı bir bot oluşturun."
+            />
+            <div className="flex flex-wrap justify-center gap-2 pb-3">
+              <Button type="button" variant="outline" className="border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10" onClick={() => onNewBot("PAPER")}>
+                PAPER bot oluştur
+              </Button>
+              <Button type="button" variant="outline" className="border-amber-500/40 text-amber-300 hover:bg-amber-500/10" onClick={() => onNewBot("LIVE")}>
+                Gerçek (LIVE) bot kur
+              </Button>
+            </div>
+          </>
         ) : shown.length === 0 ? (
-          <EmptyState
-            icon={Bot}
-            title="Eşleşen bot yok"
-            hint="Arama, durum filtresi veya Hedge çipini gevşetin."
-          />
+          <>
+            <EmptyState
+              icon={Bot}
+              title={modeF !== "ALL" && modeCounts[modeF] === 0 ? `${modeF === "PAPER" ? "PAPER" : "Gerçek (LIVE)"} bot yok` : "Eşleşen bot yok"}
+              hint={modeF !== "ALL" && modeCounts[modeF] === 0
+                ? "Bu modda henüz bot yok. Yeni bot oluşturma ekranı seçtiğiniz modla açılır."
+                : "Arama, mod, durum filtresi veya Hedge çipini gevşetin."}
+            />
+            {modeF !== "ALL" && modeCounts[modeF] === 0 && (
+              <div className="flex flex-col items-center gap-2 pb-3">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className={modeF === "LIVE" ? "border-amber-500/40 text-amber-300 hover:bg-amber-500/10" : "border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10"}
+                  onClick={() => onNewBot(modeF)}
+                >
+                  {modeF === "PAPER" ? "PAPER bot oluştur" : "Gerçek (LIVE) bot kur"}
+                </Button>
+                {modeF === "LIVE" && <p className="max-w-md text-center text-[10px] text-amber-400/80">LIVE mod gerçek borsa emirleri kullanır; sihirbazdaki anahtar ve risk kontrolleri uygulanır.</p>}
+              </div>
+            )}
+          </>
         ) : (
           <>
             <GlobalPolicyStrip bots={bots} />

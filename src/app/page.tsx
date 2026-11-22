@@ -31,6 +31,7 @@ import {
   WizardView,
 } from "@/components/terminal/views";
 import { useEngineHealth, useMaintenance } from "@/hooks/use-engine";
+import type { Mode } from "@/lib/engine-types";
 import { fmtDur } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -103,6 +104,8 @@ export default function Page({ searchParams }: { searchParams: PageSearchParams 
   const initialView: View = parsedView === "studio" && !initialBotId ? "fleet" : parsedView;
   const [view, setView] = useState<View>(initialView);
   const [botId, setBotId] = useState<string | null>(initialBotId);
+  const [wizardMode, setWizardMode] = useState<Mode>("PAPER");
+  const [wizardSession, setWizardSession] = useState(0);
   const [authLocked, setAuthLocked] = useState(false);
   /* P1 + P6 */
   const [moreOpen, setMoreOpen] = useState(false);
@@ -163,6 +166,11 @@ export default function Page({ searchParams }: { searchParams: PageSearchParams 
     setMoreOpen(false);
     setView(v);
     syncUrl(v, null);
+  };
+  const openNewBot = (mode: Mode = "PAPER") => {
+    setWizardMode(mode);
+    setWizardSession((current) => current + 1);
+    go("wizard");
   };
 
   const navActive = (id: View): boolean => (id === "fleet" && view === "studio") || view === id;
@@ -251,7 +259,7 @@ export default function Page({ searchParams }: { searchParams: PageSearchParams 
                     return (
                       <button
                         key={n.id}
-                        onClick={() => go(n.id)}
+                        onClick={() => n.id === "wizard" ? openNewBot("PAPER") : go(n.id)}
                         aria-current={navActive(n.id) ? "page" : undefined}
                         className={cn(
                           "flex min-h-11 w-full items-center gap-3 rounded-lg px-3 text-sm font-medium transition-colors",
@@ -285,18 +293,18 @@ export default function Page({ searchParams }: { searchParams: PageSearchParams 
         <main className="min-w-0 flex-1 p-4 pb-24 md:p-6 md:pb-8">
           <AnimatePresence mode="wait">
             <motion.div
-              key={`${view}-${botId ?? "none"}`}
+              key={`${view}-${botId ?? "none"}${view === "wizard" ? `-${wizardSession}` : ""}`}
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -8 }}
               transition={{ duration: reduceMotion ? 0 : 0.18 }}
             >
-              {view === "dashboard" && <DashboardView onInspect={openStudio} onNewBot={() => go("wizard")} />}
-              {view === "fleet" && <FleetView onInspect={openStudio} onNewBot={() => go("wizard")} />}
+              {view === "dashboard" && <DashboardView onInspect={openStudio} onNewBot={() => openNewBot("PAPER")} />}
+              {view === "fleet" && <FleetView onInspect={openStudio} onNewBot={(mode) => openNewBot(mode ?? "PAPER")} />}
               {view === "studio" && botId && <StudioView botId={botId} onBack={() => go("fleet")} />}
-              {view === "wizard" && <WizardView onCreated={openStudio} />}
+              {view === "wizard" && <WizardView onCreated={openStudio} initialMode={wizardMode} />}
               {view === "calc" && <CalculatorLazy />}
-              {view === "backtest" && <BacktestLazy onGoWizard={() => go("wizard")} />}
+              {view === "backtest" && <BacktestLazy onGoWizard={() => openNewBot("PAPER")} />}
               {view === "knowledge" && <KnowledgeLazy onOpenAi={() => go("backtest")} />}
               {view === "settings" && <SettingsLazy />}
             </motion.div>
@@ -344,7 +352,7 @@ export default function Page({ searchParams }: { searchParams: PageSearchParams 
           return (
             <button
               key={n.id}
-              onClick={() => go(n.id)}
+              onClick={() => n.id === "wizard" ? openNewBot("PAPER") : go(n.id)}
               aria-current={navActive(n.id) ? "page" : undefined}
               className={cn(
                 "flex min-h-14 min-w-14 flex-1 flex-col items-center justify-center gap-0.5 py-1.5 text-[11px] font-semibold",
