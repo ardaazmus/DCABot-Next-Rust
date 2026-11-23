@@ -15,7 +15,24 @@ use dca_math::Instrument;
 use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha2::Sha256;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicI64, Ordering};
+
+const EXECUTIONS_PAGE_LIMIT: usize = 100;
+const EXECUTIONS_MAX_PAGES: usize = 20;
+const EXECUTIONS_MAX_CURSOR_BYTES: usize = 1024;
+
+fn encode_query_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
 
 pub const MAINNET: &str = "https://api.bybit.com";
 pub const TESTNET: &str = "https://api-testnet.bybit.com";
@@ -466,6 +483,90 @@ fn check_ret(v: Value, path: &str) -> Result<Value, String> {
     Ok(v.get("result").cloned().unwrap_or(Value::Null))
 }
 
+fn parse_bybit_execution_page(
+    response: &Value,
+    category: &str,
+    order_link_id: &str,
+) -> Result<(Vec<ExecutionRecord>, String), String> {
+    let list = response
+        .get("list")
+        .and_then(Value::as_array)
+        .ok_or("bybit execution response missing list")?;
+    let mut records = Vec::with_capacity(list.len());
+    for item in list {
+        let returned_link_id = item
+            .get("orderLinkId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if returned_link_id.is_empty() || returned_link_id != order_link_id {
+            continue;
+        }
+        let exec_id = item
+            .get("execId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or("bybit execution record missing execId")?;
+        let exec_qty = Fraction::from_any_str(
+            item.get("execQty")
+                .and_then(Value::as_str)
+                .ok_or("bybit execution record missing execQty")?,
+        )
+        .map_err(|error| format!("bybit execution invalid execQty: {error}"))?;
+        let exec_price = Fraction::from_any_str(
+            item.get("execPrice")
+                .and_then(Value::as_str)
+                .ok_or("bybit execution record missing execPrice")?,
+        )
+        .map_err(|error| format!("bybit execution invalid execPrice: {error}"))?;
+        if !exec_qty.is_positive() || !exec_price.is_positive() {
+            return Err("bybit execution record has non-positive quantity or price".into());
+        }
+
+        // Bybit spot buy fees may be charged in base currency. The accounting
+        // ledger is quote-denominated, so convert that fee at execution price.
+        let side = item.get("side").and_then(Value::as_str).unwrap_or("");
+        let exec_fee =
+            match item.get("execFee").and_then(Value::as_str) {
+                Some(raw) if !raw.is_empty() => {
+                    let fee = Fraction::from_any_str(raw)
+                        .map_err(|error| format!("bybit execution invalid execFee: {error}"))?;
+                    match (category, side) {
+                        ("spot", "Buy") => Some(fee.mul(&exec_price).map_err(|error| {
+                            format!("bybit spot fee conversion failed: {error}")
+                        })?),
+                        _ => Some(fee),
+                    }
+                }
+                _ => None,
+            };
+        let exec_time = item
+            .get("execTime")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse().ok())
+            .or_else(|| item.get("execTime").and_then(Value::as_i64))
+            .unwrap_or(0);
+        records.push(ExecutionRecord {
+            order_link_id: returned_link_id.to_string(),
+            exec_id: exec_id.to_string(),
+            exec_qty,
+            exec_price,
+            exec_fee,
+            is_maker: item
+                .get("isMaker")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            exec_time,
+        });
+    }
+
+    let cursor = response
+        .get("nextPageCursor")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Ok((records, cursor))
+}
+
 /// Faz 2.7 — saf: Bybit risk-limit listesini M07 kademelerine normalize eder.
 /// Girdi: `/v5/market/risk-limit` `result` nesnesi (`list[]`: riskLimitValue /
 /// maintenanceMargin / maxLeverage). Kademe i: floor = onceki cap (ilk 0),
@@ -590,7 +691,8 @@ impl VenueAdapter for BybitAdapter {
                 query.push_str(&format!("&symbol={s}"));
             }
             if !cursor.is_empty() {
-                query.push_str(&format!("&cursor={cursor}"));
+                query.push_str("&cursor=");
+                query.push_str(&encode_query_component(&cursor));
             }
             let v = self
                 .public_get("/v5/market/instruments-info", &query)
@@ -1006,8 +1108,9 @@ impl VenueAdapter for BybitAdapter {
     }
 
     /// Faz 3 (C-3) — emrin venue execution kayıtları (fill kanıtı; imzalı):
-    /// GET /v5/execution/list?category&symbol&orderLinkId. Her kayıt kendi
-    /// exec_id'siyle idempotent işlenir; Cancelled/Rejected buradan hiç gelmez.
+    /// GET /v5/execution/list?category&symbol&orderLinkId. Every page is
+    /// consumed through Bybit's cursor; never report a truncated fill set as
+    /// complete. Each record remains idempotent by `exec_id`.
     async fn executions(
         &self,
         creds: &VenueCreds,
@@ -1015,72 +1118,40 @@ impl VenueAdapter for BybitAdapter {
         symbol: &str,
         order_link_id: &str,
     ) -> Result<Vec<ExecutionRecord>, String> {
-        let query =
-            format!("category={category}&symbol={symbol}&orderLinkId={order_link_id}&limit=100");
-        let v = self
-            .private_get(&creds.key, &creds.secret, "/v5/execution/list", &query)
-            .await?;
         let mut out = Vec::new();
-        if let Some(list) = v.get("list").and_then(|x| x.as_array()) {
-            for item in list {
-                let exec_id = item
-                    .get("execId")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if exec_id.is_empty() {
-                    continue;
-                }
-                let returned_link_id = item
-                    .get("orderLinkId")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("");
-                if returned_link_id.is_empty() || returned_link_id != order_link_id {
-                    continue;
-                }
-                let exec_qty = Fraction::from_any_str(
-                    item.get("execQty").and_then(|x| x.as_str()).unwrap_or("0"),
-                )
-                .unwrap_or_else(|_| Fraction::zero());
-                let exec_price = Fraction::from_any_str(
-                    item.get("execPrice")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("0"),
-                )
-                .unwrap_or_else(|_| Fraction::zero());
-                // H-4 (fee-coin): Bybit spot alışında ücret BASE cinsinden kesilir
-                // (satışta quote). Muhasebe quote olduğundan alış ücreti quote
-                // karşılığına çevrilir: fee_q = fee_base * execPrice. Lineer
-                // vadeli ücreti zaten USDT(quote) cinsindendir.
-                let side_str = item.get("side").and_then(|x| x.as_str()).unwrap_or("");
-                let raw_fee = item
-                    .get("execFee")
-                    .and_then(|x| x.as_str())
-                    .and_then(|s| Fraction::from_any_str(s).ok());
-                let exec_fee = match (raw_fee, category) {
-                    (Some(f), "spot") if side_str == "Buy" => f.mul(&exec_price).ok().or(Some(f)),
-                    (f, _) => f,
-                };
-                out.push(ExecutionRecord {
-                    order_link_id: returned_link_id.to_string(),
-                    exec_id,
-                    exec_qty,
-                    exec_price,
-                    exec_fee,
-                    is_maker: item
-                        .get("isMaker")
-                        .and_then(|x| x.as_bool())
-                        .unwrap_or(false),
-                    exec_time: item
-                        .get("execTime")
-                        .and_then(|x| x.as_str())
-                        .and_then(|s| s.parse().ok())
-                        .or_else(|| item.get("execTime").and_then(|x| x.as_i64()))
-                        .unwrap_or(0),
-                });
+        let mut cursor = String::new();
+        let mut seen_cursors = HashSet::new();
+        for page in 0..EXECUTIONS_MAX_PAGES {
+            let mut query = format!(
+                "category={category}&symbol={symbol}&orderLinkId={order_link_id}&limit={EXECUTIONS_PAGE_LIMIT}"
+            );
+            if !cursor.is_empty() {
+                query.push_str("&cursor=");
+                query.push_str(&encode_query_component(&cursor));
+            }
+            let response = self
+                .private_get(&creds.key, &creds.secret, "/v5/execution/list", &query)
+                .await?;
+            let (mut page_records, next_cursor) =
+                parse_bybit_execution_page(&response, category, order_link_id)?;
+            out.append(&mut page_records);
+            if next_cursor.is_empty() {
+                return Ok(out);
+            }
+            if next_cursor.len() > EXECUTIONS_MAX_CURSOR_BYTES {
+                return Err("bybit execution pagination cursor exceeds size limit".into());
+            }
+            if !seen_cursors.insert(next_cursor.clone()) {
+                return Err("bybit execution pagination repeated a cursor".into());
+            }
+            cursor = next_cursor;
+            if page + 1 == EXECUTIONS_MAX_PAGES {
+                return Err(format!(
+                    "bybit execution pagination exceeded {EXECUTIONS_MAX_PAGES} pages; refusing partial fill history"
+                ));
             }
         }
-        Ok(out)
+        unreachable!("bounded execution-page loop returns or errors on its last page")
     }
 
     /// Task 20 L3 — tek emir sorgusu: önce realtime (açık emir), bulunamazsa
@@ -1415,6 +1486,47 @@ mod tests {
     fn parse_bybit_risk_limit_rejects_empty() {
         let raw = serde_json::json!({"list": []});
         assert!(parse_bybit_risk_limit(&raw).is_err());
+    }
+
+    #[test]
+    fn execution_page_parser_preserves_cursor_and_filters_order() {
+        let raw = serde_json::json!({
+            "nextPageCursor": "cursor%3Apage2",
+            "list": [
+                {
+                    "orderLinkId": "bot-order-1",
+                    "execId": "exec-1",
+                    "execQty": "0.5",
+                    "execPrice": "100",
+                    "execFee": "0.001",
+                    "isMaker": true,
+                    "execTime": "1700000000000",
+                    "side": "Buy"
+                },
+                { "orderLinkId": "another-order" }
+            ]
+        });
+
+        let (records, cursor) = parse_bybit_execution_page(&raw, "spot", "bot-order-1").unwrap();
+        assert_eq!(cursor, "cursor%3Apage2");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].exec_id, "exec-1");
+        assert_eq!(records[0].exec_qty.to_string(), "1/2");
+        assert_eq!(records[0].exec_fee.as_ref().unwrap().to_string(), "1/10");
+    }
+
+    #[test]
+    fn execution_page_parser_rejects_malformed_result_shape() {
+        assert!(parse_bybit_execution_page(&serde_json::json!({}), "linear", "order").is_err());
+        let invalid = serde_json::json!({
+            "list": [{
+                "orderLinkId": "order",
+                "execId": "exec",
+                "execQty": "bad",
+                "execPrice": "10"
+            }]
+        });
+        assert!(parse_bybit_execution_page(&invalid, "linear", "order").is_err());
     }
 
     #[test]

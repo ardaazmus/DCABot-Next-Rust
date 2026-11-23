@@ -106,3 +106,5 @@ Bu belge kaynak rapordaki maddelerin repo üzerindeki uygulama durumunu kaydeder
 4. **P2 — Veritabanı yazma modeli ve kabul:** Synchronous SQLite bağlantısı async motor içinde mutex ile kullanılıyor; backup betiği tutarlı snapshot ile fail-closed. [Yerel PAPER yedek/geri yükleme runbook'u](LOCAL_BACKUP_RESTORE.md) eklendi. Uzun vadeli DB writer actor/async I/O dönüşümü ve veri hacmi/iş kayıtlarının saklama süresi kararı ayrı iş. Borsa demo/testnet senaryoları anahtar ve sandbox hesap erişimi gerektirir; canlı emir olmadan tamamlanamaz.
 
 Özel borsa hesabı endpoint'lerine veya ana ağa işlem isteği gönderilmedi. PAPER motoru kamuya açık piyasa verisi çekebilir; hiçbir canlı emir gönderilmedi. Docker kontrolleri izole sahte sırlarla yapıldı; kullanıcı volume'ları korunarak test volume'ları silindi. Bu doküman denetim notlarının tümünü tamamlanmış saymaz; yukarıdaki maddeler ayrı geliştirme işi olarak açık bırakılmıştır.
+
+22 Kasım tarihli doğrulama ve yeniden denetim raporu için güncel kod karşılaştırması ve bu turdaki Bybit pagination düzeltmesi [ikinci rapor uygulama durumunda](denetim-raporu-2-uygulama-durumu.md) tutuluyor.
