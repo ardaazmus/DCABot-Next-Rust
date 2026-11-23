@@ -194,22 +194,18 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
      Faz 25 (UIX-23): sağlayıcı config ortak store'dan (Ayarlar'da tek yer). */
   const ai = useAiConfig();
   const [memories, setMemories] = useState<BotMemory[]>([]);
-  const [memBusy, setMemBusy] = useState(false);
   const [memGenBusy, setMemGenBusy] = useState(false);
   const [memErr, setMemErr] = useState<string | null>(null);
   const [memProviders, setMemProviders] = useState<AiProvider[]>([]);
   const memProviderLabel =
     memProviders.find((p) => p.id === ai.provider)?.label ?? (ai.provider === "builtin" ? "Yerleşik (paketlenmedi)" : ai.provider);
   const loadMemories = async () => {
-    setMemBusy(true);
     setMemErr(null);
     try {
       const r = await apiBotMemoryList(botId, 20);
       setMemories(r.memories);
     } catch (e) {
       setMemErr(e instanceof Error ? e.message : "Hafıza okunamadı");
-    } finally {
-      setMemBusy(false);
     }
   };
   const runMemory = async () => {
@@ -309,8 +305,11 @@ export function Studio({ botId, onBack }: { botId: string; onBack: () => void })
     }
   };
   useEffect(() => {
-    void loadMemories();
-     
+    let alive = true;
+    apiBotMemoryList(botId, 20)
+      .then((r) => { if (alive) setMemories(r.memories); })
+      .catch((e) => { if (alive) setMemErr(e instanceof Error ? e.message : "Hafıza okunamadı"); });
+    return () => { alive = false; };
   }, [botId]);
   useEffect(() => {
     let alive = true;

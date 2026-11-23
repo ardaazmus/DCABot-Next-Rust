@@ -28,7 +28,7 @@ pub mod grid;
 pub mod hedge;
 
 pub use advisory::{compute_warnings, grid_fee_breaker_violation};
-pub use backtest::{run_backtest, BacktestMetrics, BacktestResult};
+pub use backtest::{run_backtest, run_backtest_with_mmr, BacktestMetrics, BacktestResult};
 pub use certify::{certify, certify_verdict, CertGate, CertGateVerdict, CertifyOutput};
 pub use dca::{DcaEngine, DcaPhase};
 pub use grid::GridEngine;

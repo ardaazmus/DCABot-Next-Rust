@@ -16,6 +16,26 @@ use dca_math::Instrument;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// Serialize an already tick/step-quantized exchange value without the old
+/// eight-decimal truncation. Exchange increments can require more precision;
+/// trailing zeroes are stripped so adapters send the minimum meaningful scale.
+pub fn format_order_decimal(value: &Fraction) -> String {
+    let mut text = value.to_half_even_display(18);
+    if let Some(dot) = text.find('.') {
+        while text.ends_with('0') {
+            text.pop();
+        }
+        if text.len() == dot + 1 {
+            text.pop();
+        }
+    }
+    if text == "-0" {
+        "0".into()
+    } else {
+        text
+    }
+}
+
 fn normalize_venue_base_url(
     raw: &str,
     venue: &str,

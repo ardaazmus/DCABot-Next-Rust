@@ -62,7 +62,7 @@ import {
 } from "@/components/ui/select";
 import { LadderTable, MeshTable } from "@/components/terminal/ladder";
 import { Panel, PassChip, Spinner } from "@/components/terminal/bits";
-import { consumeCarriedConfig } from "@/lib/carry-config";
+import { useCarriedConfig, type CarriedBotConfig } from "@/lib/carry-config";
 import { TvChart, type TvMarker, type TvPlotSeries, type TvPriceLine } from "@/components/terminal/tv-chart";
 import { SignalBuilder } from "@/components/terminal/signal-builder";
 import {
@@ -122,44 +122,69 @@ interface WizardProps {
   initialExecutionEnvironment?: ExecutionEnvironmentChoice;
 }
 
-export function Wizard({ onCreated, initialMode = "PAPER", initialExecutionEnvironment }: WizardProps) {
+export function Wizard(props: WizardProps) {
+  const carriedConfig = useCarriedConfig();
+  return <WizardForm key={carriedConfig?.ts ?? "empty"} {...props} carriedConfig={carriedConfig} />;
+}
+
+function WizardForm({
+  onCreated,
+  initialMode = "PAPER",
+  initialExecutionEnvironment,
+  carriedConfig,
+}: WizardProps & { carriedConfig: CarriedBotConfig | null }) {
+  const carriedValues = carriedConfig?.config ?? {};
+  const carriedNumber = (key: string, fallback: number) => {
+    const value = Number(carriedValues[key]);
+    return Number.isFinite(value) && value > 0 ? value : fallback;
+  };
+  const carriedText = (key: string, fallback: string) => {
+    const value = carriedValues[key];
+    return value === undefined || value === null || String(value).trim() === "" ? fallback : String(value);
+  };
+  const carriedMaxSafety =
+    typeof carriedValues.max_safety_orders === "number" && carriedValues.max_safety_orders >= 0
+      ? Math.min(100, Math.floor(carriedValues.max_safety_orders))
+      : 5;
 
   /* step 1 */
-  const [kind, setKind] = useState<BotKind | null>(null);
+  const [kind, setKind] = useState<BotKind | null>((carriedConfig?.kind as BotKind | undefined) ?? null);
   const [cardKey, setCardKey] = useState<string | null>(null);
   /* step 2 */
-  const [venue, setVenue] = useState<Venue>("BYBIT");
+  const [venue, setVenue] = useState<Venue>((carriedConfig?.venue as Venue | undefined) ?? "BYBIT");
   const [executionEnvironmentChoice, setExecutionEnvironmentChoice] = useState<ExecutionEnvironmentChoice>(
-    initialExecutionEnvironment ?? (initialMode === "LIVE" ? "EXCHANGE_SANDBOX" : "INTERNAL_PAPER"),
+    carriedConfig
+      ? "INTERNAL_PAPER"
+      : initialExecutionEnvironment ?? (initialMode === "LIVE" ? "EXCHANGE_SANDBOX" : "INTERNAL_PAPER"),
   );
   const mode: Mode = executionEnvironmentChoice === "INTERNAL_PAPER" ? "PAPER" : "LIVE";
   const { health: engineHealth } = useEngineHealth(15000);
-  const [symbolQuery, setSymbolQuery] = useState("");
+  const [symbolQuery, setSymbolQuery] = useState(carriedConfig?.symbol ?? "");
   const [listOpen, setListOpen] = useState(false);
-  const [symbol, setSymbol] = useState<string | null>(null);
+  const [symbol, setSymbol] = useState<string | null>(carriedConfig?.symbol ?? null);
   const [instrument, setInstrument] = useState<Instrument | null>(null);
-  const [intervalSel, setIntervalSel] = useState<Interval>("1h");
+  const [intervalSel, setIntervalSel] = useState<Interval>((carriedConfig?.interval as Interval | undefined) ?? "1h");
   const [instruments, setInstruments] = useState<Instrument[]>([]);
-  const [marketsBusy, setMarketsBusy] = useState(false);
+  const [marketsLoadedKey, setMarketsLoadedKey] = useState<string | null>(null);
   /** P2-1: 24h istatistik haritası (sembol → ticker). Sessizce boş kalabilir. */
   const [tickers, setTickers] = useState<Record<string, Ticker24h>>({});
   const [quoteFilter, setQuoteFilter] = useState<"ALL" | "USDT" | "USDC">("USDT");
   /* step 3 */
-  const [baseSize, setBaseSize] = useState("500");
-  const [safetySize, setSafetySize] = useState("500");
+  const [baseSize, setBaseSize] = useState(carriedText("base_order_size", "500"));
+  const [safetySize, setSafetySize] = useState(carriedText("safety_order_size", "500"));
   const [sizingMode, setSizingMode] = useState<"QUOTE_NOTIONAL" | "BASE_QTY">("QUOTE_NOTIONAL");
-  const [deviationPct, setDeviationPct] = useState(2); // percent
-  const [stepScale, setStepScale] = useState("1.3");
-  const [volumeScale, setVolumeScale] = useState("1.2");
-  const [maxSafety, setMaxSafety] = useState(5);
-  const [targetProfitPct, setTargetProfitPct] = useState(2); // percent
+  const [deviationPct, setDeviationPct] = useState(Math.round(carriedNumber("deviation_pct", 0.02) * 10000) / 100); // percent
+  const [stepScale, setStepScale] = useState(carriedText("step_scale", "1.3"));
+  const [volumeScale, setVolumeScale] = useState(carriedText("volume_scale", "1.2"));
+  const [maxSafety, setMaxSafety] = useState(carriedMaxSafety);
+  const [targetProfitPct, setTargetProfitPct] = useState(Math.round(carriedNumber("target_profit_pct", 0.02) * 10000) / 100); // percent
   const [netTp, setNetTp] = useState(true);
   const [trailing, setTrailing] = useState(false);
   const [trailTrigPct, setTrailTrigPct] = useState(1);
   const [trailDevPct, setTrailDevPct] = useState(0.5);
   const [slEnabled, setSlEnabled] = useState(false);
   const [slPct, setSlPct] = useState(5);
-  const [leverage, setLeverage] = useState(1);
+  const [leverage, setLeverage] = useState(() => Math.min(50, Math.max(1, Math.round(carriedNumber("leverage", 1)))));
   /* step 3 — hedge (M18) real inputs */
   const [hedgeRatio, setHedgeRatio] = useState("0.5");
   const [combinedTp, setCombinedTp] = useState("50");
@@ -202,8 +227,8 @@ export function Wizard({ onCreated, initialMode = "PAPER", initialExecutionEnvir
     setSignalPreviewError(err);
   }, []);
   /* step 4 */
-  const [startCash, setStartCash] = useState("100000");
-  const [anchor, setAnchor] = useState("");
+  const [startCash, setStartCash] = useState(carriedConfig?.startCash ?? "100000");
+  const [anchor, setAnchor] = useState(String(carriedValues.anchor ?? ""));
   const [anchorFetched, setAnchorFetched] = useState<number | null>(null);
   const [gridLower, setGridLower] = useState("");
   const [gridUpper, setGridUpper] = useState("");
@@ -225,15 +250,17 @@ export function Wizard({ onCreated, initialMode = "PAPER", initialExecutionEnvir
   const [launching, setLaunching] = useState(false);
   const [launchError, setLaunchError] = useState<string | null>(null);
   /* step 6 — Risk Motoru (Task 16): advisory policy + user acknowledgment */
-  const [riskPolicy, setRiskPolicy] = useState<UserRiskPolicy>(() => ({ ...DEFAULT_RISK_POLICY }));
+  const [riskPolicy, setRiskPolicy] = useState<UserRiskPolicy>(() => ({
+    ...DEFAULT_RISK_POLICY,
+    active_safety_orders: Math.min(Math.max(1, DEFAULT_RISK_POLICY.active_safety_orders), Math.max(carriedMaxSafety, 1)),
+  }));
   const [riskAck, setRiskAck] = useState(false);
   /** Warnings echoed by an engine 422 RISK_ACKNOWLEDGMENT_REQUIRED body. */
   const [serverWarnings, setServerWarnings] = useState<AdvisoryWarning[]>([]);
   /** Server-enforced LIVE certification failure; user acknowledgment cannot bypass it. */
   const [certGateFailed, setCertGateFailed] = useState<string | null>(null);
   /* LIVE vault check */
-  const [vaultKeys, setVaultKeys] = useState<VaultKey[] | null>(null);
-  const [vaultError, setVaultError] = useState<string | null>(null);
+  const [vaultResult, setVaultResult] = useState<{ requestKey: string; keys: VaultKey[] | null; error: string | null } | null>(null);
 
   const isGridKind = kind !== null && kind.includes("GRID");
   const isShort = kind === "DCA_SHORT";
@@ -242,51 +269,28 @@ export function Wizard({ onCreated, initialMode = "PAPER", initialExecutionEnvir
   const isFuturesMarket = isShort || kind === "FUTURES_GRID" || isFuturesDca || isHedgeKind;
   const marketType: "spot" | "linear" = isFuturesMarket || leverage > 1 ? "linear" : "spot";
   const category: "spot" | "linear" = isFuturesMarket ? "linear" : "spot";
+  const marketsRequestKey = kind ? `${category}:${venue}` : null;
+  const marketsBusy = marketsRequestKey !== null && marketsLoadedKey !== marketsRequestKey;
+  const defaultGridLower = anchorFetched === null ? "" : String(Number((anchorFetched * 0.9).toPrecision(8)));
+  const defaultGridUpper = anchorFetched === null ? "" : String(Number((anchorFetched * 1.1).toPrecision(8)));
+  const gridLowerValue = gridLower || (isGridKind ? defaultGridLower : "");
+  const gridUpperValue = gridUpper || (isGridKind ? defaultGridUpper : "");
 
-  /* ---- Faz 19 (UIX-11): Lab'den taşınan config'i tek seferlik prefill ---- */
+  /* Lab config state is read from session storage through useSyncExternalStore. */
   useEffect(() => {
-    const c = consumeCarriedConfig();
-    if (!c) return;
-    const cfg = (c.config ?? {}) as Record<string, unknown>;
-    const num = (v: unknown, fallback: number): number => {
-      const n = Number(v);
-      return Number.isFinite(n) && n > 0 ? n : fallback;
-    };
-    setKind(c.kind as BotKind);
-    setVenue((c.venue as Venue) ?? "BYBIT");
-    setExecutionEnvironmentChoice("INTERNAL_PAPER");
-    setSymbol(c.symbol);
-    setSymbolQuery(c.symbol);
-    carriedSymbolRef.current = c.symbol;
-    setIntervalSel(c.interval as Interval);
-    setStartCash(c.startCash);
-    // Motor fraksiyon sözleşmesi: 0.02 = %2 → arayüz yüzde gösterir (×100).
-    setDeviationPct(Math.round(num(cfg.deviation_pct, 0.02) * 10000) / 100);
-    setTargetProfitPct(Math.round(num(cfg.target_profit_pct, 0.02) * 10000) / 100);
-    if (typeof cfg.max_safety_orders === "number" && cfg.max_safety_orders >= 0) {
-      setMaxSafety(Math.min(100, Math.floor(cfg.max_safety_orders)));
-    }
-    if (cfg.base_order_size != null && cfg.base_order_size !== "") setBaseSize(String(cfg.base_order_size));
-    if (cfg.safety_order_size != null && cfg.safety_order_size !== "") setSafetySize(String(cfg.safety_order_size));
-    if (cfg.step_scale != null && cfg.step_scale !== "") setStepScale(String(cfg.step_scale));
-    if (cfg.volume_scale != null && cfg.volume_scale !== "") setVolumeScale(String(cfg.volume_scale));
-    if (cfg.leverage != null && cfg.leverage !== "") {
-      const lev = Math.floor(num(cfg.leverage, 1));
-      if (lev >= 1 && lev <= 50) setLeverage(lev);
-    }
+    if (!carriedConfig) return;
     toast({
       title: "Lab konfigürasyonu yüklendi",
-      description: `${c.symbol} · ${c.interval} — sapma, hedef kâr ve kademeler Lab koşusundan dolduruldu.`,
+      description: `${carriedConfig.symbol} · ${carriedConfig.interval} — sapma, hedef kâr ve kademeler Lab koşusundan dolduruldu.`,
     });
-     
-  }, []);
+  }, [carriedConfig]);
 
   /* ---- markets fetch once strategy kind or venue is selected ---- */
   useEffect(() => {
     if (!kind) return;
     let alive = true;
-    setMarketsBusy(true);
-    apiMarkets(category, undefined, venue)
+    const requestKey = `${category}:${venue}`;
+    const markets = apiMarkets(category, undefined, venue)
       .then((r) => {
         if (alive) {
           setInstruments(r.instruments);
@@ -305,7 +309,7 @@ export function Wizard({ onCreated, initialMode = "PAPER", initialExecutionEnvir
         if (alive) setInstruments([]);
       });
     /* P2-1: 24h ticker'ları ayrı uctan — hata sessiz (liste yine de çalışır). */
-    apiTickers(category, venue)
+    const tickers = apiTickers(category, venue)
       .then((r) => {
         if (!alive) return;
         const m: Record<string, Ticker24h> = {};
@@ -314,10 +318,10 @@ export function Wizard({ onCreated, initialMode = "PAPER", initialExecutionEnvir
       })
       .catch(() => {
         if (alive) setTickers({});
-      })
-      .finally(() => {
-        if (alive) setMarketsBusy(false);
       });
+    void Promise.all([markets, tickers]).finally(() => {
+      if (alive) setMarketsLoadedKey(requestKey);
+    });
     return () => {
       alive = false;
     };
@@ -343,10 +347,20 @@ export function Wizard({ onCreated, initialMode = "PAPER", initialExecutionEnvir
   }, [instruments, symbolQuery, quoteFilter]);
 
   /* ---- anchor from last kline when symbol set ---- */
+  const anchorRequestSeq = useRef(0);
+  const resetMarketInputs = useCallback((resetAnchor: boolean) => {
+    anchorRequestSeq.current += 1;
+    setAnchorFetched(null);
+    setGridLower("");
+    setGridUpper("");
+    if (resetAnchor) setAnchor("");
+  }, []);
   const fetchAnchor = useCallback(async () => {
     if (!symbol) return;
+    const requestSeq = ++anchorRequestSeq.current;
     try {
       const r = await apiKlines(symbol, intervalSel, 1);
+      if (requestSeq !== anchorRequestSeq.current) return;
       const c = r.bars?.[0]?.c;
       if (c) {
         const v = fracToNum(c) ?? 0;
@@ -354,39 +368,48 @@ export function Wizard({ onCreated, initialMode = "PAPER", initialExecutionEnvir
         setAnchor((prev) => (prev === "" || prev === "0" ? String(v) : prev));
       }
     } catch {
-      setAnchorFetched(null);
+      if (requestSeq === anchorRequestSeq.current) setAnchorFetched(null);
     }
   }, [symbol, intervalSel]);
 
   useEffect(() => {
-    void fetchAnchor();
-    // reset grid bounds when symbol changes
-    setGridLower("");
-    setGridUpper("");
+    if (!symbol) return;
+    const requestSeq = ++anchorRequestSeq.current;
+    let alive = true;
+    apiKlines(symbol, intervalSel, 1)
+      .then((r) => {
+        if (!alive || requestSeq !== anchorRequestSeq.current) return;
+        const c = r.bars?.[0]?.c;
+        if (c) {
+          const v = fracToNum(c) ?? 0;
+          setAnchorFetched(v);
+          setAnchor((prev) => (prev === "" || prev === "0" ? String(v) : prev));
+        }
+      })
+      .catch(() => {
+        if (alive && requestSeq === anchorRequestSeq.current) setAnchorFetched(null);
+      });
+    return () => {
+      alive = false;
+      if (anchorRequestSeq.current === requestSeq) anchorRequestSeq.current += 1;
+    };
   }, [symbol, intervalSel]);
-
-  /* ---- grid bounds default around anchor ---- */
-  useEffect(() => {
-    if (isGridKind && anchorFetched) {
-      setGridLower((p) => (p === "" ? String(Number((anchorFetched * 0.9).toPrecision(8))) : p));
-      setGridUpper((p) => (p === "" ? String(Number((anchorFetched * 1.1).toPrecision(8))) : p));
-    }
-  }, [isGridKind, anchorFetched]);
 
   /* ---- live calc (debounced) ---- */
   const calcTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const carriedSymbolRef = useRef<string | null>(null);
+  const carriedSymbolRef = useRef<string | null>(carriedConfig?.symbol ?? null);
   // Faz 23 (UI derin inceleme #4): hesap-yanıtı yarışı — debounce sonrası
   // isteklerin dönüş SIRASI garanti değil; eski parametrenin cevabı yeni
   // cevabı ezmişti (ladder/G6 rozetleri yanlış veriyle). seq guard: yalnız
   // en son tetiklenen koşu state yazabilir.
   const calcSeq = useRef(0);
   useEffect(() => {
+    const mySeq = ++calcSeq.current;
     if (!kind) return;
     if (calcTimer.current) clearTimeout(calcTimer.current);
-    setCalcBusy(true);
-    const mySeq = ++calcSeq.current;
     calcTimer.current = setTimeout(async () => {
+      if (calcSeq.current !== mySeq) return;
+      setCalcBusy(true);
       try {
         setCalcError(null);
         if (!isGridKind) {
@@ -416,11 +439,13 @@ export function Wizard({ onCreated, initialMode = "PAPER", initialExecutionEnvir
             market: marketType,
             direction: isShort ? "short" : "long",
           });
-          if (calcSeq.current === mySeq) setCalcDca(r);
-          setCalcGrid(null);
+          if (calcSeq.current === mySeq) {
+            setCalcDca(r);
+            setCalcGrid(null);
+          }
         } else {
-          const lo = fracToNum(gridLower);
-          const hi = fracToNum(gridUpper);
+          const lo = fracToNum(gridLowerValue);
+          const hi = fracToNum(gridUpperValue);
           if (!lo || !hi || lo >= hi) {
             setCalcGrid(null);
             setCalcError("Grid alt sınır < üst sınır olmalı.");
@@ -437,21 +462,25 @@ export function Wizard({ onCreated, initialMode = "PAPER", initialExecutionEnvir
             maker_fee: instrument ? String(fracToNum(instrument.maker_fee_rate) ?? 0.001) : "0.001",
             taker_fee: instrument ? String(fracToNum(instrument.taker_fee_rate) ?? 0.001) : "0.001",
           });
-          if (calcSeq.current === mySeq) setCalcGrid(r);
-          setCalcDca(null);
+          if (calcSeq.current === mySeq) {
+            setCalcGrid(r);
+            setCalcDca(null);
+          }
         }
       } catch (e) {
-        setCalcDca(null);
-        setCalcGrid(null);
-        setCalcError(e instanceof Error ? e.message : "Hesaplama hatası");
+        if (calcSeq.current === mySeq) {
+          setCalcDca(null);
+          setCalcGrid(null);
+          setCalcError(e instanceof Error ? e.message : "Hesaplama hatası");
+        }
       } finally {
-        setCalcBusy(false);
+        if (calcSeq.current === mySeq) setCalcBusy(false);
       }
     }, 500);
     return () => {
       if (calcTimer.current) clearTimeout(calcTimer.current);
     };
-  }, [kind, anchor, baseSize, safetySize, sizingMode, deviationPct, stepScale, volumeScale, maxSafety, targetProfitPct, netTp, slEnabled, slPct, leverage, isGridKind, gridLower, gridUpper, gridLevels, gridMode, gridTrail, gridNotional, instrument, marketType]);
+  }, [kind, anchor, baseSize, safetySize, sizingMode, deviationPct, stepScale, volumeScale, maxSafety, targetProfitPct, netTp, slEnabled, slPct, leverage, isGridKind, gridLowerValue, gridUpperValue, gridLevels, gridMode, gridTrail, gridNotional, instrument, marketType]);
 
   /* ---- start condition: live market price for on-screen evaluation ---- */
   useEffect(() => {
@@ -647,18 +676,27 @@ export function Wizard({ onCreated, initialMode = "PAPER", initialExecutionEnvir
   }, []);
 
   const patchRiskPolicy = useCallback((patch: Partial<UserRiskPolicy>) => {
-    setRiskPolicy((p) => ({ ...p, ...patch }));
-    setServerWarnings([]);
-  }, []);
-
-  /* active_safety_orders her zaman 1..max(max_safety_orders, 1) aralığına kelepirlenir. */
-  useEffect(() => {
     setRiskPolicy((p) => {
-      const maxSo = Math.max(maxSafety, 1);
+      const next = { ...p, ...patch };
+      if (patch.active_safety_orders !== undefined) {
+        next.active_safety_orders = Math.min(Math.max(1, Math.round(patch.active_safety_orders)), Math.max(maxSafety, 1));
+      }
+      return next;
+    });
+    setServerWarnings([]);
+  }, [maxSafety]);
+
+  /* active_safety_orders değerini max_safety_orders ile aynı event içinde tut. */
+  const updateMaxSafety = (value: number) => {
+    const nextMax = Math.round(value);
+    setMaxSafety(nextMax);
+    setRiskPolicy((p) => {
+      const maxSo = Math.max(nextMax, 1);
       const clamped = Math.min(Math.max(1, Math.round(p.active_safety_orders ?? 1)), maxSo);
       return clamped === p.active_safety_orders ? p : { ...p, active_safety_orders: clamped };
     });
-  }, [maxSafety]);
+    setServerWarnings([]);
+  };
 
   const wizardWarnings = useMemo(
     () =>
@@ -697,32 +735,29 @@ export function Wizard({ onCreated, initialMode = "PAPER", initialExecutionEnvir
   const vaultEnvironment = executionEnvironmentChoice === "EXCHANGE_SANDBOX"
     ? activeExecutionEnvironment
     : executionEnvironmentChoice === "MAINNET" ? "MAINNET" : null;
+  const vaultRequestKey = mode === "LIVE" && venue && vaultEnvironment ? `${venue}:${vaultEnvironment}` : null;
+  const vaultKeys = vaultRequestKey && vaultResult?.requestKey === vaultRequestKey ? vaultResult.keys : null;
+  const vaultError = vaultRequestKey && vaultResult?.requestKey === vaultRequestKey ? vaultResult.error : null;
   const canLaunch = sec1Valid && sec2Valid && sec3Valid && sec4Valid && sec5Valid && sec6Valid && engineOnline && executionEnvironmentAvailable;
   const secValid = [sec1Valid, sec2Valid && executionEnvironmentAvailable, sec3Valid, sec4Valid, sec5Valid, sec6Valid];
 
   /* ---- LIVE mode: verify a vault key exists for the selected venue ---- */
   useEffect(() => {
-    if (mode !== "LIVE" || !venue) {
-      setVaultKeys(null);
-      setVaultError(null);
-      return;
-    }
+    if (!vaultRequestKey) return;
     let alive = true;
     apiVaultKeys()
       .then((r) => {
         if (!alive) return;
-        setVaultKeys(r.keys ?? []);
-        setVaultError(null);
+        setVaultResult({ requestKey: vaultRequestKey, keys: r.keys ?? [], error: null });
       })
       .catch((e) => {
         if (!alive) return;
-        setVaultKeys(null);
-        setVaultError(e instanceof Error ? e.message : "vault okunamadı");
+        setVaultResult({ requestKey: vaultRequestKey, keys: null, error: e instanceof Error ? e.message : "vault okunamadı" });
       });
     return () => {
       alive = false;
     };
-  }, [mode, venue]);
+  }, [vaultRequestKey]);
 
   const vaultVenueOk =
     mode === "LIVE" && vaultKeys !== null
@@ -1430,6 +1465,7 @@ export function Wizard({ onCreated, initialMode = "PAPER", initialExecutionEnvir
                           type="button"
                           onMouseDown={(e) => e.preventDefault()}
                           onClick={() => {
+                            if (symbol !== i.symbol) resetMarketInputs(true);
                             setSymbol(i.symbol);
                             setInstrument(i);
                             setSymbolQuery("");
@@ -1480,6 +1516,7 @@ export function Wizard({ onCreated, initialMode = "PAPER", initialExecutionEnvir
                           setSymbolQuery(c);
                           const found = instruments.find((i) => i.symbol === targetSymbol || i.base === c);
                           if (found) {
+                            if (symbol !== found.symbol) resetMarketInputs(true);
                             setSymbol(found.symbol);
                             setInstrument(found);
                           }
@@ -1507,7 +1544,10 @@ export function Wizard({ onCreated, initialMode = "PAPER", initialExecutionEnvir
                 </div>
                 <div className="mt-3">
                   <Label className="text-xs text-slate-400">Periyot</Label>
-                  <Select value={intervalSel} onValueChange={(v) => setIntervalSel(v as Interval)}>
+                  <Select value={intervalSel} onValueChange={(v) => {
+                    if (v !== intervalSel) resetMarketInputs(false);
+                    setIntervalSel(v as Interval);
+                  }}>
                     <SelectTrigger className="mt-1.5 min-h-11 w-full border-border-strong bg-surface text-slate-100">
                       <SelectValue />
                     </SelectTrigger>
@@ -1554,7 +1594,7 @@ export function Wizard({ onCreated, initialMode = "PAPER", initialExecutionEnvir
                       type="button"
                       onClick={() => {
                         setDeviationPct(p.dev);
-                        setMaxSafety(p.safety);
+                        updateMaxSafety(p.safety);
                         setTargetProfitPct(p.tp);
                         setStepScale(String(p.step));
                         setVolumeScale(String(p.vol));
@@ -1651,7 +1691,7 @@ export function Wizard({ onCreated, initialMode = "PAPER", initialExecutionEnvir
 
                 <div className="mt-5 space-y-5">
                   <SliderField label="Deviation (sapma) %" value={deviationPct} min={0.5} max={10} step={0.1} onChange={setDeviationPct} />
-                  <SliderField label="Maks. Güvenlik Emri" value={maxSafety} min={0} max={10} step={1} onChange={(v) => setMaxSafety(Math.round(v))} integer />
+                  <SliderField label="Maks. Güvenlik Emri" value={maxSafety} min={0} max={10} step={1} onChange={updateMaxSafety} integer />
                   <SliderField label="Hedef Kâr (TP) %" value={targetProfitPct} min={0.2} max={10} step={0.1} onChange={setTargetProfitPct} />
                   <div className="grid grid-cols-2 gap-3">
                     <NumField label="Step Scale" value={stepScale} onChange={setStepScale} />
@@ -1681,8 +1721,8 @@ export function Wizard({ onCreated, initialMode = "PAPER", initialExecutionEnvir
             ) : (
               <Panel title="Grid Parametreleri" icon={<Grid3x3 className="h-4 w-4 text-slate-500" aria-hidden />}>
                 <div className="grid grid-cols-2 gap-3">
-                  <NumField label="Alt Sınır" value={gridLower} onChange={setGridLower} />
-                  <NumField label="Üst Sınır" value={gridUpper} onChange={setGridUpper} />
+                  <NumField label="Alt Sınır" value={gridLowerValue} onChange={setGridLower} />
+                  <NumField label="Üst Sınır" value={gridUpperValue} onChange={setGridUpper} />
                 </div>
                 <div className="mt-3 flex gap-2">
                   {(["arithmetic", "geometric"] as const).map((m) => (

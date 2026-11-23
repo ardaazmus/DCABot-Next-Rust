@@ -17,8 +17,9 @@
 //! (exact stringaritmetik — float YOK).
 
 use super::{
-    KeyPermissions, Kline, OrderBook, OrderBookLevel, OrderRequest, PositionSnapshot, Ticker24h,
-    TickerSnapshot, VenueAdapter, VenueCreds, VenueOrderState, WalletSnapshot,
+    format_order_decimal, KeyPermissions, Kline, OrderBook, OrderBookLevel, OrderRequest,
+    PositionSnapshot, Ticker24h, TickerSnapshot, VenueAdapter, VenueCreds, VenueOrderState,
+    WalletSnapshot,
 };
 use dca_math::fraction::Fraction;
 use dca_math::Instrument;
@@ -734,14 +735,14 @@ impl VenueAdapter for OkxAdapter {
             let row = first_data(&spec).ok_or("swap spec yok")?;
             let (_, lot_sz, _, ct_val) = self.inst_spec(row).ok_or("swap spec eksik")?;
             let ct = ct_val.ok_or("ctVal yok")?;
-            let contracts = Fraction::from_any_str(&req.qty.to_half_even_display(8))
+            let contracts = Fraction::from_any_str(&format_order_decimal(&req.qty))
                 .map_err(|e| e.to_string())?
                 .div(&Fraction::from_decimal_str(&ct).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
-            floor_to_step(&contracts.to_half_even_display(8), &lot_sz)?
+            floor_to_step(&format_order_decimal(&contracts), &lot_sz)?
         } else {
             // Spot: miktar base cinsindendir (EX-02 düzeltmesi).
-            req.qty.to_half_even_display(8)
+            format_order_decimal(&req.qty)
         };
         let pos_side =
             resolve_okx_pos_side(&req.category, req.position_idx, req.side, req.reduce_only);
@@ -763,7 +764,7 @@ impl VenueAdapter for OkxAdapter {
             body["px"] = Value::String(
                 req.price
                     .as_ref()
-                    .map(|p| p.to_half_even_display(8))
+                    .map(format_order_decimal)
                     .unwrap_or_default(),
             );
         }

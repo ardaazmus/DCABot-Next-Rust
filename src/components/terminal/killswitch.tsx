@@ -27,20 +27,25 @@ export function KillButton({ className, onStopAll }: { className?: string; onSto
   const [engaged, setEngaged] = useState(false);
   const [reason, setReason] = useState<string | null>(null);
 
-  const refresh = async () => {
-    try {
-      const s = await apiKillState();
-      setEngaged(s.engaged);
-      setReason(s.reason);
-    } catch {
-      // motor kapalıysa sessiz — offline banner zaten var
-    }
-  };
-
   useEffect(() => {
-    void refresh();
-    const t = setInterval(() => void refresh(), 10000);
-    return () => clearInterval(t);
+    let alive = true;
+    const syncState = () => {
+      apiKillState()
+        .then((s) => {
+          if (!alive) return;
+          setEngaged(s.engaged);
+          setReason(s.reason);
+        })
+        .catch(() => {
+          // motor kapalıysa sessiz — offline banner zaten var
+        });
+    };
+    syncState();
+    const t = setInterval(syncState, 10000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
   }, []);
 
   const reset = () => {

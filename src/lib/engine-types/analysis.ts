@@ -136,6 +136,8 @@ export interface BacktestResult {
   gateLogs: number;
   /** Task 18 N-5 — funding geçmişi alınamadığında dürüst uyarı metni. */
   fundingWarning?: string | null;
+  /** Backtest liquidation used the fallback MMR because venue tiers were unavailable. */
+  mmrWarning?: string | null;
   /** Task 19 — Pine strateji uyarıları (pyramiding vb.). */
   pineWarnings?: string[];
   /** Task 20 — derleme notları (koşullu ta.* vb.). */

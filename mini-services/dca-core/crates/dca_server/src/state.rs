@@ -2,8 +2,8 @@
 
 use crate::store::{Db, Vault};
 use dca_exchange::{
-    binance::BinanceAdapter, bybit::BybitAdapter, okx::OkxAdapter, paper::PaperVenue, VenueAdapter,
-    PositionSnapshot, VenueCreds,
+    binance::BinanceAdapter, bybit::BybitAdapter, okx::OkxAdapter, paper::PaperVenue,
+    PositionSnapshot, VenueAdapter, VenueCreds,
 };
 use dca_kernel::{SimulationStepper, StepperConfig};
 use dca_math::fraction::Fraction;
@@ -14,6 +14,35 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 
+/// Insert into a time-bounded cache while enforcing a hard entry ceiling.
+/// Expired entries are removed first; when still full, the oldest entry is
+/// evicted so arbitrary query keys cannot grow process memory indefinitely.
+pub fn insert_bounded_cache<K, V>(
+    cache: &mut HashMap<K, (i64, V)>,
+    key: K,
+    value: V,
+    now: i64,
+    ttl_ms: i64,
+    max_entries: usize,
+) where
+    K: Eq + std::hash::Hash + Clone,
+{
+    if max_entries == 0 {
+        return;
+    }
+    cache.retain(|_, (ts, _)| now.saturating_sub(*ts) < ttl_ms);
+    if !cache.contains_key(&key) && cache.len() >= max_entries {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, (ts, _))| *ts)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(key, (now, value));
+}
+
 #[derive(Debug, Clone)]
 pub struct SseEvent {
     pub event: String,
@@ -23,7 +52,7 @@ pub struct SseEvent {
 pub struct BotRuntime {
     pub bot_id: String,
     pub name: String,
-    pub mode: String,  // PAPER | LIVE
+    pub mode: String, // PAPER | LIVE
     /// Effective exchange endpoint, distinct from the order-execution path.
     /// Values include INTERNAL_PAPER, BYBIT_DEMO, BYBIT_TESTNET, OKX_DEMO,
     /// MAINNET, and UNSUPPORTED.
@@ -33,6 +62,10 @@ pub struct BotRuntime {
     pub cfg: BotConfig,
     pub interval_str: String,
     pub last_bar_ts: i64,
+    /// Idempotency cursor for funding settlements. Older snapshots infer it
+    /// from `last_bar_ts` because their cumulative funding already includes
+    /// every processed bar up to that point.
+    pub last_funding_ts: i64,
     pub stepper: SimulationStepper,
     pub engine_kind: EngineTag,
     pub credentials: Option<VenueCreds>,
@@ -342,6 +375,38 @@ pub struct LiveTrackedOrder {
 impl BotRuntime {
     pub fn snapshot_json(&self) -> serde_json::Value {
         let snap = self.engine_kind.snapshot();
+        let zero = dca_math::fraction::Fraction::zero();
+        let hedge_fees = self
+            .hedge_stepper
+            .as_ref()
+            .map(|hs| hs.cumulative_fees.clone())
+            .unwrap_or_else(|| zero.clone());
+        let hedge_funding = self
+            .hedge_stepper
+            .as_ref()
+            .map(|hs| hs.cumulative_funding.clone())
+            .unwrap_or_else(|| zero.clone());
+        let combined_fees = self
+            .stepper
+            .cumulative_fees
+            .add(&hedge_fees)
+            .unwrap_or_else(|_| self.stepper.cumulative_fees.clone());
+        let combined_funding = self
+            .stepper
+            .cumulative_funding
+            .add(&hedge_funding)
+            .unwrap_or_else(|_| self.stepper.cumulative_funding.clone());
+        let combined_realized_net = self
+            .stepper
+            .realized_net
+            .add(
+                &self
+                    .hedge_stepper
+                    .as_ref()
+                    .map(|hs| hs.realized_net.clone())
+                    .unwrap_or_else(|| zero.clone()),
+            )
+            .unwrap_or_else(|_| self.stepper.realized_net.clone());
         // Faz 24 (UI/UX Pro Max §3.1.2): net gerçekleşen (kernel tanımı:
         // gross − kapanış fees − funding) UI'ya stats içinden taşınır —
         // strategy EngineSnapshot'ında bu alan yoktur.
@@ -352,7 +417,7 @@ impl BotRuntime {
         if let Some(obj) = snap.as_object_mut() {
             obj.insert(
                 "realized_net".into(),
-                serde_json::json!(self.stepper.realized_net.to_string()),
+                serde_json::json!(combined_realized_net.to_string()),
             );
             obj.insert(
                 "position_direction".into(),
@@ -416,10 +481,12 @@ impl BotRuntime {
             "stats": snap,
             "config": serde_json::to_value(&self.cfg).unwrap_or(serde_json::Value::Null),
             "cash": self.stepper.cash.to_string(),
-            "cumulativeFees": self.stepper.cumulative_fees.to_string(),
+            "cumulativeFees": combined_fees.to_string(),
+            "hedgeCumulativeFees": hedge_fees.to_string(),
             // Faz 28 (P1-3): funding maliyeti snapshot'a çıkar — /api/summary
             // totalFunding bunu toplar; UI totalEconomicPnL'e dahil eder.
-            "cumulativeFunding": self.stepper.cumulative_funding.to_string(),
+            "cumulativeFunding": combined_funding.to_string(),
+            "hedgeCumulativeFunding": hedge_funding.to_string(),
             "marginMode": !self.stepper.cfg.is_spot,
             "leverage": self.stepper.cfg.leverage.to_string(),
             "imUsed": self.stepper.im_used.to_string(),
@@ -478,7 +545,7 @@ pub struct AppState {
     /// P4-1 haber HTTP istemcisi (8 sn zaman aşımı, beyaz-liste konaklar).
     pub news_http: reqwest::Client,
     /// P4-2 haber TR-özet önbelleği: news item id → özet (öğe başına bir kez).
-    pub news_ai_cache: Mutex<HashMap<String, String>>,
+    pub news_ai_cache: Mutex<HashMap<String, (i64, String)>>,
     /// Faz 0.2 — global kill-switch (v3 engage/release; TV ENTRY dahil durdurur).
     pub kill: Mutex<HaltState>,
     /// Faz 0.3 — global freeze (v3 realOrderGate; yalnız LIVE yeni emirler durur).
@@ -590,7 +657,7 @@ impl AppState {
     /// Faz 1.6 (B-8): kline önbelleği yazma
     pub fn set_cached_klines(&self, key: String, klines: Vec<dca_exchange::Kline>) {
         if let Ok(mut cache) = self.kline_cache.lock() {
-            cache.insert(key, (now_ms(), klines));
+            insert_bounded_cache(&mut cache, key, klines, now_ms(), 10_000, 512);
         }
     }
 
@@ -634,7 +701,9 @@ impl AppState {
             "BYBIT" if self.bybit.base_url == "https://api-demo.bybit.com" => "BYBIT_DEMO",
             "BYBIT" if self.bybit.base_url == "https://api-testnet.bybit.com" => "BYBIT_TESTNET",
             "BYBIT" => "MAINNET",
-            "BINANCE" if self.binance.base_url == "https://testnet.binance.vision" => "BINANCE_TESTNET",
+            "BINANCE" if self.binance.base_url == "https://testnet.binance.vision" => {
+                "BINANCE_TESTNET"
+            }
             "BINANCE" => "MAINNET",
             "OKX" if self.okx.is_demo => "OKX_DEMO",
             "OKX" => "MAINNET",
@@ -833,6 +902,8 @@ pub struct RuntimeSnapshot {
     pub realized_fees: Fraction,
     pub realized_net: Fraction,
     pub last_bar_ts: i64,
+    #[serde(default)]
+    pub last_funding_ts: Option<i64>,
     pub grid_bootstrapped: bool,
     pub leverage_synced: bool,
     /// Faz 5 (H-7): webhook secret kalıcı — restart sonrası TradingView
@@ -896,6 +967,7 @@ pub fn save_runtime_state(app: &AppState, bot_id: &str, rt: &BotRuntime) {
         realized_fees: rt.stepper.realized_fees.clone(),
         realized_net: rt.stepper.realized_net.clone(),
         last_bar_ts: rt.last_bar_ts,
+        last_funding_ts: Some(rt.last_funding_ts),
         grid_bootstrapped: rt.grid_bootstrapped,
         leverage_synced: rt.leverage_synced,
         webhook_secret: Some(rt.webhook_secret.clone()),
@@ -1188,6 +1260,7 @@ pub async fn create_runtime(
         cfg,
         interval_str: interval.to_string(),
         last_bar_ts: 0,
+        last_funding_ts: 0,
         stepper,
         engine_kind: engine,
         credentials,
@@ -1236,6 +1309,7 @@ pub async fn create_runtime(
                 rt.stepper.realized_fees = snap.realized_fees;
                 rt.stepper.realized_net = snap.realized_net;
                 rt.last_bar_ts = snap.last_bar_ts;
+                rt.last_funding_ts = snap.last_funding_ts.unwrap_or(snap.last_bar_ts);
                 rt.grid_bootstrapped = snap.grid_bootstrapped;
                 rt.leverage_synced = snap.leverage_synced;
                 if let Some(sec) = snap.webhook_secret {

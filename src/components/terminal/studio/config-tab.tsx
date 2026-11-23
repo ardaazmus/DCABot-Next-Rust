@@ -1,7 +1,7 @@
 "use client";
 
 /* Faz C — Config sekmesi (Studio gövdesinden taşındı; yalnızca prop alır). */
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -11,36 +11,47 @@ import { apiPatchBot, getBotMeta, useBotDetail } from "@/hooks/use-engine";
 import { Spinner } from "@/components/terminal/bits";
 import { fmtNum, fracToNum } from "@/lib/format";
 import { toast } from "@/hooks/use-toast";
-import type { BotConfig } from "@/lib/engine-types";
+import type { BotConfig, BotDetail } from "@/lib/engine-types";
 
 /* ---------------- Config tab ---------------- */
 
 export function ConfigTab({ botId, configHint }: { botId: string; configHint: BotConfig | null }) {
   const { bot, refetch } = useBotDetail(botId);
-  const [tp, setTp] = useState("");
-  const [slEnabled, setSlEnabled] = useState(false);
-  const [sl, setSl] = useState("");
-  const [trailing, setTrailing] = useState(false);
+  if (!bot) return <Spinner className="h-6 w-6" />;
+  return <ConfigTabForm key={botId} botId={botId} bot={bot} configHint={configHint} refetch={refetch} />;
+}
+
+function ConfigTabForm({
+  botId,
+  bot,
+  configHint,
+  refetch,
+}: {
+  botId: string;
+  bot: BotDetail;
+  configHint: BotConfig | null;
+  refetch: () => void;
+}) {
+  const initialConfig = bot.config ?? configHint ?? null;
+  const [initial] = useState(() => {
+    const cfg = initialConfig;
+    const tpPct = cfg ? (fracToNum(cfg.target_profit_pct) ?? 0.02) * 100 : 2;
+    const slPct = cfg?.stop_loss_pct != null ? (fracToNum(cfg.stop_loss_pct) ?? 0) * 100 : null;
+    return {
+      tp: tpPct > 0 ? tpPct.toFixed(2) : "2.00",
+      slEnabled: slPct != null || bot.stats.sl_price !== null,
+      sl: slPct != null && slPct > 0 ? slPct.toFixed(2) : "",
+      trailing: cfg ? cfg.trailing_enabled : bot.stats.trailing_state !== "Off",
+    };
+  });
+  const [tp, setTp] = useState(initial.tp);
+  const [slEnabled, setSlEnabled] = useState(initial.slEnabled);
+  const [sl, setSl] = useState(initial.sl);
+  const [trailing, setTrailing] = useState(initial.trailing);
   const [busy, setBusy] = useState(false);
-  const [seeded, setSeeded] = useState(false);
 
   /* M20 hint source: wizard writes deviation via saveBotMeta (localStorage) at creation. */
   const [meta] = useState(() => getBotMeta(botId));
-
-  useEffect(() => {
-    if (bot && !seeded) {
-      setSeeded(true);
-      /* Prefer the engine's stored config snapshot (15-a wire); fall back to
-         wizard's sessionStorage hint, then to sane defaults. */
-      const cfg = bot.config ?? configHint ?? null;
-      const tpPct = cfg ? (fracToNum(cfg.target_profit_pct) ?? 0.02) * 100 : 2;
-      const slPct = cfg?.stop_loss_pct != null ? (fracToNum(cfg.stop_loss_pct) ?? 0) * 100 : null;
-      setTp(tpPct > 0 ? tpPct.toFixed(2) : "2.00");
-      setSlEnabled(slPct != null || bot.stats.sl_price !== null);
-      setSl(slPct != null && slPct > 0 ? slPct.toFixed(2) : "");
-      setTrailing(cfg ? cfg.trailing_enabled : bot.stats.trailing_state !== "Off");
-    }
-  }, [bot, seeded, configHint]);
 
   const deviationPct = (() => {
     if (meta?.deviation_pct) return (fracToNum(meta.deviation_pct) ?? 0) * 100;
@@ -74,8 +85,6 @@ export function ConfigTab({ botId, configHint }: { botId: string; configHint: Bo
       setBusy(false);
     }
   };
-
-  if (!bot) return <Spinner className="h-6 w-6" />;
 
   return (
     <div className="grid max-w-2xl gap-4">

@@ -20,6 +20,10 @@ function levelColor(level: string): string {
 }
 
 export function ForensicsTraces({ botId }: { botId: string }) {
+  return <ForensicsTracesForBot key={botId} botId={botId} />;
+}
+
+function ForensicsTracesForBot({ botId }: { botId: string }) {
   const [traces, setTraces] = useState<ForensicsTrace[] | null>(null);
   const [openId, setOpenId] = useState<string | null>(null);
   const [events, setEvents] = useState<ForensicsEvent[] | null>(null);
@@ -38,11 +42,20 @@ export function ForensicsTraces({ botId }: { botId: string }) {
   }, [botId]);
 
   useEffect(() => {
-    setTraces(null);
-    setOpenId(null);
-    setEvents(null);
-    void loadTraces();
-  }, [loadTraces]);
+    let alive = true;
+    apiForensicsTraces(50)
+      .then((r) => {
+        if (!alive) return;
+        setTraces((r.traces ?? []).filter((t) => t.botId === botId));
+        setLoadError(null);
+      })
+      .catch((e) => {
+        if (alive) setLoadError(e instanceof Error ? e.message : "İzler okunamadı");
+      });
+    return () => {
+      alive = false;
+    };
+  }, [botId]);
 
   const openTrace = async (id: string) => {
     if (openId === id) {

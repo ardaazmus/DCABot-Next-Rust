@@ -24,7 +24,7 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::Json;
 use dca_math::fraction::Fraction;
-use dca_strategy::{run_backtest, BotConfig};
+use dca_strategy::{run_backtest_with_mmr, BotConfig};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -124,6 +124,16 @@ pub(crate) async fn backtest(State(app): State<Arc<AppState>>, Json(req): Json<B
     if let Some(w) = &funding_warning {
         persist_event(&app, &req.symbol, "WARN", "BACKTEST", w).await;
     }
+    let (mmr_brackets, mmr_warning): (Option<Vec<dca_math::MmrBracket>>, Option<String>) =
+        if kind.is_futures() {
+            match adapter.mmr_brackets(&req.symbol, None).await {
+                Ok(brackets) if !brackets.is_empty() => (Some(brackets), None),
+                Ok(_) => (None, Some("Borsa MMR kademesi boş döndü — likidasyon hesabı %0,5 varsayılanıyla yapıldı".into())),
+                Err(error) => (None, Some(format!("Borsa MMR kademesi alınamadı ({error}) — likidasyon hesabı %0,5 varsayılanıyla yapıldı"))),
+            }
+        } else {
+            (None, None)
+        };
     let bars_n: Vec<dca_kernel::Bar> = bars
         .iter()
         .map(|k| dca_kernel::Bar { t: k.t, o: k.o.clone(), h: k.h.clone(), l: k.l.clone(), c: k.c.clone(), v: k.v.clone() })
@@ -143,8 +153,9 @@ pub(crate) async fn backtest(State(app): State<Arc<AppState>>, Json(req): Json<B
     let inst2 = inst.clone();
     let start2 = start.clone();
     let funding2 = funding.clone();
+    let mmr2 = mmr_brackets.clone();
     let result = tokio::task::spawn_blocking(move || {
-        run_backtest(&bars_n, &inst, &cfg, start, session, &funding)
+        run_backtest_with_mmr(&bars_n, &inst, &cfg, start, session, &funding, mmr_brackets.as_deref())
     })
         .await
         .map_err(|e| err422(e.to_string()))?
@@ -152,7 +163,7 @@ pub(crate) async fn backtest(State(app): State<Arc<AppState>>, Json(req): Json<B
     let result_opt = if is_realistic {
         Some(
             tokio::task::spawn_blocking(move || {
-                run_backtest(&bars_n2, &inst2, &cfg_opt, start2, session, &funding2)
+                run_backtest_with_mmr(&bars_n2, &inst2, &cfg_opt, start2, session, &funding2, mmr2.as_deref())
             })
             .await
             .map_err(|e| err422(e.to_string()))?
@@ -188,6 +199,7 @@ pub(crate) async fn backtest(State(app): State<Arc<AppState>>, Json(req): Json<B
         "gateLogs": result.gate_logs.len(),
         // Task 18 N-5: fetch hatasında "null değil" — dürüst uyarı metni.
         "fundingWarning": funding_warning,
+        "mmrWarning": mmr_warning,
         // Task 20 L5 — makro takvim tazeliği (bayatsa Gate 7 koruması fiilen kapalı)
         "macroCalendarStale": dca_math::macro_calendar::is_stale(now_ms()),
         // Task 19 — Pine strateji uyarıları (pyramiding vb.) + realism karşılaştırması

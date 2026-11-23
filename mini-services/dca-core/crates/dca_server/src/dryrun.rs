@@ -155,7 +155,14 @@ pub async fn dryrun(
             if fetched.is_empty() {
                 return Err(err422(format!("instrument bulunamadı: {symbol} ({venue} spot)")));
             }
-            app.instruments_cache.lock().await.insert(cache_key, (crate::state::now_ms(), fetched.clone()));
+            crate::state::insert_bounded_cache(
+                &mut *app.instruments_cache.lock().await,
+                cache_key,
+                fetched.clone(),
+                crate::state::now_ms(),
+                crate::state::INSTRUMENTS_CACHE_TTL_MS,
+                256,
+            );
             fetched
         }
     };

@@ -1,8 +1,9 @@
 //! Binance spot adapter (secondary venue) — exchangeInfo, klines, signed trade.
 
 use super::{
-    KeyPermissions, Kline, OrderBook, OrderBookLevel, OrderRequest, PositionSnapshot, Ticker24h,
-    TickerSnapshot, VenueAdapter, VenueCreds, VenueOrderState, WalletSnapshot,
+    format_order_decimal, KeyPermissions, Kline, OrderBook, OrderBookLevel, OrderRequest,
+    PositionSnapshot, Ticker24h, TickerSnapshot, VenueAdapter, VenueCreds, VenueOrderState,
+    WalletSnapshot,
 };
 use dca_math::fraction::Fraction;
 use dca_math::Instrument;
@@ -413,7 +414,7 @@ impl VenueAdapter for BinanceAdapter {
                 dca_math::Side::Sell => "SELL",
             },
             if req.is_market { "MARKET" } else { "LIMIT" },
-            req.qty.to_half_even_display(8),
+            format_order_decimal(&req.qty),
             req.order_link_id
         );
         if !req.is_market {
@@ -421,7 +422,7 @@ impl VenueAdapter for BinanceAdapter {
                 "&price={}&timeInForce=GTC",
                 req.price
                     .as_ref()
-                    .map(|p| p.to_half_even_display(8))
+                    .map(format_order_decimal)
                     .unwrap_or_default()
             ));
         }

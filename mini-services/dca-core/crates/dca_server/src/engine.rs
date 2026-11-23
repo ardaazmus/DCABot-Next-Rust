@@ -28,6 +28,17 @@ pub struct PreSignals {
     pub pine_out: Option<Result<dca_pine::BarVerdict, String>>,
     pub sig_engine: Option<std::sync::Arc<dca_signals::SignalEngine>>,
     pub sig_root: Option<dca_signals::SignalNode>,
+    funding: FundingInputs,
+}
+
+#[derive(Default)]
+struct FundingInputs {
+    /// A funding-history refresh was attempted at this time. The result is
+    /// applied to BotRuntime after the network phase, while its map lock is held.
+    attempted_at: Option<i64>,
+    history: Option<Result<Vec<(i64, String)>, String>>,
+    /// One public ticker result may serve every crossed boundary in this poll.
+    ticker_rate: Option<Result<Option<String>, String>>,
 }
 
 pub async fn process_bar(
@@ -83,7 +94,7 @@ pub async fn process_bar(
     let liq_fired = check_liquidation(app, rt, bar, sse).await?;
     let _ = liq_fired;
     // 2.6) Futures funding settlement at UTC boundary crossings (M05 sign bridge)
-    check_funding(app, rt, bar, sse).await?;
+    check_funding(app, rt, bar, &pre.funding, sse).await?;
     // 2.7) TradingView webhook force-start consumption (external signal parity):
     // arms the engine so the NEXT gate evaluation bypasses start conditions.
     if rt.webhook_start_requested {
@@ -286,7 +297,7 @@ pub async fn process_bar(
                 // composite signal tree — 3Commas external-signal parity.
                 let forced = std::mem::take(&mut g.force_start_pending);
                 let trig_ok =
-                    dca_strategy::evaluate_entry_trigger(&g.cfg.entry_trigger, &c, bar.t, None)
+                    dca_strategy::evaluate_entry_trigger(&g.cfg.entry_trigger, &o, bar.t, None)
                         .unwrap_or(false);
                 let sig_ok = signal_ok.unwrap_or(true);
                 if forced || (trig_ok && sig_ok) {
@@ -300,7 +311,10 @@ pub async fn process_bar(
                         )
                         .await;
                     }
-                    g.bootstrap(&c)
+                    // The offline backtest bootstraps at the bar open; using
+                    // close here shifted every initial grid level and broke
+                    // paper/live vs backtest parity.
+                    g.bootstrap(&o)
                 } else {
                     Vec::new()
                 }
@@ -361,11 +375,10 @@ async fn check_funding(
     app: &AppState,
     rt: &mut BotRuntime,
     bar: &Bar,
+    inputs: &FundingInputs,
     sse: &broadcast::Sender<SseEvent>,
 ) -> Result<(), String> {
     const FALLBACK_INTERVAL_MS: i64 = 8 * 3600 * 1000;
-    const HISTORY_TTL_MS: i64 = 6 * 3600 * 1000; // başarılı fetch tazeliği
-    const RETRY_TTL_MS: i64 = 10 * 60 * 1000; // başarısız fetch yeniden deneme aralığı
     if rt.stepper.cfg.is_spot {
         return Ok(());
     }
@@ -378,75 +391,11 @@ async fn check_funding(
     if !main_open && !hedge_open {
         return Ok(());
     }
-    let category = if rt.cfg.kind.is_futures() {
-        "linear"
-    } else {
-        "spot"
-    };
-    let Some(adapter) = app.adapter(&rt.venue) else {
-        crate::state::persist_event(
-            app,
-            &rt.bot_id,
-            "WARN",
-            "FUNDING",
-            "venue adapter yok — funding mutabakatı atlandı",
-        )
-        .await;
-        return Ok(());
-    };
-
-    // Geçmiş cache: başarılı fetch HISTORY_TTL taze; başarısızlık RETRY_TTL
-    // sonra yeniden denenir (her bar isteği spam olmasın).
-    let now_ms = crate::state::now_ms();
-    let stale = now_ms - rt.funding_history_ok_at > HISTORY_TTL_MS;
-    let retry_due = now_ms - rt.funding_history_tried_at > RETRY_TTL_MS;
-    if rt.funding_history.is_empty() || (stale && retry_due) {
-        rt.funding_history_tried_at = now_ms;
-        match adapter.funding_history(&rt.cfg.symbol, 200).await {
-            Ok(mut v) => {
-                v.sort_by_key(|(t, _)| *t);
-                let n = v.len();
-                rt.funding_history = v;
-                rt.funding_history_ok_at = now_ms;
-                if n == 0 {
-                    crate::state::persist_event(app, &rt.bot_id, "WARN", "FUNDING", "venue funding geçmişi boş döndü — settlement'lar fallback (anlık rate) ile karşılanacak").await;
-                }
-            }
-            Err(e) => {
-                crate::state::persist_event(
-                    app,
-                    &rt.bot_id,
-                    "WARN",
-                    "FUNDING",
-                    &format!("funding geçmişi alınamadı: {e} — son bilinen kayıtlarla devam (10 dk sonra yeniden denenecek)"),
-                )
-                .await;
-            }
-        }
-    }
-
     // Interval: geçmişteki ardışık settlement aralıklarının medyanı; yetersiz
     // kayıt varsa 8h fallback (eski davranış).
-    let interval_ms = {
-        let hs = &rt.funding_history;
-        if hs.len() >= 3 {
-            let mut diffs: Vec<i64> = hs
-                .windows(2)
-                .map(|w| w[1].0 - w[0].0)
-                .filter(|d| *d > 0)
-                .collect();
-            if !diffs.is_empty() {
-                diffs.sort_unstable();
-                diffs[diffs.len() / 2]
-            } else {
-                FALLBACK_INTERVAL_MS
-            }
-        } else {
-            FALLBACK_INTERVAL_MS
-        }
-    };
+    let interval_ms = { funding_interval_ms(&rt.funding_history, FALLBACK_INTERVAL_MS) };
 
-    let prev_ts = rt.last_bar_ts.max(0);
+    let prev_ts = rt.last_bar_ts.max(rt.last_funding_ts).max(0);
     let window: Vec<(i64, String)> = rt
         .funding_history
         .iter()
@@ -454,25 +403,38 @@ async fn check_funding(
         .cloned()
         .collect();
 
+    let crossings = if interval_ms > 0 {
+        bar.t / interval_ms - prev_ts / interval_ms
+    } else {
+        0
+    };
     // Gerçek kayıt yoksa: boundary gerçekten geçilmedi olabilir (en yaygın)
     // YA DA geçmiş cache'i pencereyi kapsamıyor. Boundary sayısıyla ayırt et;
     // geçildiyse fallback anlık-rate yoluna in — hataları SESSİZ geçme.
     if window.is_empty() {
-        let crossings = if interval_ms > 0 {
-            bar.t / interval_ms - prev_ts / interval_ms
-        } else {
-            0
-        };
         if crossings <= 0 {
             return Ok(());
         }
-        let Ok(ticker) = adapter.ticker(category, &rt.cfg.symbol).await else {
-            crate::state::persist_event(app, &rt.bot_id, "WARN", "FUNDING", &format!("funding boundary geçildi ({crossings}x) ama ticker alınamadı — settlement ertelendi (P1-6: sessiz yutma yok)")).await;
-            return Ok(());
-        };
-        let Some(rate) = ticker.funding_rate else {
-            crate::state::persist_event(app, &rt.bot_id, "WARN", "FUNDING", &format!("funding boundary geçildi ({crossings}x) ama ticker'da rate yok — settlement ertelendi")).await;
-            return Ok(());
+        let rate = match &inputs.ticker_rate {
+            Some(Ok(Some(rate))) => match Fraction::from_any_str(rate) {
+                Ok(rate) => rate,
+                Err(error) => {
+                    crate::state::persist_event(app, &rt.bot_id, "WARN", "FUNDING", &format!("funding boundary geçildi ({crossings}x) ama ticker rate çözülemedi: {error} — settlement ertelendi")).await;
+                    return Ok(());
+                }
+            },
+            Some(Ok(None)) => {
+                crate::state::persist_event(app, &rt.bot_id, "WARN", "FUNDING", &format!("funding boundary geçildi ({crossings}x) ama ticker'da rate yok — settlement ertelendi")).await;
+                return Ok(());
+            }
+            Some(Err(error)) => {
+                crate::state::persist_event(app, &rt.bot_id, "WARN", "FUNDING", &format!("funding boundary geçildi ({crossings}x) ama ticker alınamadı: {error} — settlement ertelendi")).await;
+                return Ok(());
+            }
+            None => {
+                crate::state::persist_event(app, &rt.bot_id, "WARN", "FUNDING", &format!("funding boundary geçildi ({crossings}x) ama kilitsiz poll fazında ticker hazırlanmamış — settlement ertelendi")).await;
+                return Ok(());
+            }
         };
         if !rate.is_zero() {
             let close = Fraction::from_decimal_str(&bar.c).map_err(|e| e.to_string())?;
@@ -486,6 +448,7 @@ async fn check_funding(
                 app,
                 rt,
                 bar,
+                bar.t,
                 &rate,
                 &close,
                 scale,
@@ -499,6 +462,7 @@ async fn check_funding(
 
     // GERÇEK mutabakat: penceredeki her settlement kaydı ayrı uygulanır.
     let close = Fraction::from_decimal_str(&bar.c).map_err(|e| e.to_string())?;
+    let mut valid_history_count = 0i64;
     for (t, rate_str) in &window {
         let Ok(rate) = Fraction::from_any_str(rate_str) else {
             crate::state::persist_event(
@@ -511,12 +475,176 @@ async fn check_funding(
             .await;
             continue;
         };
+        valid_history_count = valid_history_count.saturating_add(1);
         if rate.is_zero() {
             continue;
         }
-        apply_funding_settlement(app, rt, bar, &rate, &close, None, "history", sse).await?;
+        apply_funding_settlement(app, rt, bar, *t, &rate, &close, None, "history", sse).await?;
+    }
+    let missing_crossings = crossings.saturating_sub(valid_history_count);
+    if missing_crossings > 0 {
+        let rate = match &inputs.ticker_rate {
+            Some(Ok(Some(rate))) => match Fraction::from_any_str(rate) {
+                Ok(rate) => rate,
+                Err(error) => {
+                    crate::state::persist_event(app, &rt.bot_id, "WARN", "FUNDING", &format!("{missing_crossings} funding settlement kaydı eksik; ticker rate çözülemedi: {error} — settlement ertelendi")).await;
+                    return Ok(());
+                }
+            },
+            Some(Ok(None)) => {
+                crate::state::persist_event(app, &rt.bot_id, "WARN", "FUNDING", &format!("{missing_crossings} funding settlement kaydı eksik; ticker'da rate yok — settlement ertelendi")).await;
+                return Ok(());
+            }
+            Some(Err(error)) => {
+                crate::state::persist_event(app, &rt.bot_id, "WARN", "FUNDING", &format!("{missing_crossings} funding settlement kaydı eksik; ticker alınamadı: {error} — settlement ertelendi")).await;
+                return Ok(());
+            }
+            None => {
+                crate::state::persist_event(app, &rt.bot_id, "WARN", "FUNDING", &format!("{missing_crossings} funding settlement kaydı eksik; kilitsiz poll fazında ticker hazırlanmamış — settlement ertelendi")).await;
+                return Ok(());
+            }
+        };
+        if !rate.is_zero() {
+            let scale = Fraction::from_i64(missing_crossings);
+            apply_funding_settlement(
+                app,
+                rt,
+                bar,
+                bar.t,
+                &rate,
+                &close,
+                Some(&scale),
+                "fallback(incomplete-history)",
+                sse,
+            )
+            .await?;
+        }
     }
     Ok(())
+}
+
+fn funding_interval_ms(history: &[(i64, String)], fallback_ms: i64) -> i64 {
+    if history.len() < 3 {
+        return fallback_ms;
+    }
+    let mut diffs: Vec<i64> = history
+        .windows(2)
+        .map(|w| w[1].0.saturating_sub(w[0].0))
+        .filter(|d| *d > 0)
+        .collect();
+    if diffs.is_empty() {
+        return fallback_ms;
+    }
+    diffs.sort_unstable();
+    diffs[diffs.len() / 2]
+}
+
+async fn prepare_funding_inputs(
+    adapter: &dyn VenueAdapter,
+    symbol: &str,
+    category: &str,
+    bars: &[Kline],
+    last_bar_ts: i64,
+    interval_ms: i64,
+    now_ms: i64,
+    enabled: bool,
+    should_refresh: bool,
+    cached_history: &[(i64, String)],
+) -> FundingInputs {
+    const FALLBACK_INTERVAL_MS: i64 = 8 * 3600 * 1000;
+    if !enabled || last_bar_ts <= 0 {
+        return FundingInputs::default();
+    }
+    let closed_bars: Vec<&Kline> = bars
+        .iter()
+        .filter(|bar| bar.t > last_bar_ts && bar.t.saturating_add(interval_ms) <= now_ms)
+        .collect();
+    if closed_bars.is_empty() {
+        return FundingInputs::default();
+    }
+
+    let mut inputs = FundingInputs::default();
+    let mut usable_history = cached_history.to_vec();
+    if should_refresh {
+        inputs.attempted_at = Some(now_ms);
+        match adapter.funding_history(symbol, 200).await {
+            Ok(mut history) => {
+                history.sort_by_key(|(ts, _)| *ts);
+                history.dedup_by_key(|(ts, _)| *ts);
+                usable_history = history.clone();
+                inputs.history = Some(Ok(history));
+            }
+            Err(error) => inputs.history = Some(Err(error)),
+        }
+    }
+
+    let funding_interval = funding_interval_ms(&usable_history, FALLBACK_INTERVAL_MS);
+    let mut previous_ts = last_bar_ts.max(0);
+    let mut fallback_needed = false;
+    for bar in closed_bars {
+        let history_count = usable_history
+            .iter()
+            .filter(|(ts, rate)| {
+                *ts > previous_ts && *ts <= bar.t && Fraction::from_any_str(rate).is_ok()
+            })
+            .count() as i64;
+        let crossings = if funding_interval > 0 {
+            bar.t / funding_interval - previous_ts / funding_interval
+        } else {
+            0
+        };
+        if crossings > history_count {
+            fallback_needed = true;
+            break;
+        }
+        previous_ts = bar.t;
+    }
+    if fallback_needed {
+        inputs.ticker_rate = Some(
+            adapter
+                .ticker(category, symbol)
+                .await
+                .map(|ticker| ticker.funding_rate.map(|rate| rate.to_string())),
+        );
+    }
+    inputs
+}
+
+async fn apply_funding_inputs(app: &AppState, rt: &mut BotRuntime, inputs: &FundingInputs) {
+    let Some(attempted_at) = inputs.attempted_at else {
+        return;
+    };
+    rt.funding_history_tried_at = attempted_at;
+    match inputs.history.as_ref() {
+        Some(Ok(history)) => {
+            rt.funding_history = history.clone();
+            rt.funding_history_ok_at = attempted_at;
+            if history.is_empty() && !rt.funding_empty_warned {
+                rt.funding_empty_warned = true;
+                crate::state::persist_event(
+                    app,
+                    &rt.bot_id,
+                    "WARN",
+                    "FUNDING",
+                    "venue funding geçmişi boş döndü — settlement'lar fallback (anlık rate) ile karşılanacak",
+                )
+                .await;
+            } else if !history.is_empty() {
+                rt.funding_empty_warned = false;
+            }
+        }
+        Some(Err(error)) => {
+            crate::state::persist_event(
+                app,
+                &rt.bot_id,
+                "WARN",
+                "FUNDING",
+                &format!("funding geçmişi alınamadı: {error} — son bilinen kayıtlarla devam (10 dk sonra yeniden denenecek)"),
+            )
+            .await;
+        }
+        None => {}
+    }
 }
 
 /// Tek settlement'ın uygulanması — ana + hedge bacak, SSE FUNDING + olay kaydı.
@@ -525,6 +653,7 @@ async fn apply_funding_settlement(
     app: &AppState,
     rt: &mut BotRuntime,
     bar: &Bar,
+    settlement_ts: i64,
     rate: &Fraction,
     close: &Fraction,
     scale: Option<&Fraction>,
@@ -609,6 +738,7 @@ async fn apply_funding_settlement(
             }
         }
     }
+    rt.last_funding_ts = rt.last_funding_ts.max(settlement_ts);
     Ok(())
 }
 
@@ -660,7 +790,12 @@ async fn check_liquidation(
     bar: &Bar,
     sse: &broadcast::Sender<SseEvent>,
 ) -> Result<(), String> {
-    if rt.stepper.cfg.is_spot || rt.stepper.position.qty.is_zero() {
+    let main_open = !rt.stepper.position.qty.is_zero();
+    let hedge_open = rt
+        .hedge_stepper
+        .as_ref()
+        .is_some_and(|stepper| !stepper.position.qty.is_zero());
+    if rt.stepper.cfg.is_spot || (!main_open && !hedge_open) {
         return Ok(());
     }
     // Faz 4 (H-5): LIVE'da yerel sentez-LIQ kapanışı YOKTUR — tasfiyeyi venue
@@ -672,7 +807,7 @@ async fn check_liquidation(
     }
     // Faz 13B: hedge bacağı AYRI kernel — kendi likidasyon sınırıyla izlenir;
     // tetiklenirse YALNIZ hedge bacağı kapanır (ana bacak etkilenmez).
-    if let Some(hs) = rt.hedge_stepper.as_mut() {
+    let hedge_liquidation = if let Some(hs) = rt.hedge_stepper.as_mut() {
         if !hs.cfg.is_spot && hs.cfg.leverage > Fraction::one() {
             if let Some(hliq) = liq_price_of_stepper(hs, rt.mmr_brackets.as_ref()) {
                 let hlow = Fraction::from_decimal_str(&bar.l).map_err(|e| e.to_string())?;
@@ -691,30 +826,68 @@ async fn check_liquidation(
                         Fraction::max(&hopen, &hliq)
                     };
                     hs.cancel_pending();
-                    if let Some(hfill) = hs
-                        .force_close(&hliq_px, bar.t, "LIQ")
+                    hs.force_close(&hliq_px, bar.t, "LIQ")
                         .map_err(|e| e.to_string())?
-                    {
-                        let _ = persist_fill(app, &rt.bot_id, &hfill).await;
-                        let _ = sse.send(SseEvent {
-                            event: "LIQUIDATION".into(),
-                            data: json!({"botId": rt.bot_id, "leg": "hedge", "liqPrice": hliq_px.to_string(), "qty": hfill.qty.to_string(), "ts": bar.t}).to_string(),
-                        });
-                        crate::state::persist_event(
-                            app,
-                            &rt.bot_id,
-                            "CRITICAL",
-                            "LIQUIDATION",
-                            "hedge bacağı likide oldu (yerel simülasyon)",
-                        )
-                        .await;
-                        if let dca_strategy::EngineTag::Hedge(h) = &mut rt.engine_kind {
-                            h.hedge.as_mut().map(|l| l.force_liquidate());
-                        }
-                    }
+                        .map(|fill| (fill, hliq_px))
+                } else {
+                    None
                 }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some((hfill, hliq_px)) = hedge_liquidation {
+        let mut acts = rt.engine_kind.on_fill(&hfill);
+        if let dca_strategy::EngineTag::Hedge(hedge) = &mut rt.engine_kind {
+            if let Some(leg) = hedge.hedge.as_mut() {
+                if let Some(tp) = leg.resting_tp.take() {
+                    acts.push(dca_strategy::Action::CancelResting { id: tp.order_id });
+                }
+                leg.force_liquidate();
             }
         }
+        persist_fill(app, &rt.bot_id, &hfill).await?;
+        let _ = sse.send(SseEvent {
+            event: "FILL".into(),
+            data: json!({
+                "botId": rt.bot_id,
+                "fillKey": hfill.fill_key,
+                "orderId": hfill.order_id,
+                "role": hfill.role,
+                "side": format!("{:?}", hfill.side),
+                "kind": format!("{:?}", hfill.kind),
+                "price": hfill.price.to_string(),
+                "qty": hfill.qty.to_string(),
+                "fee": hfill.fee.to_string(),
+                "feeRole": format!("{}", hfill.fee_role),
+                "fillModel": format!("{:?}", hfill.realism),
+                "ts": hfill.ts,
+            })
+            .to_string(),
+        });
+        let _ = sse.send(SseEvent {
+            event: "LIQUIDATION".into(),
+            data: json!({"botId": rt.bot_id, "leg": "hedge", "liqPrice": hliq_px.to_string(), "qty": hfill.qty.to_string(), "ts": bar.t}).to_string(),
+        });
+        crate::state::persist_event(
+            app,
+            &rt.bot_id,
+            "CRITICAL",
+            "LIQUIDATION",
+            "hedge bacağı likide oldu (yerel simülasyon)",
+        )
+        .await;
+        for action in acts {
+            dispatch_action(app, rt, action, bar.t, sse).await?;
+        }
+    }
+    if rt.stepper.position.qty.is_zero() {
+        return Ok(());
     }
     if rt.stepper.cfg.leverage <= Fraction::one() {
         return Ok(());
@@ -2239,6 +2412,10 @@ struct PollCtx {
     need_pos_mode: bool,
     need_venue_pos_check: bool,
     local_position_exposure: bool,
+    last_bar_ts: i64,
+    funding_history: Vec<(i64, String)>,
+    funding_enabled: bool,
+    need_funding_history: bool,
     /// H-1 adim 2: sinyal/pine kararları kilitsiz Faz 2'de hesaplanır.
     entry_signal: Option<dca_signals::SignalConfig>,
     pine_script: Option<String>,
@@ -2330,6 +2507,12 @@ async fn poll_inner(
             };
         const MMR_TTL_MS: i64 = 600_000;
         let now_v = crate::state::now_ms();
+        const FUNDING_HISTORY_TTL_MS: i64 = 6 * 60 * 60 * 1000;
+        const FUNDING_RETRY_TTL_MS: i64 = 10 * 60 * 1000;
+        let funding_retry_due =
+            now_v.saturating_sub(rt.funding_history_tried_at) > FUNDING_RETRY_TTL_MS;
+        let funding_history_stale =
+            now_v.saturating_sub(rt.funding_history_ok_at) > FUNDING_HISTORY_TTL_MS;
         PollCtx {
             venue: rt.venue.clone(),
             mode: rt.mode.clone(),
@@ -2350,6 +2533,15 @@ async fn poll_inner(
                 && is_fut
                 && (rt.status == "RUNNING" || local_position_exposure),
             local_position_exposure,
+            last_bar_ts: rt.last_bar_ts,
+            funding_history: rt.funding_history.clone(),
+            funding_enabled: is_fut && !rt.stepper.cfg.is_spot,
+            need_funding_history: is_fut
+                && !rt.stepper.cfg.is_spot
+                && (local_position_exposure || rt.status == "RUNNING")
+                && rt.last_bar_ts > 0
+                && funding_retry_due
+                && (rt.funding_history.is_empty() || funding_history_stale),
             entry_signal: rt.cfg.entry_signal.clone(),
             pine_script: rt.cfg.pine_script.clone(),
             pine_inputs: rt.cfg.pine_inputs.clone(),
@@ -2383,6 +2575,20 @@ async fn poll_inner(
         .klines(category, &ctx.symbol, &iv, 60)
         .await
         .map_err(|e| e.to_string())?;
+    let interval_ms = crate::engine::iv_str_ms(&ctx.interval_str).unwrap_or(3_600_000);
+    let funding_inputs = prepare_funding_inputs(
+        market_adapter,
+        &ctx.symbol,
+        category,
+        &bars,
+        ctx.last_bar_ts,
+        interval_ms,
+        crate::state::now_ms(),
+        ctx.funding_enabled,
+        ctx.need_funding_history,
+        &ctx.funding_history,
+    )
+    .await;
 
     let mut leverage_done = false;
     let mut leverage_info: Option<String> = None;
@@ -2475,6 +2681,7 @@ async fn poll_inner(
             pine_out: None,
             sig_engine: None,
             sig_root: None,
+            funding: funding_inputs,
         }
     } else {
         let (tree_ok, sig_engine, sig_root) = match ctx.entry_signal.clone() {
@@ -2560,6 +2767,7 @@ async fn poll_inner(
             pine_out,
             sig_engine,
             sig_root,
+            funding: funding_inputs,
         }
     };
 
@@ -2609,6 +2817,7 @@ async fn poll_inner(
     // ---------------- H-1 FAZ 3: kilitli uygulama ----------------
     let mut rts = app.runtimes.lock().await;
     let rt = rts.get_mut(bot_id).ok_or("runtime not found")?;
+    apply_funding_inputs(app, rt, &pre.funding).await;
     let position_check_failed = ctx.need_venue_pos_check && venue_positions.is_none();
     let position_check_unsettled = ctx.need_venue_pos_check && sweep_has_fill;
     let position_mismatch = venue_positions
@@ -2688,7 +2897,6 @@ async fn poll_inner(
     }
     // BOT-04: henüz kapanmamış (forming) son mumu işlemeyecek —
     // sadece `bar_start + interval_ms <= now` olan kapalı barlara karar verilir.
-    let interval_ms = crate::engine::iv_str_ms(&rt.interval_str).unwrap_or(3_600_000);
     let now = crate::state::now_ms();
     // C-4 warmup: yeni kurulan / restore edilen botun imleci sıfırdan başlar;
     // ilk poll aksi halde çekilen 60 geçmiş barı "yeniden yaşar" ve bugünkü
@@ -2742,6 +2950,17 @@ async fn poll_inner(
     if strategy_blocked {
         for b in &bars {
             if b.t > rt.last_bar_ts && b.t + interval_ms <= now {
+                let bar = Bar {
+                    t: b.t,
+                    o: b.o.clone(),
+                    h: b.h.clone(),
+                    l: b.l.clone(),
+                    c: b.c.clone(),
+                    v: b.v.clone(),
+                };
+                // Paused/frozen strategies still own open exposure. Funding is
+                // account economics, so settle it before advancing the cursor.
+                check_funding(app, rt, &bar, &pre.funding, sse).await?;
                 rt.last_bar_ts = b.t;
             }
         }
@@ -2857,7 +3076,10 @@ async fn live_sweep_has_unsettled_fill(
 ) -> bool {
     for result in results {
         if let Ok(executions) = &result.executions {
-            for execution in executions.iter().filter(|execution| !execution.exec_qty.is_zero()) {
+            for execution in executions
+                .iter()
+                .filter(|execution| !execution.exec_qty.is_zero())
+            {
                 let fill_key = format!("{}-{}", execution.order_link_id, execution.exec_id);
                 if !fill_exists(app, bot_id, &fill_key).await.unwrap_or(false) {
                     return true;

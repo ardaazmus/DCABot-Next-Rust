@@ -400,17 +400,14 @@ function NumInput(props: {
   onCommit: (v: number) => void;
 }) {
   const { id, label, value, min, max, step = 1, className, onCommit } = props;
-  const [draft, setDraft] = useState<string>(String(value));
-
-  useEffect(() => {
-    setDraft(String(value));
-  }, [value]);
+  const [draft, setDraft] = useState<string | null>(null);
+  const displayValue = draft ?? String(value);
 
   const commit = () => {
-    const n = Number(draft.replace(",", "."));
+    const n = Number(displayValue.replace(",", "."));
     const next = Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : value;
     onCommit(next);
-    setDraft(String(next));
+    setDraft(null);
   };
 
   return (
@@ -425,7 +422,7 @@ function NumInput(props: {
         min={min}
         max={max}
         step={step}
-        value={draft}
+        value={displayValue}
         onChange={(e) => setDraft(e.target.value)}
         onBlur={commit}
         onKeyDown={(e) => {
@@ -854,11 +851,12 @@ export function SignalBuilder({ value, onChange, symbol, baseInterval, venue = "
   const [preview, setPreview] = useState<SignalPreviewResponse | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
+  const visiblePreview = engineOn ? preview : null;
+  const visiblePreviewError = engineOn ? previewError : null;
+  const visiblePreviewLoading = engineOn && previewLoading;
 
   useEffect(() => {
     if (!engineOn) {
-      setPreview(null);
-      setPreviewError(null);
       onPreviewChange?.(null, null);
       return;
     }
@@ -871,8 +869,9 @@ export function SignalBuilder({ value, onChange, symbol, baseInterval, venue = "
     if (!parsed.node) return;
 
     let alive = true;
-    setPreviewLoading(true);
-    (async () => {
+    void Promise.resolve().then(async () => {
+      if (!alive) return;
+      setPreviewLoading(true);
       try {
         const res = await engineFetch<SignalPreviewResponse>(
           "/api/signals/preview",
@@ -901,7 +900,7 @@ export function SignalBuilder({ value, onChange, symbol, baseInterval, venue = "
       } finally {
         if (alive) setPreviewLoading(false);
       }
-    })();
+    });
     return () => {
       alive = false;
     };
@@ -993,34 +992,34 @@ export function SignalBuilder({ value, onChange, symbol, baseInterval, venue = "
               <span className="text-[10px] font-semibold tracking-widest text-muted-foreground">
                 CANLI ÖNİZLEME
               </span>
-              {previewLoading && !preview && (
+              {visiblePreviewLoading && !visiblePreview && (
                 <span className="text-[10px] text-muted-foreground">değerleniyor…</span>
               )}
-              {!previewLoading && !preview && !previewError && (
+              {!visiblePreviewLoading && !visiblePreview && !visiblePreviewError && (
                 <span className="text-[10px] text-muted-foreground">bekleniyor…</span>
               )}
-              {previewError && !preview && (
-                <span className="text-[10px] text-muted-foreground" title={previewError}>
+              {visiblePreviewError && !visiblePreview && (
+                <span className="text-[10px] text-muted-foreground" title={visiblePreviewError}>
                   canlı önizleme yok
                 </span>
               )}
-              {preview && (
+              {visiblePreview && (
                 <Badge
                   variant="outline"
                   className={cn(
                     "text-[9px] font-semibold tracking-wide",
-                    preview.met
+                    visiblePreview.met
                       ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
                       : "border-rose-500/40 bg-rose-500/10 text-rose-400",
                   )}
                 >
-                  {preview.met ? "KOŞUL SAĞLANIYOR" : "BEKLENİYOR"}
+                  {visiblePreview.met ? "KOŞUL SAĞLANIYOR" : "BEKLENİYOR"}
                 </Badge>
               )}
             </div>
-            {preview?.leaves && preview.leaves.length > 0 && (
+            {visiblePreview?.leaves && visiblePreview.leaves.length > 0 && (
               <ul className="mt-1.5 space-y-1">
-                {preview.leaves.map((leaf, i) => (
+                {visiblePreview.leaves.map((leaf, i) => (
                   <li key={i} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px]">
                     <span className="font-mono text-slate-300">{leaf.desc}</span>
                     <span className="font-mono text-muted-foreground">

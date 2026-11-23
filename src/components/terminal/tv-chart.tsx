@@ -169,6 +169,7 @@ export function TvChart({
   const [lastClose, setLastClose] = useState<number | null>(null);
   const [hasData, setHasData] = useState(false);
   const [retryTick, setRetryTick] = useState(0);
+  const staticCandles = useMemo(() => (data == null ? [] : toCandleData(data)), [data]);
 
   /* -- chart lifecycle (client only, runs once per `compact` change) -- */
   useEffect(() => {
@@ -244,25 +245,11 @@ export function TvChart({
   useEffect(() => {
     // Task 21 — statik veri modu: backtest'in KULLANDIĞI barlar dışarıdan gelir.
     // Fetch yok, refresh yok — plot dizinleri bu pencereyle birebir hizalanır.
-    if (data !== undefined && data !== null) {
-      const candleData = toCandleData(data);
-      candleRef.current?.setData(candleData);
-      volumeRef.current?.setData(toVolumeData(data));
-      timesRef.current = candleData.map((d) => d.time);
-      setLastClose(candleData.length > 0 ? candleData[candleData.length - 1].close : null);
-      if (candleData.length === 0) {
-        setErrorMsg("Grafik verisi yok — bar penceresi boş");
-        setStatus("error");
-        setHasData(false);
-      } else {
-        setErrorMsg(null);
-        setHasData(true);
-        setStatus("ok");
-      }
-      return;
-    }
     if (data !== undefined) {
-      // data=null → açıkça veri yok (boş durum); fetch tetiklenmez.
+      const candleData = staticCandles;
+      candleRef.current?.setData(candleData);
+      volumeRef.current?.setData(toVolumeData(data ?? []));
+      timesRef.current = candleData.map((d) => d.time);
       return;
     }
 
@@ -304,7 +291,7 @@ export function TvChart({
       alive = false;
       clearInterval(t);
     };
-  }, [data, symbol, interval, bars, retryTick]);
+  }, [data, staticCandles, symbol, interval, bars, retryTick]);
 
   /* -- pine plot serileri: ana grafiğe LineSeries olarak bindirilir -- */
   const plotKey = useMemo(() => JSON.stringify(plotSeries ?? []), [plotSeries]);
@@ -419,6 +406,14 @@ export function TvChart({
       last: [...p.values].reverse().find((v) => v !== null && Number.isFinite(v)) ?? null,
     }))
     .filter((p) => p.last !== null);
+  const shownStatus = data === undefined ? status : staticCandles.length > 0 ? "ok" : "error";
+  const shownHasData = data === undefined ? hasData : staticCandles.length > 0;
+  const shownLastClose = data === undefined
+    ? lastClose
+    : staticCandles.length > 0
+      ? staticCandles[staticCandles.length - 1].close
+      : null;
+  const shownError = data === undefined ? errorMsg : staticCandles.length > 0 ? null : "Grafik verisi yok — bar penceresi boş";
 
   return (
     <div
@@ -428,13 +423,13 @@ export function TvChart({
       <div ref={containerRef} className="h-full w-full" />
       <span className="sr-only">
         {symbol} {interval} mum grafiği
-        {lastClose !== null ? `, son kapanış ${fmtFrac(lastClose)}` : ""}
+        {shownLastClose !== null ? `, son kapanış ${fmtFrac(shownLastClose)}` : ""}
         {levelCount > 0 ? `, ${levelCount} fiyat seviyesi işaretli` : ""}
         {plotLegend.length > 0 ? `, ${plotLegend.length} plot çizgisi` : ""}
         {(markers ?? []).length > 0 ? `, ${(markers ?? []).length} işlem işareti` : ""}.
       </span>
 
-      {!compact && status !== "error" && (
+      {!compact && shownStatus !== "error" && (
         <div className="pointer-events-none absolute left-2 top-2 z-10 flex items-center gap-1.5 rounded-md border border-border/60 bg-[#0b0f17]/80 px-2 py-1 text-[10px] font-medium text-muted-foreground backdrop-blur-sm">
           <span className="font-semibold text-slate-200">{symbol}</span>
           <span aria-hidden>·</span>
@@ -445,10 +440,10 @@ export function TvChart({
               AÇIKÇA etiketlemek (TZ kaydırma her günü taşırma hataları üretir). */}
           <span aria-hidden>·</span>
           <span className="text-slate-400">UTC</span>
-          {lastClose !== null && (
+          {shownLastClose !== null && (
             <>
               <span aria-hidden>·</span>
-              <span className="text-slate-200">{fmtFrac(lastClose)}</span>
+              <span className="text-slate-200">{fmtFrac(shownLastClose)}</span>
             </>
           )}
           {levelCount > 0 && (
@@ -496,7 +491,7 @@ export function TvChart({
         </div>
       )}
 
-      {status === "loading" && !hasData && (
+      {shownStatus === "loading" && !shownHasData && (
         <div
           className="absolute inset-0 z-10 flex items-center justify-center bg-[#0b0f17]/50"
           role="status"
@@ -506,12 +501,12 @@ export function TvChart({
         </div>
       )}
 
-      {status === "error" && (
+      {shownStatus === "error" && (
         <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-2 bg-[#0b0f17]/80 text-center">
           <p className={cn("text-xs font-semibold text-rose-400")}>Grafik verisi alınamadı</p>
-          {errorMsg && (
-            <p className="max-w-[85%] truncate text-[10px] text-muted-foreground" title={errorMsg}>
-              {errorMsg}
+          {shownError && (
+            <p className="max-w-[85%] truncate text-[10px] text-muted-foreground" title={shownError}>
+              {shownError}
             </p>
           )}
           {data === undefined && (

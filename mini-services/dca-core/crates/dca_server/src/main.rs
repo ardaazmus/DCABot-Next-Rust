@@ -4412,10 +4412,14 @@ async fn markets(State(app): State<Arc<AppState>>, Query(q): Query<MarketsQuery>
     // M-3: yalnız dolu yanıtlar cache'lenir — hatadan gelen boş liste TTL
     // boyunca "gerçek boş piyasa" gibi servis edilmez.
     if !list.is_empty() {
-        app.instruments_cache
-            .lock()
-            .await
-            .insert(key, (state::now_ms(), list.clone()));
+        state::insert_bounded_cache(
+            &mut *app.instruments_cache.lock().await,
+            key,
+            list.clone(),
+            state::now_ms(),
+            state::INSTRUMENTS_CACHE_TTL_MS,
+            256,
+        );
     }
     Json(json!({"instruments": list, "cached": false}))
 }
@@ -4449,10 +4453,14 @@ async fn tickers(State(app): State<Arc<AppState>>, Query(q): Query<MarketsQuery>
         "PAPER" => Vec::new(),
         _ => app.bybit.tickers_24h(&category).await.unwrap_or_default(),
     };
-    app.tickers_cache
-        .lock()
-        .await
-        .insert(key, (state::now_ms(), rows.clone()));
+    state::insert_bounded_cache(
+        &mut *app.tickers_cache.lock().await,
+        key,
+        rows.clone(),
+        state::now_ms(),
+        30_000,
+        32,
+    );
     Json(json!({"tickers": rows, "cached": false}))
 }
 
@@ -6274,10 +6282,14 @@ pub(crate) async fn get_market_news(app: &Arc<AppState>, symbol: &str) -> Value 
         "cached": false,
         "note": if sources.is_empty() { "Haber alınamadı (token yoksa CRYPTOPANIC_AUTH_TOKEN ekleyin; Binance bacağı da erişilemedi)." } else { "Başlıklar düz metindir; ham HTML taşınmaz." },
     });
-    app.news_cache
-        .lock()
-        .await
-        .insert(symbol.to_string(), (state::now_ms(), out.clone()));
+    state::insert_bounded_cache(
+        &mut *app.news_cache.lock().await,
+        symbol.to_string(),
+        out.clone(),
+        state::now_ms(),
+        300_000,
+        256,
+    );
     out
 }
 

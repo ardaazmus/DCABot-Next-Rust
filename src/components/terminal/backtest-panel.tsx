@@ -76,6 +76,12 @@ export function BacktestResultView({ result, symbol, interval }: { result: Backt
   const hasPlotChart = !!result.bars && result.bars.length > 0 && (plotSeries.length > 0 || (markers?.length ?? 0) > 0);
   return (
     <div className="space-y-4">
+      {(result.fundingWarning || result.mmrWarning) && (
+        <div className="space-y-1 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-[11px] text-amber-200" role="status">
+          {result.fundingWarning && <p><span className="font-semibold">Funding verisi:</span> {result.fundingWarning}</p>}
+          {result.mmrWarning && <p><span className="font-semibold">Bakım marjı:</span> {result.mmrWarning}</p>}
+        </div>
+      )}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 xl:grid-cols-8">
         <MetricTile label="Toplam Getiri" value={fmtPctNum(m.total_return_pct)} tone={ret >= 0 ? "emerald" : "rose"} />
         <MetricTile label="Max DD" value={fmtPctNum(m.max_drawdown_pct)} tone="rose" />

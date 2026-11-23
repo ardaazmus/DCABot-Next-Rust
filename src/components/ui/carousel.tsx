@@ -58,14 +58,21 @@ function Carousel({
     },
     plugins
   )
-  const [canScrollPrev, setCanScrollPrev] = React.useState(false)
-  const [canScrollNext, setCanScrollNext] = React.useState(false)
-
-  const onSelect = React.useCallback((api: CarouselApi) => {
-    if (!api) return
-    setCanScrollPrev(api.canScrollPrev())
-    setCanScrollNext(api.canScrollNext())
-  }, [])
+  const subscribeScrollState = React.useCallback((notify: () => void) => {
+    if (!api) return () => undefined
+    api.on("reInit", notify)
+    api.on("select", notify)
+    return () => {
+      api.off("reInit", notify)
+      api.off("select", notify)
+    }
+  }, [api])
+  const readScrollState = React.useCallback(
+    () => api ? `${Number(api.canScrollPrev())}:${Number(api.canScrollNext())}` : "0:0",
+    [api],
+  )
+  const scrollState = React.useSyncExternalStore(subscribeScrollState, readScrollState, () => "0:0")
+  const [canScrollPrev, canScrollNext] = scrollState.split(":").map((value) => value === "1")
 
   const scrollPrev = React.useCallback(() => {
     api?.scrollPrev()
@@ -92,17 +99,6 @@ function Carousel({
     if (!api || !setApi) return
     setApi(api)
   }, [api, setApi])
-
-  React.useEffect(() => {
-    if (!api) return
-    onSelect(api)
-    api.on("reInit", onSelect)
-    api.on("select", onSelect)
-
-    return () => {
-      api?.off("select", onSelect)
-    }
-  }, [api, onSelect])
 
   return (
     <CarouselContext.Provider

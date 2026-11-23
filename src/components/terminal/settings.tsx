@@ -159,8 +159,18 @@ export function SettingsView() {
     }
   }, []);
   useEffect(() => {
-    void loadBl();
-  }, [loadBl]);
+    let alive = true;
+    apiBlacklist()
+      .then((r) => {
+        if (!alive) return;
+        setBl(r.blacklist ?? []);
+        setBlError(null);
+      })
+      .catch((e) => {
+        if (alive) setBlError(e instanceof Error ? e.message : "Kara liste okunamadı");
+      });
+    return () => { alive = false; };
+  }, []);
   const addBl = async () => {
     if (!blPair.trim()) return;
     setBlBusy(true);
@@ -191,8 +201,18 @@ export function SettingsView() {
     }
   }, []);
   useEffect(() => {
-    void loadMaint();
-  }, [loadMaint]);
+    let alive = true;
+    apiMaintenance()
+      .then((r) => {
+        if (!alive) return;
+        setMaint(r);
+        setMaintNote(r.note ?? "");
+      })
+      .catch(() => {
+        /* motor kapalıysa sessiz */
+      });
+    return () => { alive = false; };
+  }, []);
   const setQuiet = async (quiet: boolean) => {
     setMaintBusy(true);
     try {
@@ -230,8 +250,23 @@ export function SettingsView() {
   }, []);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    let alive = true;
+    apiVaultKeys()
+      .then((r) => {
+        if (!alive) return;
+        setKeys(r.keys ?? []);
+        setLoadError(null);
+      })
+      .catch((e) => {
+        if (!alive) return;
+        setKeys([]);
+        setLoadError(e instanceof Error ? e.message : "Kasa okunamadı");
+      })
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
+    return () => { alive = false; };
+  }, []);
 
   const addKey = async () => {
     setBusy(true);

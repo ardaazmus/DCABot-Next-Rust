@@ -295,21 +295,20 @@ const DEFAULT_MICRO: MicroStructure = {
 };
 
 function DcaCalc({
-  marketPrice,
-  marketPriceSeq,
+  anchor,
+  onAnchorChange,
   micro,
   market,
   symbol,
   onMarketChange,
 }: {
-  marketPrice: string | null;
-  marketPriceSeq: number;
+  anchor: string;
+  onAnchorChange: (value: string) => void;
   micro: MicroStructure;
   market: "spot" | "linear";
   symbol: string;
   onMarketChange: (m: "spot" | "linear") => void;
 }) {
-  const [anchor, setAnchor] = useState("100");
   const [base, setBase] = useState("100");
   const [safety, setSafety] = useState("100");
   const [deviation, setDeviation] = useState(2);
@@ -327,15 +326,10 @@ function DcaCalc({
   const [err, setErr] = useState<string | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  /* "Piyasa Fiyatı" fetch → anchor input'una yansır (seq her fetch'te artar). */
-  useEffect(() => {
-    if (marketPrice) setAnchor(marketPrice);
-  }, [marketPrice, marketPriceSeq]);
-
   useEffect(() => {
     if (timer.current) clearTimeout(timer.current);
-    setBusy(true);
     timer.current = setTimeout(async () => {
+      setBusy(true);
       try {
         setErr(null);
         const r = await apiCalcDca({
@@ -378,7 +372,7 @@ function DcaCalc({
       <Panel title="DCA Parametreleri" icon={<CalcIcon className="h-4 w-4 text-slate-500" aria-hidden />}>
         <div className="space-y-4">
           <div className="grid grid-cols-3 gap-2">
-            <NumIn label="Anchor" value={anchor} onChange={setAnchor} />
+            <NumIn label="Anchor" value={anchor} onChange={onAnchorChange} />
             <NumIn label="Base" value={base} onChange={setBase} />
             <NumIn label="Safety" value={safety} onChange={setSafety} />
           </div>
@@ -538,8 +532,8 @@ function GridCalc({ micro }: { micro: MicroStructure }) {
 
   useEffect(() => {
     if (timer.current) clearTimeout(timer.current);
-    setBusy(true);
     timer.current = setTimeout(async () => {
+      setBusy(true);
       try {
         setErr(null);
         const lo = fracToNum(lower) ?? 0;
@@ -700,15 +694,9 @@ export function CalculatorView() {
   const [market, setMarket] = useState<"spot" | "linear">("spot");
   const [micro, setMicro] = useState<MicroStructure>(DEFAULT_MICRO);
   const [microLive, setMicroLive] = useState(false);
-  const [dcaAnchor, setDcaAnchor] = useState<string | null>(null);
-  const [anchorSeq, setAnchorSeq] = useState(0);
-  const [fetching, setFetching] = useState(false);
-
-  const applySymbol = () => {
-    const s = symbolInput.trim().toUpperCase() || "BTCUSDT";
-    setSymbolInput(s);
-    setSymbol(s);
-  };
+  const [dcaAnchor, setDcaAnchor] = useState("100");
+  const [fetching, setFetching] = useState(true);
+  const marketRequestSeq = useRef(0);
 
   /* Real instrument micro-structure (tick/step/fees) for symbol+category —
      defaults stay as fallback when the fetch fails. */
@@ -737,46 +725,58 @@ export function CalculatorView() {
   }, [symbol, market]);
 
   const fetchMarket = async () => {
+    const requestSeq = ++marketRequestSeq.current;
     setFetching(true);
     try {
       const r = await apiKlines(symbol, "1h", 1);
+      if (requestSeq !== marketRequestSeq.current) return;
       const c = r.bars?.[0]?.c;
       const v = c ? fracToNum(c) : null;
       if (v) {
         setDcaAnchor(String(v));
-        setAnchorSeq((n) => n + 1);
       } else {
         toast({ title: "Fiyat alınamadı", description: `${symbol} için kline verisi boş döndü — eski çapa korunuyor.`, variant: "destructive" });
       }
     } catch {
-      toast({ title: "Fiyat alınamadı", description: `${symbol} klines isteği başarısız — eski çapa korunuyor.`, variant: "destructive" });
+      if (requestSeq === marketRequestSeq.current) {
+        toast({ title: "Fiyat alınamadı", description: `${symbol} klines isteği başarısız — eski çapa korunuyor.`, variant: "destructive" });
+      }
     } finally {
-      setFetching(false);
+      if (requestSeq === marketRequestSeq.current) setFetching(false);
     }
+  };
+
+  const applySymbol = () => {
+    const s = symbolInput.trim().toUpperCase() || "BTCUSDT";
+    setSymbolInput(s);
+    marketRequestSeq.current += 1;
+    setFetching(true);
+    setSymbol(s);
+    if (s === symbol) void fetchMarket();
   };
 
   /* Fetch the live price on mount and on symbol change — anchor follows. */
   useEffect(() => {
+    const requestSeq = ++marketRequestSeq.current;
     let alive = true;
-    setFetching(true);
     apiKlines(symbol, "1h", 1)
       .then((r) => {
-        if (!alive) return;
+        if (!alive || requestSeq !== marketRequestSeq.current) return;
         const c = r.bars?.[0]?.c;
         const v = c ? fracToNum(c) : null;
         if (v) {
           setDcaAnchor(String(v));
-          setAnchorSeq((n) => n + 1);
         }
       })
       .catch(() => {
-        if (alive) toast({ title: "Fiyat alınamadı", description: `${symbol} klines isteği başarısız — eski çapa korunuyor.`, variant: "destructive" });
+        if (alive && requestSeq === marketRequestSeq.current) toast({ title: "Fiyat alınamadı", description: `${symbol} klines isteği başarısız — eski çapa korunuyor.`, variant: "destructive" });
       })
       .finally(() => {
-        if (alive) setFetching(false);
+        if (alive && requestSeq === marketRequestSeq.current) setFetching(false);
       });
     return () => {
       alive = false;
+      if (marketRequestSeq.current === requestSeq) marketRequestSeq.current += 1;
     };
   }, [symbol]);
 
@@ -833,7 +833,7 @@ export function CalculatorView() {
           </TabsTrigger>
         </TabsList>
         <TabsContent value="dca" className="mt-4">
-          <DcaCalc marketPrice={dcaAnchor} marketPriceSeq={anchorSeq} micro={micro} market={market} symbol={symbol} onMarketChange={setMarket} />
+          <DcaCalc anchor={dcaAnchor} onAnchorChange={setDcaAnchor} micro={micro} market={market} symbol={symbol} onMarketChange={setMarket} />
         </TabsContent>
         <TabsContent value="grid" className="mt-4">
           <GridCalc micro={micro} />

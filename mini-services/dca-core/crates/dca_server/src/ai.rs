@@ -789,11 +789,18 @@ pub struct NewsAiBody {
 }
 
 pub async fn news_ai(State(app): State<Arc<AppState>>, Json(body): Json<NewsAiBody>) -> impl IntoResponse {
+    const NEWS_AI_CACHE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
     if body.id.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({"ok": false, "reason": "id zorunlu"})));
     }
     // Önbellek: bir kez üretilen özet saklanır.
-    if let Some(s) = app.news_ai_cache.lock().await.get(body.id.trim()).cloned() {
+    let cached_summary = {
+        let mut cache = app.news_ai_cache.lock().await;
+        let now = crate::state::now_ms();
+        cache.retain(|_, (at, _)| now.saturating_sub(*at) < NEWS_AI_CACHE_TTL_MS);
+        cache.get(body.id.trim()).map(|(_, summary)| summary.clone())
+    };
+    if let Some(s) = cached_summary {
         return (StatusCode::OK, Json(json!({"ok": true, "summaryTr": s, "reason": Value::Null, "cached": true})));
     }
     // Öğeyi haber önbelleğinde bul.
@@ -824,7 +831,14 @@ pub async fn news_ai(State(app): State<Arc<AppState>>, Json(body): Json<NewsAiBo
         None => return (StatusCode::OK, Json(json!({"ok": false, "summaryTr": Value::Null, "reason": "Haber bulunamadı (önce /api/market/news çağırın)", "cached": false}))),
     };
     if let Some(prev) = cached_mark.strip_prefix("CACHED:") {
-        app.news_ai_cache.lock().await.insert(body.id.trim().to_string(), prev.to_string());
+        crate::state::insert_bounded_cache(
+            &mut *app.news_ai_cache.lock().await,
+            body.id.trim().to_string(),
+            prev.to_string(),
+            crate::state::now_ms(),
+            NEWS_AI_CACHE_TTL_MS,
+            5_000,
+        );
         return (StatusCode::OK, Json(json!({"ok": true, "summaryTr": prev, "reason": Value::Null, "cached": true})));
     }
     if title.trim().is_empty() {
@@ -841,7 +855,14 @@ pub async fn news_ai(State(app): State<Arc<AppState>>, Json(body): Json<NewsAiBo
             if line.is_empty() {
                 return (StatusCode::OK, Json(json!({"ok": false, "summaryTr": Value::Null, "reason": "Model yanıtı boş — sahte özet üretilmedi", "cached": false})));
             }
-            app.news_ai_cache.lock().await.insert(body.id.trim().to_string(), line.clone());
+            crate::state::insert_bounded_cache(
+                &mut *app.news_ai_cache.lock().await,
+                body.id.trim().to_string(),
+                line.clone(),
+                crate::state::now_ms(),
+                NEWS_AI_CACHE_TTL_MS,
+                5_000,
+            );
             // Haber önbelleğindeki öğeye de işle (sonraki /news yanıtları taşır).
             {
                 let mut cache = app.news_cache.lock().await;

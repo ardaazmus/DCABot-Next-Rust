@@ -70,7 +70,14 @@ pub fn resample(bars: &[BarData], bucket_ms: i64) -> Vec<BarData> {
                 last.c = b.c;
                 last.v += b.v;
             }
-            _ => out.push(BarData { t: bt, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v }),
+            _ => out.push(BarData {
+                t: bt,
+                o: b.o,
+                h: b.h,
+                l: b.l,
+                c: b.c,
+                v: b.v,
+            }),
         }
     }
     out
@@ -79,10 +86,18 @@ pub fn resample(bars: &[BarData], bucket_ms: i64) -> Vec<BarData> {
 /// Build the signal engine for a backtest run: the bot interval plus every
 /// higher timeframe referenced by the tree (lower TFs are rejected — we only
 /// have bot-interval bars; zero look-ahead cannot be guaranteed for them).
-pub fn build_backtest_signal(bars: &[Bar], root: &dca_signals::SignalNode) -> Result<(SignalEngine, i64), String> {
+pub fn build_backtest_signal(
+    bars: &[Bar],
+    root: &dca_signals::SignalNode,
+) -> Result<(SignalEngine, i64), String> {
     dca_signals::validate_signal_node(root)?;
-    let bot_ms = if bars.len() >= 2 { bars[1].t - bars[0].t } else { return Err("backtest: en az 2 bar gerekli".into()) };
-    let bot_tf = tf_from_ms(bot_ms).ok_or_else(|| format!("backtest: desteklenmeyen bar aralığı ({bot_ms} ms)"))?;
+    let bot_ms = if bars.len() >= 2 {
+        bars[1].t - bars[0].t
+    } else {
+        return Err("backtest: en az 2 bar gerekli".into());
+    };
+    let bot_tf = tf_from_ms(bot_ms)
+        .ok_or_else(|| format!("backtest: desteklenmeyen bar aralığı ({bot_ms} ms)"))?;
     let base = bars_to_signal(bars);
     let mut needed: Vec<Timeframe> = SignalEngine::timeframes_needed(root);
     needed.retain(|t| *t != bot_tf);
@@ -211,6 +226,21 @@ pub fn run_backtest(
     session: dca_math::sessions::SessionType,
     funding: &[(i64, String)],
 ) -> Result<BacktestResult, String> {
+    run_backtest_with_mmr(bars, inst, cfg, start_cash, session, funding, None)
+}
+
+/// Backtest with venue maintenance-margin tiers. The compatibility entry point
+/// above keeps offline callers working and uses the documented conservative
+/// fallback when no venue tier snapshot is available.
+pub fn run_backtest_with_mmr(
+    bars: &[Bar],
+    inst: &Instrument,
+    cfg: &BotConfig,
+    start_cash: Fraction,
+    session: dca_math::sessions::SessionType,
+    funding: &[(i64, String)],
+    mmr_brackets: Option<&[dca_math::MmrBracket]>,
+) -> Result<BacktestResult, String> {
     let margin_mode = !cfg.kind.is_futures(); // is_spot flag: futures kinds trade linear margin
     let stepper_lev = if margin_mode {
         Fraction::one()
@@ -230,7 +260,11 @@ pub fn run_backtest(
             ..Default::default()
         },
     );
-    let pos_dir: i8 = if cfg.kind.direction() == Some(dca_math::m02::Direction::Short) { -1 } else { 1 };
+    let pos_dir: i8 = if cfg.kind.direction() == Some(dca_math::m02::Direction::Short) {
+        -1
+    } else {
+        1
+    };
     stepper.set_position_direction(pos_dir);
     // Composite signal tree (3Commas-style): precompute per-TF series once;
     // per-bar evaluation is timestamp-guarded so future bars never leak back.
@@ -242,7 +276,11 @@ pub fn run_backtest(
     // zero look-ahead garantilidir (bar i kararı yalnız i'ye kadar barları görür).
     let pine_res = match &cfg.pine_script {
         Some(code) => {
-            let inputs: dca_pine::PineInputs = cfg.pine_inputs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let inputs: dca_pine::PineInputs = cfg
+                .pine_inputs
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
             Some(dca_pine::run_all(code, bars, &inputs)?)
         }
         None => None,
@@ -250,7 +288,10 @@ pub fn run_backtest(
 
     // Faz 13B-backtest: hedge türleri İKİ stepper ile koşar — ana (yön +1) ve
     // hedge (yön −1) bacakların kernel defterleri canlıdaki gibi ayrıdır (EX-06).
-    let is_hedge_kind = matches!(cfg.kind, StrategyKind::HedgeProtective | StrategyKind::HedgeDual);
+    let is_hedge_kind = matches!(
+        cfg.kind,
+        StrategyKind::HedgeProtective | StrategyKind::HedgeDual
+    );
     let mut hedge_stepper: Option<SimulationStepper> = if is_hedge_kind {
         let mut hs = SimulationStepper::new(
             inst.clone(),
@@ -271,7 +312,8 @@ pub fn run_backtest(
     };
     let mut engine: EngineBox = match cfg.kind {
         StrategyKind::SpotGrid | StrategyKind::FuturesGrid | StrategyKind::InfinityGrid => {
-            let mark0 = Fraction::from_decimal_str(&bars.first().ok_or("no bars")?.c).map_err(|e| e.to_string())?;
+            let mark0 = Fraction::from_decimal_str(&bars.first().ok_or("no bars")?.c)
+                .map_err(|e| e.to_string())?;
             EngineBox::Grid(GridEngine::new("bt", cfg.clone(), inst.clone(), &mark0)?)
         }
         StrategyKind::HedgeProtective | StrategyKind::HedgeDual => {
@@ -294,7 +336,8 @@ pub fn run_backtest(
     let mut dd_state = DrawdownState::default();
     let mut all_fills = Vec::new();
     let mut start_equity: Option<Fraction> = None;
-    let mut grid_level_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut grid_level_map: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
     // Funding ledger (futures only): ascending events of (ts, rate).
     let mut funding_events: Vec<(i64, Fraction)> = funding
@@ -302,14 +345,19 @@ pub fn run_backtest(
         .filter_map(|(ts, r)| Fraction::from_any_str(r).ok().map(|f| (*ts, f)))
         .collect();
     funding_events.sort_by_key(|x| x.0);
-    let mut f_cursor = 0usize;
-    let mut f_cursor_h = 0usize;
+    // The bot has no position before the supplied bar window begins. Ignore
+    // older venue history so it cannot be charged on the first in-window fill.
+    let first_bar_ts = bars.first().map(|bar| bar.t).unwrap_or(i64::MAX);
+    let first_funding_event = funding_events.partition_point(|(ts, _)| *ts < first_bar_ts);
+    let mut f_cursor = first_funding_event;
+    let mut f_cursor_h = first_funding_event;
     let mut total_funding = Fraction::zero();
     let mut prev_bar_t: Option<i64> = None;
     // Task 16 — günlük DD devre kesici (spec 2.9): UTC gün başına eşik.
     // Task 18 N-1: eşik yüzde string'i → fraksiyona (/100) çevrilir; 0 = kapalı.
     let breaker_active = cfg.risk_policy.daily_dd_breaker_active();
-    let breaker_threshold = dca_risk::daily_dd_breaker_threshold(&cfg.risk_policy.daily_dd_breaker_pct);
+    let breaker_threshold =
+        dca_risk::daily_dd_breaker_threshold(&cfg.risk_policy.daily_dd_breaker_pct);
     let mut breaker_day: i64 = -1;
     let mut breaker_day_start_eq: Option<Fraction> = None;
     let mut breaker_tripped = false;
@@ -339,22 +387,161 @@ pub fn run_backtest(
         };
 
         let fills = stepper.step(bar, bar.t, false).map_err(|e| e.to_string())?;
+        // Match runtime sequencing: each leg's fill callback and any resulting
+        // local cascade run immediately after that leg is stepped.
+        for fill in &fills {
+            sync_grid_levels(&engine, &mut grid_level_map);
+            let acts = match &mut engine {
+                EngineBox::Dca(e) => e.on_fill(fill),
+                EngineBox::Grid(g) => {
+                    let map = grid_level_map.clone();
+                    g.on_fill(fill, move |id| map.get(id).copied())
+                }
+                EngineBox::Hedge(h) => h.on_fill_leg(fill),
+            };
+            for action in acts {
+                dispatch_leg(&mut stepper, hedge_stepper.as_mut(), action, bar.t)?;
+            }
+        }
+        all_fills.extend(fills);
         // Faz 13B-backtest: hedge bacak stepper'ı AYRI kernel olarak step edilir
         // ve fill'leri prefix routing'iyle EngineBox::Hedge'e iletilir.
         let hedge_fills = match hedge_stepper.as_mut() {
             Some(hs) => hs.step(bar, bar.t, false).map_err(|e| e.to_string())?,
             None => Vec::new(),
         };
+        for fill in &hedge_fills {
+            let acts = match &mut engine {
+                EngineBox::Hedge(h) => h.on_fill_leg(fill),
+                _ => Vec::new(),
+            };
+            for action in acts {
+                dispatch_leg(&mut stepper, hedge_stepper.as_mut(), action, bar.t)?;
+            }
+        }
+        all_fills.extend(hedge_fills);
 
-        // Task 16 — rejim sınıflandırma (zero look-ahead: yalnız kapalı barlar).
+        // Runtime liquidation checks the hedge leg first, then the main leg.
+        // Both legs use the venue's maintenance tiers when available.
+        if let Some(hs) = hedge_stepper.as_mut() {
+            if let Some(fill) = liquidation_fill(hs, bar.t, &o, &h, &l, mmr_brackets)? {
+                all_fills.push(fill.clone());
+                if let EngineBox::Hedge(hedge) = &mut engine {
+                    let mut actions = hedge.on_fill_leg(&fill);
+                    if let Some(leg) = hedge.hedge.as_mut() {
+                        if let Some(tp) = leg.resting_tp.take() {
+                            actions.push(Action::CancelResting { id: tp.order_id });
+                        }
+                        leg.force_liquidate();
+                    }
+                    for action in actions {
+                        dispatch_leg(&mut stepper, hedge_stepper.as_mut(), action, bar.t)?;
+                    }
+                }
+            }
+        }
+        if let Some(fill) = liquidation_fill(&mut stepper, bar.t, &o, &h, &l, mmr_brackets)? {
+            all_fills.push(fill.clone());
+            let acts = match &mut engine {
+                EngineBox::Dca(e) => {
+                    let mut actions = e.on_fill(&fill);
+                    if let Some(tp) = e.resting_tp.take() {
+                        actions.push(Action::CancelResting { id: tp.order_id });
+                    }
+                    e.force_liquidate();
+                    actions
+                }
+                EngineBox::Grid(_) => Vec::new(),
+                EngineBox::Hedge(hedge) => {
+                    let mut actions = hedge.on_fill_leg(&fill);
+                    if let Some(tp) = hedge.main.resting_tp.take() {
+                        actions.push(Action::CancelResting { id: tp.order_id });
+                    }
+                    hedge.main.force_liquidate();
+                    actions
+                }
+            };
+            for action in acts {
+                dispatch_leg(&mut stepper, hedge_stepper.as_mut(), action, bar.t)?;
+            }
+        }
+
+        // Funding settlement — every boundary event inside (prev_bar_t, bar.t]
+        // charges rate * notional while a position is open (mark ≈ bar close).
+        while f_cursor < funding_events.len()
+            && funding_events[f_cursor].0 <= prev_bar_t.unwrap_or(0)
+        {
+            f_cursor += 1; // events already behind the window
+        }
+        if !stepper.cfg.is_spot && !stepper.position.qty.is_zero() {
+            let mut applied = Fraction::zero();
+            while f_cursor < funding_events.len() && funding_events[f_cursor].0 <= bar.t {
+                let (fts, rate) = funding_events[f_cursor].clone();
+                let _ = fts;
+                let notional = stepper.position.qty.mul(&c).map_err(|e| e.to_string())?;
+                let dir = Fraction::from_i64(stepper.position.direction as i64);
+                let expense = rate
+                    .mul(&notional)
+                    .map_err(|e| e.to_string())?
+                    .mul(&dir)
+                    .map_err(|e| e.to_string())?;
+                stepper.apply_funding_expense(&expense);
+                if let EngineBox::Dca(e) = &mut engine {
+                    e.apply_funding(&expense);
+                }
+                applied = applied.add(&expense).unwrap_or_else(|_| applied.clone());
+                f_cursor += 1;
+            }
+            if !applied.is_zero() {
+                total_funding = total_funding
+                    .add(&applied)
+                    .unwrap_or_else(|_| total_funding.clone());
+            }
+        }
+        // Faz 13B-backtest: hedge bacağı AYRI kernel — kendi notional'iyle settlement.
+        // Advance past settlements that happened before the hedge position
+        // existed; the main-leg cursor already enforces this same lower bound.
+        while f_cursor_h < funding_events.len()
+            && funding_events[f_cursor_h].0 <= prev_bar_t.unwrap_or(0)
+        {
+            f_cursor_h += 1;
+        }
+        if let Some(hs) = hedge_stepper.as_mut() {
+            if !hs.cfg.is_spot && !hs.position.qty.is_zero() {
+                let mut happlied = Fraction::zero();
+                while f_cursor_h < funding_events.len() && funding_events[f_cursor_h].0 <= bar.t {
+                    let (_, rate) = funding_events[f_cursor_h].clone();
+                    let notional = hs.position.qty.mul(&c).map_err(|e| e.to_string())?;
+                    let dir = Fraction::from_i64(hs.position.direction as i64);
+                    let expense = rate
+                        .mul(&notional)
+                        .map_err(|e| e.to_string())?
+                        .mul(&dir)
+                        .map_err(|e| e.to_string())?;
+                    hs.apply_funding_expense(&expense);
+                    if let EngineBox::Hedge(h) = &mut engine {
+                        if let Some(hleg) = h.hedge.as_mut() {
+                            hleg.apply_funding(&expense);
+                        }
+                    }
+                    happlied = happlied.add(&expense).unwrap_or_else(|_| happlied.clone());
+                    f_cursor_h += 1;
+                }
+                if !happlied.is_zero() {
+                    total_funding = total_funding
+                        .add(&happlied)
+                        .unwrap_or_else(|_| total_funding.clone());
+                }
+            }
+        }
+
+        // Runtime updates its closed-bar regime and daily breaker after fills,
+        // liquidation and funding have changed the account state.
         regime_closes.push(c.to_f64_display());
         if regime_closes.len() > 200 {
             regime_closes.remove(0);
         }
         let regime = dca_signals::classify_regime(&regime_closes);
-
-        // Task 16 — günlük DD devre kesici: UTC günü değişince çapa sıfırlanır;
-        // eşik aşılırsa bugün yeni deal açılışı bloklanır (TP/SL etkilenmez).
         let day = bar.t / 86_400_000;
         if day != breaker_day {
             breaker_day = day;
@@ -377,172 +564,6 @@ pub fn run_backtest(
                 }
             }
         }
-
-        // Futures margin guard — M07 liquidation inside the bar's range.
-        if !stepper.cfg.is_spot && stepper.cfg.leverage > Fraction::one() && !stepper.position.qty.is_zero() {
-            if let (Some(avg), true) = (stepper.position.avg_price.clone(), true) {
-                let qty = stepper.position.qty.clone();
-                let brackets = vec![dca_math::MmrBracket {
-                    min_notional: Fraction::zero(),
-                    max_notional: Fraction::from_u64(u64::MAX),
-                    mmr: Fraction::from_decimal_str("0.005").unwrap(),
-                    deduction: Fraction::zero(),
-                }];
-                if let Ok(Some(liq)) = liquidation_price(stepper.position.direction, &qty, &avg, &stepper.im_used, &brackets, &Fraction::zero()) {
-                    let lo = Fraction::from_decimal_str(&bar.l).map_err(|e| e.to_string())?;
-                    let hi = Fraction::from_decimal_str(&bar.h).map_err(|e| e.to_string())?;
-                    let op = Fraction::from_decimal_str(&bar.o).map_err(|e| e.to_string())?;
-                    let crossed = if stepper.position.direction == 1 { lo <= liq } else { hi >= liq };
-                    if crossed {
-                        let liq_px = if stepper.position.direction == 1 { Fraction::min(&op, &liq) } else { Fraction::max(&op, &liq) };
-                        stepper.cancel_pending();
-                        if let Some(fill) = stepper.force_close(&liq_px, bar.t, "LIQ").map_err(|e| e.to_string())? {
-                            all_fills.push(fill.clone());
-                            let acts = match &mut engine {
-                                EngineBox::Dca(e) => {
-                                    e.on_fill(&fill);
-                                    e.force_liquidate();
-                                    Vec::new()
-                                }
-                                EngineBox::Grid(_) => Vec::new(),
-                                EngineBox::Hedge(h) => {
-                                    // Faz 13B: ana bacak LIQ — hedge bacağı kendi
-                                    // stepper'ıyla izlenmeye devam eder.
-                                    h.on_fill_leg(&fill);
-                                    h.main.force_liquidate();
-                                    Vec::new()
-                                }
-                            };
-                            for a in acts {
-                                dispatch_leg(&mut stepper, hedge_stepper.as_mut(), a, bar.t)?;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if !bootstrap_done {
-            match &mut engine {
-                EngineBox::Grid(g) => {
-                    // Start-condition gate: mesh orders wait until the trigger passes
-                    // AND the composite signal tree is satisfied (fail-closed).
-                    // Task 22 — hangi alt-koşulun takıldığı sayılır (no-deal nedeni).
-                    let trigger_ok = crate::evaluate_entry_trigger(&g.cfg.entry_trigger, &o, bar.t, None).unwrap_or(false);
-                    let signal_pass = signal_ok.unwrap_or(true);
-                    if !trigger_ok {
-                        grid_miss_trigger_bars += 1;
-                    }
-                    if !signal_pass {
-                        grid_miss_signal_bars += 1;
-                    }
-                    if trigger_ok && signal_pass {
-                        let boot_acts = g.bootstrap(&o);
-                        sync_grid_levels(&engine, &mut grid_level_map);
-                        for a in boot_acts {
-                            dispatch_leg(&mut stepper, hedge_stepper.as_mut(), a, bar.t)?;
-                        }
-                        bootstrap_done = true;
-                    }
-                }
-                EngineBox::Dca(_) => {
-                    bootstrap_done = true; // DCA engines gate internally
-                }
-                EngineBox::Hedge(_) => {
-                    bootstrap_done = true; // hedge engines gate internally
-                }
-            }
-        }
-
-        // Funding settlement — every boundary event inside (prev_bar_t, bar.t]
-        // charges rate * notional while a position is open (mark ≈ bar close).
-        while f_cursor < funding_events.len()
-            && funding_events[f_cursor].0 <= prev_bar_t.unwrap_or(0)
-        {
-            f_cursor += 1; // events already behind the window
-        }
-        if !stepper.cfg.is_spot && !stepper.position.qty.is_zero() {
-            let mut applied = Fraction::zero();
-            while f_cursor < funding_events.len() && funding_events[f_cursor].0 <= bar.t {
-                let (fts, rate) = funding_events[f_cursor].clone();
-                let _ = fts;
-                let notional = stepper
-                    .position
-                    .qty
-                    .mul(&c)
-                    .map_err(|e| e.to_string())?;
-                let dir = Fraction::from_i64(stepper.position.direction as i64);
-                let expense = rate
-                    .mul(&notional)
-                    .map_err(|e| e.to_string())?
-                    .mul(&dir)
-                    .map_err(|e| e.to_string())?;
-                stepper.apply_funding_expense(&expense);
-                if let EngineBox::Dca(e) = &mut engine {
-                    e.apply_funding(&expense);
-                }
-                applied = applied.add(&expense).unwrap_or_else(|_| applied.clone());
-                f_cursor += 1;
-            }
-            if !applied.is_zero() {
-                total_funding = total_funding.add(&applied).unwrap_or_else(|_| total_funding.clone());
-            }
-        }
-        // Faz 13B-backtest: hedge bacağı AYRI kernel — kendi notional'iyle settlement.
-        if let Some(hs) = hedge_stepper.as_mut() {
-            if !hs.cfg.is_spot && !hs.position.qty.is_zero() {
-                let mut happlied = Fraction::zero();
-                while f_cursor_h < funding_events.len() && funding_events[f_cursor_h].0 <= bar.t {
-                    let (_, rate) = funding_events[f_cursor_h].clone();
-                    let notional = hs.position.qty.mul(&c).map_err(|e| e.to_string())?;
-                    let dir = Fraction::from_i64(hs.position.direction as i64);
-                    let expense = rate.mul(&notional).map_err(|e| e.to_string())?.mul(&dir).map_err(|e| e.to_string())?;
-                    hs.apply_funding_expense(&expense);
-                    if let EngineBox::Hedge(h) = &mut engine {
-                        if let Some(hleg) = h.hedge.as_mut() {
-                            hleg.apply_funding(&expense);
-                        }
-                    }
-                    happlied = happlied.add(&expense).unwrap_or_else(|_| happlied.clone());
-                    f_cursor_h += 1;
-                }
-                if !happlied.is_zero() {
-                    total_funding = total_funding.add(&happlied).unwrap_or_else(|_| total_funding.clone());
-                }
-            }
-        }
-
-        for fill in &fills {
-            // Grid fills resolve their mesh level from the engine's own
-            // id → level registry (kept in sync — offsets emitted by a previous
-            // fill are registered at creation time).
-            sync_grid_levels(&engine, &mut grid_level_map);
-            let acts = match &mut engine {
-                EngineBox::Dca(e) => e.on_fill(fill),
-                EngineBox::Grid(g) => {
-                    let map = grid_level_map.clone();
-                    g.on_fill(fill, move |id| map.get(id).copied())
-                }
-                EngineBox::Hedge(h) => h.on_fill_leg(fill),
-            };
-            for a in acts {
-                dispatch_leg(&mut stepper, hedge_stepper.as_mut(), a, bar.t)?;
-            }
-        }
-        all_fills.extend(fills);
-
-        // Faz 13B-backtest: hedge bacak fill'leri EngineBox::Hedge'e (on_fill_leg
-        // prefix routing'iyle) iletilir ve cascade eylemleri hedge stepper'ına dispatch.
-        for fill in &hedge_fills {
-            let acts = match &mut engine {
-                EngineBox::Hedge(h) => h.on_fill_leg(fill),
-                _ => Vec::new(),
-            };
-            for a in acts {
-                dispatch_leg(&mut stepper, hedge_stepper.as_mut(), a, bar.t)?;
-            }
-        }
-        all_fills.extend(hedge_fills);
 
         let ctx = BarContext {
             bar,
@@ -613,6 +634,36 @@ pub fn run_backtest(
             stepper.log_advisory_pub(bar.t, "PINE", "PINE_EXIT", detail);
         }
 
+        // Runtime calls the strategy decision before the grid's initial mesh
+        // placement. Match that order and use the same open-price reference.
+        if !bootstrap_done {
+            match &mut engine {
+                EngineBox::Grid(g) => {
+                    let trigger_ok =
+                        crate::evaluate_entry_trigger(&g.cfg.entry_trigger, &o, bar.t, None)
+                            .unwrap_or(false);
+                    let signal_pass = signal_ok.unwrap_or(true);
+                    if !trigger_ok {
+                        grid_miss_trigger_bars += 1;
+                    }
+                    if !signal_pass {
+                        grid_miss_signal_bars += 1;
+                    }
+                    if trigger_ok && signal_pass {
+                        let boot_acts = g.bootstrap(&o);
+                        sync_grid_levels(&engine, &mut grid_level_map);
+                        for action in boot_acts {
+                            dispatch_leg(&mut stepper, hedge_stepper.as_mut(), action, bar.t)?;
+                        }
+                        bootstrap_done = true;
+                    }
+                }
+                EngineBox::Dca(_) | EngineBox::Hedge(_) => {
+                    bootstrap_done = true;
+                }
+            }
+        }
+
         let mut eq = stepper.equity(&c).map_err(|e| e.to_string())?;
         // Arena 1.5 Düzeltmesi: Hedge bacağının equity'si tam start_cash içerir.
         // İki bacağın start_cash'i toplanmaz; hedge bacağının net PnL katkısı (equity - start_cash) eklenir.
@@ -623,7 +674,10 @@ pub fn run_backtest(
         }
         start_equity.get_or_insert_with(|| eq.clone());
         update_drawdown(&mut dd_state, &eq).map_err(|e| e.to_string())?;
-        equity_curve.push(EquityPoint { ts: bar.t, equity: eq.to_string() });
+        equity_curve.push(EquityPoint {
+            ts: bar.t,
+            equity: eq.to_string(),
+        });
         prev_bar_t = Some(bar.t);
     }
 
@@ -646,9 +700,15 @@ pub fn run_backtest(
         .last()
         .map(|p| Fraction::from_any_str(&p.equity).unwrap_or_else(|_| start.clone()))
         .unwrap_or_else(|| start.clone());
-    let total_return = end.sub(&start).map_err(|e| e.to_string())?.div(&start).map_err(|e| e.to_string())?;
+    let total_return = end
+        .sub(&start)
+        .map_err(|e| e.to_string())?
+        .div(&start)
+        .map_err(|e| e.to_string())?;
     let win_rate = if deals > 0 {
-        Fraction::from_u64(wins as u64).div(&Fraction::from_u64(deals as u64)).map_err(|e| e.to_string())?
+        Fraction::from_u64(wins as u64)
+            .div(&Fraction::from_u64(deals as u64))
+            .map_err(|e| e.to_string())?
     } else {
         Fraction::zero()
     };
@@ -664,7 +724,11 @@ pub fn run_backtest(
     let mut no_deal_reasons: Vec<NoDealReason> = Vec::new();
     let mut push_reason = |code: &str, bars: u64, detail: String| {
         if bars > 0 {
-            no_deal_reasons.push(NoDealReason { code: code.to_string(), bars, detail });
+            no_deal_reasons.push(NoDealReason {
+                code: code.to_string(),
+                bars,
+                detail,
+            });
         }
     };
     match &engine {
@@ -673,7 +737,11 @@ pub fn run_backtest(
             push_reason(
                 "ENTRY_TRIGGER_NEVER_MET",
                 e.blocked_trigger_bars,
-                format!("{n} barda başlangıç koşulu ({d}) sağlanmadı — deal açılışı denenemedi", n = e.blocked_trigger_bars, d = trigger_desc),
+                format!(
+                    "{n} barda başlangıç koşulu ({d}) sağlanmadı — deal açılışı denenemedi",
+                    n = e.blocked_trigger_bars,
+                    d = trigger_desc
+                ),
             );
             push_reason(
                 "SIGNAL_BLOCKED",
@@ -683,17 +751,26 @@ pub fn run_backtest(
             push_reason(
                 "REGIME_BLOCKED",
                 e.blocked_regime_bars,
-                format!("{n} barda rejim filtresi (ZORUNLU mod) yeni deal açılışını durdurdu", n = e.blocked_regime_bars),
+                format!(
+                    "{n} barda rejim filtresi (ZORUNLU mod) yeni deal açılışını durdurdu",
+                    n = e.blocked_regime_bars
+                ),
             );
             push_reason(
                 "BREAKER_BLOCKED",
                 e.blocked_breaker_bars,
-                format!("{n} barda günlük DD devre kesici yeni deal açılışını blokladı", n = e.blocked_breaker_bars),
+                format!(
+                    "{n} barda günlük DD devre kesici yeni deal açılışını blokladı",
+                    n = e.blocked_breaker_bars
+                ),
             );
             push_reason(
                 "COOLDOWN_ACTIVE",
                 e.blocked_cooldown_bars,
-                format!("{n} barda önceki deal sonrası cooldown beklemesi", n = e.blocked_cooldown_bars),
+                format!(
+                    "{n} barda önceki deal sonrası cooldown beklemesi",
+                    n = e.blocked_cooldown_bars
+                ),
             );
             push_reason(
                 "SIZE_BELOW_MIN",
@@ -706,7 +783,10 @@ pub fn run_backtest(
             push_reason(
                 "CONFIG_INVALID",
                 e.invalid_config_bars,
-                format!("{n} barda config sayısal alanı veya SL aralığı geçersiz — deal reddedildi", n = e.invalid_config_bars),
+                format!(
+                    "{n} barda config sayısal alanı veya SL aralığı geçersiz — deal reddedildi",
+                    n = e.invalid_config_bars
+                ),
             );
         }
         EngineBox::Hedge(_) => {
@@ -718,7 +798,11 @@ pub fn run_backtest(
             push_reason(
                 "GRID_BOOTSTRAP_TRIGGER_MISSED",
                 grid_miss_trigger_bars,
-                format!("{n} barda grid başlangıç koşulu ({d}) sağlanmadı — mesh kurulamadı", n = grid_miss_trigger_bars, d = trigger_desc),
+                format!(
+                    "{n} barda grid başlangıç koşulu ({d}) sağlanmadı — mesh kurulamadı",
+                    n = grid_miss_trigger_bars,
+                    d = trigger_desc
+                ),
             );
             push_reason(
                 "GRID_BOOTSTRAP_SIGNAL_MISSED",
@@ -729,19 +813,41 @@ pub fn run_backtest(
                 push_reason(
                     "GRID_BOOTSTRAP_NEVER_MET",
                     bars.len() as u64,
-                    format!("koşu boyunca hiçbir barda mesh kurulamadı ({n} bar)", n = bars.len()),
+                    format!(
+                        "koşu boyunca hiçbir barda mesh kurulamadı ({n} bar)",
+                        n = bars.len()
+                    ),
                 );
             }
         }
     }
 
+    let total_fees = stepper
+        .cumulative_fees
+        .add(
+            &hedge_stepper
+                .as_ref()
+                .map(|hs| hs.cumulative_fees.clone())
+                .unwrap_or_else(Fraction::zero),
+        )
+        .map_err(|e| e.to_string())?;
     let metrics = BacktestMetrics {
-        total_return_pct: total_return.mul(&Fraction::from_u64(100)).map_err(|e| e.to_string())?.to_half_even_display(4),
-        max_drawdown_pct: dd_state.max_drawdown.mul(&Fraction::from_u64(100)).map_err(|e| e.to_string())?.to_half_even_display(4),
-        win_rate_pct: win_rate.mul(&Fraction::from_u64(100)).map_err(|e| e.to_string())?.to_half_even_display(2),
+        total_return_pct: total_return
+            .mul(&Fraction::from_u64(100))
+            .map_err(|e| e.to_string())?
+            .to_half_even_display(4),
+        max_drawdown_pct: dd_state
+            .max_drawdown
+            .mul(&Fraction::from_u64(100))
+            .map_err(|e| e.to_string())?
+            .to_half_even_display(4),
+        win_rate_pct: win_rate
+            .mul(&Fraction::from_u64(100))
+            .map_err(|e| e.to_string())?
+            .to_half_even_display(2),
         profit_factor: "n/a".into(),
         sharpe_display: format!("{:.3}", sharpe),
-        total_fees: stepper.cumulative_fees.to_half_even_display(6),
+        total_fees: total_fees.to_half_even_display(6),
         total_funding: total_funding.to_half_even_display(6),
         bars: bars.len(),
         deals,
@@ -763,6 +869,62 @@ pub fn run_backtest(
             .unwrap_or_default(),
         pine_plots,
     })
+}
+
+fn liquidation_fill(
+    stepper: &mut SimulationStepper,
+    ts: i64,
+    open: &Fraction,
+    high: &Fraction,
+    low: &Fraction,
+    venue_brackets: Option<&[dca_math::MmrBracket]>,
+) -> Result<Option<dca_kernel::FillRecord>, String> {
+    if stepper.cfg.is_spot
+        || stepper.cfg.leverage <= Fraction::one()
+        || stepper.position.qty.is_zero()
+    {
+        return Ok(None);
+    }
+    let Some(avg) = stepper.position.avg_price.as_ref() else {
+        return Ok(None);
+    };
+    let fallback = [dca_math::MmrBracket {
+        min_notional: Fraction::zero(),
+        max_notional: Fraction::from_u64(u64::MAX),
+        mmr: Fraction::from_decimal_str("0.005").map_err(|e| e.to_string())?,
+        deduction: Fraction::zero(),
+    }];
+    let brackets = venue_brackets
+        .filter(|tiers| !tiers.is_empty())
+        .unwrap_or(&fallback);
+    let Some(liq) = liquidation_price(
+        stepper.position.direction,
+        &stepper.position.qty,
+        avg,
+        &stepper.im_used,
+        brackets,
+        &Fraction::zero(),
+    )
+    .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let direction = stepper.position.direction;
+    let crossed = if direction == 1 {
+        low <= &liq
+    } else {
+        high >= &liq
+    };
+    if !crossed {
+        return Ok(None);
+    }
+    let liq_price = if direction == 1 {
+        Fraction::min(open, &liq)
+    } else {
+        Fraction::max(open, &liq)
+    };
+    stepper.cancel_pending();
+    stepper.force_close(&liq_price, ts, "LIQ")
 }
 
 enum EngineBox {
@@ -790,7 +952,9 @@ fn dispatch_leg(
     ts: i64,
 ) -> Result<(), String> {
     let id = match &action {
-        Action::PlaceLimit { id, .. } | Action::PlaceMarket { id, .. } | Action::CancelResting { id } => id.clone(),
+        Action::PlaceLimit { id, .. }
+        | Action::PlaceMarket { id, .. }
+        | Action::CancelResting { id } => id.clone(),
         Action::DealClosed { .. } => String::new(),
         Action::Log { .. } => String::new(),
     };
@@ -806,12 +970,25 @@ fn dispatch_leg(
 
 fn dispatch(stepper: &mut SimulationStepper, action: Action, ts: i64) -> Result<(), String> {
     match action {
-        Action::PlaceLimit { id, side, price, qty, role } => {
+        Action::PlaceLimit {
+            id,
+            side,
+            price,
+            qty,
+            role,
+        } => {
             // GRID_CLOSE ve Faz 19 TP (resting reduce-only limit) kapanış
             // emirleridir (Reduce) — GRID step kârını, TP deal kârını kitalar;
             // diğerleri envanter açar.
-            let kind = if matches!(role, "GRID_CLOSE" | "TP") { OrderKind::Reduce } else { OrderKind::Add };
-            let placement_ref = stepper.last_close.clone().unwrap_or_else(|| price.to_string());
+            let kind = if matches!(role, "GRID_CLOSE" | "TP") {
+                OrderKind::Reduce
+            } else {
+                OrderKind::Add
+            };
+            let placement_ref = stepper
+                .last_close
+                .clone()
+                .unwrap_or_else(|| price.to_string());
             stepper.submit_intent(
                 OrderIntent {
                     id: id.clone(),
@@ -821,13 +998,21 @@ fn dispatch(stepper: &mut SimulationStepper, action: Action, ts: i64) -> Result<
                     qty,
                     decision_ts: ts,
                     role: role.to_string(),
-                    placement_ref_price: Some(Fraction::from_any_str(&placement_ref).unwrap_or_else(|_| Fraction::one())),
+                    placement_ref_price: Some(
+                        Fraction::from_any_str(&placement_ref).unwrap_or_else(|_| Fraction::one()),
+                    ),
                     quote_notional: None,
                 },
                 ts,
             )?;
         }
-        Action::PlaceMarket { id, side, qty, role, quote_notional } => {
+        Action::PlaceMarket {
+            id,
+            side,
+            qty,
+            role,
+            quote_notional,
+        } => {
             let kind = if matches!(role, "TP" | "SL" | "MANUAL" | "TRAIL") {
                 OrderKind::Reduce
             } else {
@@ -900,7 +1085,14 @@ mod pine_backtest_tests {
     use std::collections::BTreeMap;
 
     fn bar(t: i64, c: &str) -> Bar {
-        Bar { t, o: c.into(), h: c.into(), l: c.into(), c: c.into(), v: "100000".into() }
+        Bar {
+            t,
+            o: c.into(),
+            h: c.into(),
+            l: c.into(),
+            c: c.into(),
+            v: "100000".into(),
+        }
     }
 
     /// 20 bar sabit fiyat + iki uç bar (giriş için düşüş, çıkış için yükseliş)
@@ -909,7 +1101,7 @@ mod pine_backtest_tests {
         let mut t = 1_700_000_000_000i64;
         for i in 0..20 {
             let px = match i {
-                5 => "90",  // düşüş
+                5 => "90",   // düşüş
                 10 => "110", // yükseliş
                 _ => "100",
             };
@@ -942,7 +1134,10 @@ mod pine_backtest_tests {
             &[],
         )
         .unwrap();
-        assert_eq!(res.metrics.deals, 0, "hiç tetiklenmeyen pine sıfır deal açmalı");
+        assert_eq!(
+            res.metrics.deals, 0,
+            "hiç tetiklenmeyen pine sıfır deal açmalı"
+        );
         assert!(res.fills.is_empty());
     }
 
@@ -960,12 +1155,25 @@ mod pine_backtest_tests {
             &[],
         )
         .unwrap();
-        assert!(res.fills.iter().any(|f| f.role == "BASE"), "pine koşulu taban emri açmalı (deal TP'siz açık kalır)",);
-        assert_eq!(res.metrics.deals, 0, "çıkış sinyali olmadığından deal açık kalır (kapanmamış sayılmaz)");
+        assert!(
+            res.fills.iter().any(|f| f.role == "BASE"),
+            "pine koşulu taban emri açmalı (deal TP'siz açık kalır)",
+        );
+        assert_eq!(
+            res.metrics.deals, 0,
+            "çıkış sinyali olmadığından deal açık kalır (kapanmamış sayılmaz)"
+        );
         let fr = &res.metrics.fill_realism;
         let total = fr.marketable_taker + fr.resting_touch + fr.open_gap_better;
-        assert_eq!(total, res.fills.len(), "kırılım toplamı fill sayısıyla eşit olmalı");
-        assert!(fr.marketable_taker >= 1, "market girişleri taker etiketli olmalı");
+        assert_eq!(
+            total,
+            res.fills.len(),
+            "kırılım toplamı fill sayısıyla eşit olmalı"
+        );
+        assert!(
+            fr.marketable_taker >= 1,
+            "market girişleri taker etiketli olmalı"
+        );
     }
 
     /// (3) Pine çıkışı: close_all tetiklendiğinde deal zarif kapanır (win/loss
@@ -983,10 +1191,16 @@ mod pine_backtest_tests {
             &[],
         )
         .unwrap();
-        assert_eq!(res.metrics.deals, 1, "tek giriş + tek çıkış = 1 kapanan deal, got {}", res.metrics.deals);
+        assert_eq!(
+            res.metrics.deals, 1,
+            "tek giriş + tek çıkış = 1 kapanan deal, got {}",
+            res.metrics.deals
+        );
         assert_eq!(res.metrics.deals, res.metrics.deals, "deals sayımı");
         assert!(
-            res.gate_logs.iter().any(|g| g.verdict == "ADVISORY:PINE_EXIT"),
+            res.gate_logs
+                .iter()
+                .any(|g| g.verdict == "ADVISORY:PINE_EXIT"),
             "PINE_EXIT advisory kaydı düşmeli"
         );
     }
@@ -1020,7 +1234,10 @@ mod pine_backtest_tests {
             // fill'ler birebir aynı olmalı (zero look-ahead).
             let part_fills = part.fills.iter().filter(|f| f.ts <= all[cut - 1].t).count();
             let full_fills = full.fills.iter().filter(|f| f.ts <= all[cut - 1].t).count();
-            assert_eq!(part_fills, full_fills, "kesim {cut}: geçmiş fill'ler değişmemeli");
+            assert_eq!(
+                part_fills, full_fills,
+                "kesim {cut}: geçmiş fill'ler değişmemeli"
+            );
         }
     }
 
@@ -1045,7 +1262,11 @@ mod pine_backtest_tests {
         )
         .unwrap();
         let exit_t = scenario_bars()[10].t;
-        let manual = res.fills.iter().find(|f| f.role == "MANUAL").expect("MANUAL çıkış fill'i olmalı");
+        let manual = res
+            .fills
+            .iter()
+            .find(|f| f.role == "MANUAL")
+            .expect("MANUAL çıkış fill'i olmalı");
         assert_eq!(
             manual.ts,
             exit_t + 3_600_000,
@@ -1071,7 +1292,14 @@ mod grid_backtest_tests {
     }
 
     fn bar(t: i64, o: &str, h: &str, l: &str, c: &str) -> Bar {
-        Bar { t, o: o.into(), h: h.into(), l: l.into(), c: c.into(), v: "100000".into() }
+        Bar {
+            t,
+            o: o.into(),
+            h: h.into(),
+            l: l.into(),
+            c: c.into(),
+            v: "100000".into(),
+        }
     }
 
     /// CRITICAL regression (Task 15-a item 8): grid must not be a one-shot mesh.
@@ -1082,9 +1310,9 @@ mod grid_backtest_tests {
         // mesh (arithmetic, tick 0.1): [90, 96.6, 103.3, 110]; bootstrap @ open 100
         let bars = vec![
             bar(1_700_000_000_000, "100", "100.5", "99.5", "100"), // bootstrap
-            bar(1_700_003_600_000, "96", "97", "89", "89"),        // buys @96.6 (gap-better @96) and @90 fill
-            bar(1_700_007_200_000, "104", "111", "104", "111"),    // both GRID_CLOSE sells fill (@104 gap-better)
-            bar(1_700_010_800_000, "111", "112", "110.5", "111"),  // re-armed openers eligible (no fill needed)
+            bar(1_700_003_600_000, "96", "97", "89", "89"), // buys @96.6 (gap-better @96) and @90 fill
+            bar(1_700_007_200_000, "104", "111", "104", "111"), // both GRID_CLOSE sells fill (@104 gap-better)
+            bar(1_700_010_800_000, "111", "112", "110.5", "111"), // re-armed openers eligible (no fill needed)
         ];
         let res = run_backtest(
             &bars,
@@ -1096,8 +1324,15 @@ mod grid_backtest_tests {
         )
         .unwrap();
         let closer_fills = res.fills.iter().filter(|f| f.role == "GRID_CLOSE").count();
-        assert!(closer_fills >= 2, "offset closers must be placed and filled, got {closer_fills}");
-        assert!(res.metrics.deals >= 2, "grid pair completions must be counted, got {}", res.metrics.deals);
+        assert!(
+            closer_fills >= 2,
+            "offset closers must be placed and filled, got {closer_fills}"
+        );
+        assert!(
+            res.metrics.deals >= 2,
+            "grid pair completions must be counted, got {}",
+            res.metrics.deals
+        );
         // NOTE (documented pre-existing limitation, out of scope here): the
         // kernel's spot position accounting treats Add fills side-agnostically,
         // so bootstrap SELL openers inflate the mirrored long position and the
@@ -1161,15 +1396,31 @@ mod grid_backtest_tests {
         )
         .unwrap();
         assert!(
-            res.gate_logs.iter().any(|g| g.verdict == "ADVISORY:PINE_EXIT" && g.detail.contains("mesh durduruldu")),
+            res.gate_logs
+                .iter()
+                .any(|g| g.verdict == "ADVISORY:PINE_EXIT" && g.detail.contains("mesh durduruldu")),
             "grid PINE_EXIT advisory'si düşmeli: {:?}",
-            res.gate_logs.iter().map(|g| (&g.verdict, &g.detail)).collect::<Vec<_>>()
+            res.gate_logs
+                .iter()
+                .map(|g| (&g.verdict, &g.detail))
+                .collect::<Vec<_>>()
         );
         // Haltsız davranışta bar 15'teki re-bootstrap ESKİ emirlerle çakışır:
         // aynı fiyat seviyelerinde çift emir → 4 alış fill'i olurdu.
-        let buy_fills = res.fills.iter().filter(|f| matches!(f.side, dca_math::Side::Buy)).count();
-        assert_eq!(buy_fills, 2, "mesh halt olduktan sonra yalnız YENİ mesh'in 2 alışı dolmalı, got {buy_fills}");
-        assert!(res.metrics.deals >= 2, "re-bootstrap sonrası çift tamamlanmalı, got {}", res.metrics.deals);
+        let buy_fills = res
+            .fills
+            .iter()
+            .filter(|f| matches!(f.side, dca_math::Side::Buy))
+            .count();
+        assert_eq!(
+            buy_fills, 2,
+            "mesh halt olduktan sonra yalnız YENİ mesh'in 2 alışı dolmalı, got {buy_fills}"
+        );
+        assert!(
+            res.metrics.deals >= 2,
+            "re-bootstrap sonrası çift tamamlanmalı, got {}",
+            res.metrics.deals
+        );
     }
 }
 
@@ -1185,7 +1436,14 @@ mod signal_backtest_tests {
         let mut t = 1_700_000_000_000i64;
         for _ in 0..n {
             let c = format!("{px}");
-            bars.push(Bar { t, o: c.clone(), h: c.clone(), l: c.clone(), c, v: "10".into() });
+            bars.push(Bar {
+                t,
+                o: c.clone(),
+                h: c.clone(),
+                l: c.clone(),
+                c,
+                v: "10".into(),
+            });
             px *= 1.01;
             px = (px * 1000.0).round() / 1000.0;
             t += 3_600_000;
@@ -1241,7 +1499,6 @@ mod signal_backtest_tests {
         cfg
     }
 
-
     #[test]
     fn backtest_signal_passthrough_when_always_true() {
         let bars = rising_bars(60, 100.0);
@@ -1254,7 +1511,10 @@ mod signal_backtest_tests {
             &[],
         )
         .unwrap();
-        assert!(res.metrics.deals >= 1, "always-true signal must allow the base order");
+        assert!(
+            res.metrics.deals >= 1,
+            "always-true signal must allow the base order"
+        );
         assert!(!res.fills.is_empty());
     }
 
@@ -1274,15 +1534,39 @@ mod signal_backtest_tests {
             &[],
         )
         .unwrap_err();
-        assert!(err.contains("zero look-ahead"), "lower TF must be rejected, got: {err}");
+        assert!(
+            err.contains("zero look-ahead"),
+            "lower TF must be rejected, got: {err}"
+        );
     }
 
     #[test]
     fn resample_aggregates_and_buckets_exactly() {
         let base = vec![
-            BarData { t: 0, o: 1.0, h: 2.0, l: 0.5, c: 1.5, v: 3.0 },
-            BarData { t: 60_000, o: 1.5, h: 2.5, l: 1.0, c: 2.0, v: 4.0 },
-            BarData { t: 120_000, o: 2.0, h: 3.0, l: 1.5, c: 2.5, v: 5.0 },
+            BarData {
+                t: 0,
+                o: 1.0,
+                h: 2.0,
+                l: 0.5,
+                c: 1.5,
+                v: 3.0,
+            },
+            BarData {
+                t: 60_000,
+                o: 1.5,
+                h: 2.5,
+                l: 1.0,
+                c: 2.0,
+                v: 4.0,
+            },
+            BarData {
+                t: 120_000,
+                o: 2.0,
+                h: 3.0,
+                l: 1.5,
+                c: 2.5,
+                v: 5.0,
+            },
         ];
         let up = resample(&base, 120_000);
         assert_eq!(up.len(), 2);
@@ -1324,7 +1608,7 @@ mod signal_backtest_tests {
 
 /* ------------------------------------------------------------------ */
 /* Task 22 — no-deal sözleşmesi: boş sonuçlar makine-okunur neden taşır.
-   Tablo-odaklı tek test; her satır bir davranış + sınır durumudur.        */
+Tablo-odaklı tek test; her satır bir davranış + sınır durumudur.        */
 /* ------------------------------------------------------------------ */
 #[cfg(test)]
 mod no_deal_reason_tests {
@@ -1334,7 +1618,10 @@ mod no_deal_reason_tests {
     use dca_math::Instrument;
 
     fn codes_of(res: &BacktestResult) -> std::collections::HashMap<&str, u64> {
-        res.no_deal_reasons.iter().map(|r| (r.code.as_str(), r.bars)).collect()
+        res.no_deal_reasons
+            .iter()
+            .map(|r| (r.code.as_str(), r.bars))
+            .collect()
     }
 
     fn run(cfg: &BotConfig, bars: &[Bar]) -> BacktestResult {
@@ -1360,7 +1647,12 @@ mod no_deal_reason_tests {
         let mut bad_base = cfg_with(None);
         bad_base.base_order_size = "abc".into();
         let cases: Vec<(&str, BotConfig, Vec<Bar>, Vec<(&str, u64)>)> = vec![
-            ("imkansız trigger", trigger_never, rising_bars(60, 100.0), vec![("ENTRY_TRIGGER_NEVER_MET", 60)]),
+            (
+                "imkansız trigger",
+                trigger_never,
+                rising_bars(60, 100.0),
+                vec![("ENTRY_TRIGGER_NEVER_MET", 60)],
+            ),
             (
                 "imkansız sinyal",
                 cfg_with(Some(sig_cfg(rsi_lt_30()))),
@@ -1371,16 +1663,28 @@ mod no_deal_reason_tests {
                 "grid bootstrap yok",
                 grid_never,
                 rising_bars(60, 100.0),
-                vec![("GRID_BOOTSTRAP_TRIGGER_MISSED", 60), ("GRID_BOOTSTRAP_NEVER_MET", 60)],
+                vec![
+                    ("GRID_BOOTSTRAP_TRIGGER_MISSED", 60),
+                    ("GRID_BOOTSTRAP_NEVER_MET", 60),
+                ],
             ),
-            ("geçersiz config", bad_base, rising_bars(60, 100.0), vec![("CONFIG_INVALID", 60)]),
+            (
+                "geçersiz config",
+                bad_base,
+                rising_bars(60, 100.0),
+                vec![("CONFIG_INVALID", 60)],
+            ),
         ];
         for (name, cfg, bars, expected) in &cases {
             let res = run(cfg, bars);
             assert_eq!(res.metrics.deals, 0, "{name}: deal açılmamalı");
             assert!(res.fills.is_empty(), "{name}: fill olmamalı");
             let got = codes_of(&res);
-            assert_eq!(got.len(), expected.len(), "{name}: beklenmeyen neden var: {got:?}");
+            assert_eq!(
+                got.len(),
+                expected.len(),
+                "{name}: beklenmeyen neden var: {got:?}"
+            );
             for (code, n) in expected {
                 assert_eq!(got.get(code), Some(n), "{name}: {code} sayacı");
             }
@@ -1392,7 +1696,11 @@ mod no_deal_reason_tests {
     fn healthy_run_has_no_reasons() {
         let res = run(&cfg_with(None), &rising_bars(60, 100.0));
         assert!(res.metrics.deals >= 1, "INSTANT koşu deal açmalı");
-        assert!(res.no_deal_reasons.is_empty(), "sağlıklı koşuda neden yok: {:?}", res.no_deal_reasons);
+        assert!(
+            res.no_deal_reasons.is_empty(),
+            "sağlıklı koşuda neden yok: {:?}",
+            res.no_deal_reasons
+        );
     }
 
     /// Cooldown: kapanış sonrası bekleme sayılır, yeni deal yine açılır.
@@ -1401,8 +1709,14 @@ mod no_deal_reason_tests {
         let mut cfg = cfg_with(None);
         cfg.cooldown_bars = 5;
         let res = run(&cfg, &rising_bars(12, 100.0));
-        assert!(res.metrics.deals >= 1, "cooldown sonrası yeni deal açılmalı");
+        assert!(
+            res.metrics.deals >= 1,
+            "cooldown sonrası yeni deal açılmalı"
+        );
         let got = codes_of(&res);
-        assert!(got.get("COOLDOWN_ACTIVE").copied().unwrap_or(0) > 0, "cooldown sayılmalı: {got:?}");
+        assert!(
+            got.get("COOLDOWN_ACTIVE").copied().unwrap_or(0) > 0,
+            "cooldown sayılmalı: {got:?}"
+        );
     }
 }

@@ -6,9 +6,9 @@
 //! Reference: docs/BYBIT_RESEARCH.md (live-verified field names).
 
 use super::{
-    ExecutionRecord, KeyPermissions, Kline, OrderBook, OrderBookLevel, OrderRequest,
-    PositionSnapshot, Ticker24h, TickerSnapshot, VenueAdapter, VenueCreds, VenueOrderState,
-    WalletSnapshot,
+    format_order_decimal, ExecutionRecord, KeyPermissions, Kline, OrderBook, OrderBookLevel,
+    OrderRequest, PositionSnapshot, Ticker24h, TickerSnapshot, VenueAdapter, VenueCreds,
+    VenueOrderState, WalletSnapshot,
 };
 use dca_math::fraction::Fraction;
 use dca_math::Instrument;
@@ -875,14 +875,14 @@ impl VenueAdapter for BybitAdapter {
             "symbol": req.symbol,
             "side": match req.side { dca_math::Side::Buy => "Buy", dca_math::Side::Sell => "Sell" },
             "orderType": if req.is_market { "Market" } else { "Limit" },
-            "qty": req.qty.to_half_even_display(8),
+            "qty": format_order_decimal(&req.qty),
             "orderLinkId": req.order_link_id,
         });
         if !req.is_market {
             body["price"] = Value::String(
                 req.price
                     .as_ref()
-                    .map(|p| p.to_half_even_display(8))
+                    .map(format_order_decimal)
                     .unwrap_or_default(),
             );
             body["timeInForce"] = Value::String("GTC".into());

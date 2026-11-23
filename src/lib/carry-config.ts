@@ -1,3 +1,7 @@
+"use client";
+
+import { useMemo, useSyncExternalStore } from "react";
+
 /**
  * Faz 19 (UIX-11): Lab ↔ Sihirbaz config taşıma.
  *
@@ -53,4 +57,27 @@ export function consumeCarriedConfig(): CarriedBotConfig | null {
   }
   if (!v || Date.now() - v.ts > FRESH_MS) return null;
   return v;
+}
+function createCarriedConfigStore() {
+  let snapshot: CarriedBotConfig | null = null;
+  let initialized = false;
+  const listeners = new Set<() => void>();
+  return {
+    subscribe(listener: () => void) {
+      listeners.add(listener);
+      if (!initialized) {
+        snapshot = consumeCarriedConfig();
+        initialized = true;
+      }
+      return () => { listeners.delete(listener); };
+    },
+    getSnapshot: () => snapshot,
+    getServerSnapshot: () => null,
+  };
+}
+
+/** Read one-time session storage input as an external store after hydration. */
+export function useCarriedConfig() {
+  const store = useMemo(() => createCarriedConfigStore(), []);
+  return useSyncExternalStore(store.subscribe, store.getSnapshot, store.getServerSnapshot);
 }
