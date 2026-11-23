@@ -248,7 +248,11 @@ function WizardForm({
   /* step 5 */
   const [botName, setBotName] = useState("");
   const [launching, setLaunching] = useState(false);
-  const [launchError, setLaunchError] = useState<string | null>(null);
+  const [launchError, setLaunchError] = useState<{ message: string; status: number | null } | null>(null);
+  const launchErrorRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (launchError) launchErrorRef.current?.focus();
+  }, [launchError]);
   /* step 6 — Risk Motoru (Task 16): advisory policy + user acknowledgment */
   const [riskPolicy, setRiskPolicy] = useState<UserRiskPolicy>(() => ({
     ...DEFAULT_RISK_POLICY,
@@ -740,6 +744,19 @@ function WizardForm({
   const vaultError = vaultRequestKey && vaultResult?.requestKey === vaultRequestKey ? vaultResult.error : null;
   const canLaunch = sec1Valid && sec2Valid && sec3Valid && sec4Valid && sec5Valid && sec6Valid && engineOnline && executionEnvironmentAvailable;
   const secValid = [sec1Valid, sec2Valid && executionEnvironmentAvailable, sec3Valid, sec4Valid, sec5Valid, sec6Valid];
+  const sectionIssues = [
+    { n: 1, title: "Strateji", valid: sec1Valid, message: "Bir strateji seçin." },
+    { n: 2, title: "Borsa & Sembol", valid: sec2Valid && executionEnvironmentAvailable, message: "Borsayı, çalışma ortamını ve kullanılabilir sembolü seçin." },
+    { n: 3, title: "Parametreler", valid: sec3Valid, message: "Parametre veya başlangıç koşulundaki eksikleri bölüm kontrollerinden tamamlayın." },
+    { n: 4, title: "Sermaye", valid: sec4Valid, message: "Sermaye, fiyat aralığı ve fee guard koşullarını tamamlayın." },
+    { n: 5, title: "Gözden Geçir", valid: sec5Valid, message: "Bot için bir ad girin." },
+    { n: 6, title: "Risk Onayı", valid: sec6Valid, message: "Görünen risk uyarılarını okuyup onaylayın." },
+  ].filter((issue) => !issue.valid && (issue.n === 1 || kind !== null));
+  const launchIssues = [
+    ...sectionIssues.map((issue) => ({ ...issue, key: `section-${issue.n}` })),
+    ...(!engineOnline ? [{ key: "engine", n: null, title: "Motor", message: "Motor çevrimdışı; motor sağlıklı duruma gelince tekrar deneyin." }] : []),
+    ...(!executionEnvironmentAvailable ? [{ key: "environment", n: null, title: "Çalışma ortamı", message: `Seçilen ortam etkin ${activeExecutionEnvironment ?? "borsa endpoint'i"} ile eşleşmiyor.` }] : []),
+  ];
 
   /* ---- LIVE mode: verify a vault key exists for the selected venue ---- */
   useEffect(() => {
@@ -935,8 +952,14 @@ function WizardForm({
           return;
         }
       }
-      setLaunchError(e instanceof Error ? e.message : "Bilinmeyen hata");
-      toast({ title: "Launch reddedildi (422)", description: e instanceof Error ? e.message : "", variant: "destructive" });
+      const errorMessage = e instanceof Error ? e.message : "Bilinmeyen hata";
+      const errorStatus = e instanceof EngineError && e.status > 0 ? e.status : null;
+      setLaunchError({ message: errorMessage, status: errorStatus });
+      toast({
+        title: errorStatus === null ? "Launch başarısız" : `Launch reddedildi (${errorStatus})`,
+        description: errorMessage,
+        variant: "destructive",
+      });
     } finally {
       setLaunching(false);
     }
@@ -2870,13 +2893,32 @@ function WizardForm({
             {calcBusy && <span className="rounded bg-secondary px-2 py-1 text-[10px] text-slate-400">HESAPLANIYOR…</span>}
           </div>
 
+          {launchIssues.length > 0 && (
+            <section className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3" aria-live="polite" aria-label="Başlatma öncesi tamamlanması gerekenler">
+              <p className="text-xs font-semibold text-amber-200">Başlatma için tamamlayın</p>
+              <ul className="mt-1.5 space-y-1">
+                {launchIssues.map((issue) => (
+                  <li key={issue.key} className="text-xs text-amber-100/80">
+                    {issue.n === null ? (
+                      <span>{issue.title}: {issue.message}</span>
+                    ) : (
+                      <a href={`#wz-sec-${issue.n}`} className="inline-flex min-h-9 items-center underline decoration-amber-500/50 underline-offset-2 hover:text-amber-100 focus-visible:rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400">
+                        {issue.title}: {issue.message}
+                      </a>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
           {launchError && (
-            <div className="mt-3 rounded-lg border border-rose-500/50 bg-rose-500/10 p-3">
+            <div ref={launchErrorRef} tabIndex={-1} role="alert" className="mt-3 rounded-lg border border-rose-500/50 bg-rose-500/10 p-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500/60">
               <div className="flex items-center gap-2 text-sm font-bold text-rose-400">
                 <AlertTriangle className="h-4 w-4" aria-hidden />
-                Motor reddetti (HTTP 422)
+                {launchError.status === null ? "İstek başarısız" : `Motor reddetti (HTTP ${launchError.status})`}
               </div>
-              <pre className="thin-scroll mt-2 max-h-32 overflow-auto whitespace-pre-wrap font-mono text-xs text-rose-300">{launchError}</pre>
+              <pre className="thin-scroll mt-2 max-h-32 overflow-auto whitespace-pre-wrap font-mono text-xs text-rose-300">{launchError.message}</pre>
             </div>
           )}
 

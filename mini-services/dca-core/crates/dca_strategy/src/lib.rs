@@ -28,8 +28,8 @@ pub mod grid;
 pub mod hedge;
 
 pub use advisory::{compute_warnings, grid_fee_breaker_violation};
-pub use backtest::{run_backtest, run_backtest_with_mmr, BacktestMetrics, BacktestResult};
-pub use certify::{certify, certify_verdict, CertGate, CertGateVerdict, CertifyOutput};
+pub use backtest::{run_backtest, run_backtest_with_mmr, run_backtest_with_mmr_cancellable, BacktestMetrics, BacktestResult};
+pub use certify::{certify, certify_cancellable, certify_verdict, CertGate, CertGateVerdict, CertifyOutput};
 pub use dca::{DcaEngine, DcaPhase};
 pub use grid::GridEngine;
 pub use hedge::HedgeEngine;

@@ -40,7 +40,7 @@ use dca_kernel::GuardAction;
 use dca_math::fraction::Fraction;
 use dca_math::Instrument;
 use dca_strategy::dca::DcaPhase;
-use dca_strategy::{certify, certify_verdict, run_backtest, BotConfig, StrategyKind};
+use dca_strategy::{certify, certify_cancellable, certify_verdict, run_backtest, run_backtest_with_mmr_cancellable, BotConfig, StrategyKind};
 use futures_util::FutureExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -569,6 +569,7 @@ async fn main() {
         .route("/api/calc/brackets", get(brackets::calc_brackets))
         .route("/api/backtest", post(routes_backtest::backtest))
         .route("/api/backtest/cert", post(backtest_cert))
+        .route("/api/backtest/:id/cancel", post(routes_backtest::cancel_backtest))
         .route("/api/signals/preview", post(signals_preview))
         .route("/api/pine/validate", post(pine_validate))
         .route("/api/pine/backtest", post(pine_backtest))
@@ -4305,6 +4306,8 @@ struct BacktestCertReq {
     /// Faz 22 (P0-10 kalanı): kullanıcı gerçek deneme sayısı (DSR söndürmesi).
     #[serde(default)]
     attempts: usize,
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 fn default_mc_runs() -> usize {
@@ -4339,6 +4342,9 @@ async fn backtest_cert(
         }
     }
 
+    let job = routes_backtest::register_job(&app, routes_backtest::parse_job_id(req.request_id)?)?;
+    let cancellation = Some(job.cancellation.clone());
+
     let category = if kind.is_futures() { "linear" } else { "spot" };
     // P4-3d: sertifikasyon market verisi seçili venue'den.
     let venue = req.venue.unwrap_or_else(|| "BYBIT".into()).to_uppercase();
@@ -4346,24 +4352,35 @@ async fn backtest_cert(
         .adapter(&venue)
         .ok_or_else(|| err422("venue desteklenmiyor"))?;
     let iv = engine::bybit_interval(&req.interval).map_err(|e| err422(e))?;
-    let bars = routes_backtest::fetch_backtest_klines(
-        adapter,
-        &venue,
-        category,
-        &req.symbol,
-        &iv,
-        req.bars.min(1000),
+    let bars_result = routes_backtest::await_job_or_cancel(
+        routes_backtest::fetch_backtest_klines(
+            adapter,
+            &venue,
+            category,
+            &req.symbol,
+            &iv,
+            req.bars.min(1000),
+        ),
+        cancellation.clone(),
     )
-    .await
-    .map_err(|e| err422(e))?;
+    .await?;
+    if cancellation.as_ref().is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Err(routes_backtest::cancellation_response());
+    }
+    let bars = bars_result.map_err(err422)?;
     if bars.is_empty() {
         return Err(err422("no market data"));
     }
+    let insts = routes_backtest::await_job_or_cancel(
+        adapter.instruments(category, Some(&req.symbol)),
+        cancellation.clone(),
+    )
+    .await?
+    .unwrap_or_default();
+    if cancellation.as_ref().is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Err(routes_backtest::cancellation_response());
+    }
     let inst = {
-        let insts = adapter
-            .instruments(category, Some(&req.symbol))
-            .await
-            .unwrap_or_default();
         insts.into_iter().next().unwrap_or_else(|| {
             let mut i = Instrument::default();
             i.symbol = req.symbol.clone();
@@ -4375,7 +4392,12 @@ async fn backtest_cert(
     // Funding history for futures certification base runs (same window as backtest).
     // Task 18 N-5: sessiz "sıfır funding" yerine WARN event + cert yanıtında flag.
     let (funding, funding_warning): (Vec<(i64, String)>, Option<String>) = if kind.is_futures() {
-        match adapter.funding_history(&req.symbol, 200).await {
+        match routes_backtest::await_job_or_cancel(
+            adapter.funding_history(&req.symbol, 200),
+            cancellation.clone(),
+        )
+        .await?
+        {
             Ok(v) => (v, None),
             Err(e) => (
                 Vec::new(),
@@ -4387,6 +4409,9 @@ async fn backtest_cert(
     } else {
         (Vec::new(), None)
     };
+    if cancellation.as_ref().is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Err(routes_backtest::cancellation_response());
+    }
     if let Some(w) = &funding_warning {
         state::persist_event(&app, &req.symbol, "WARN", "CERTIFY", w).await;
     }
@@ -4401,10 +4426,25 @@ async fn backtest_cert(
             v: k.v,
         })
         .collect();
+    let bars_base = bars_n.clone();
+    let inst_base = inst.clone();
+    let cfg_base = cfg.clone();
+    let start_base = start.clone();
+    let funding_base = funding.clone();
+    let cancellation_for_task = cancellation.clone();
     let (cert, base_metrics) = tokio::task::spawn_blocking(move || {
-        let base = run_backtest(&bars_n, &inst, &cfg, start.clone(), session, &funding).ok();
+        let _job_guard = job;
+        let cancellation = cancellation_for_task.as_deref();
+        let base_result = run_backtest_with_mmr_cancellable(
+            &bars_base, &inst_base, &cfg_base, start_base, session, &funding_base, None, cancellation,
+        );
+        let base = match base_result {
+            Ok(result) => Some(result),
+            Err(error) if error == "backtest cancelled" => return Err(error),
+            Err(_) => None,
+        };
         // Faz 18 (P0-10): denemeler de base ile aynı funding takviminde.
-        let cert = certify(
+        let cert = certify_cancellable(
             &bars_n,
             &inst,
             &cfg,
@@ -4413,12 +4453,13 @@ async fn backtest_cert(
             req.mc_runs,
             &funding,
             req.attempts,
-        );
-        (cert, base)
+            cancellation,
+        )?;
+        Ok::<_, String>((cert, base))
     })
     .await
-    .map_err(|e| err422(e.to_string()))?;
-    let cert = cert.map_err(|e| err422(e))?;
+    .map_err(|e| err422(e.to_string()))?
+    .map_err(|error| if error == "backtest cancelled" { routes_backtest::cancellation_response() } else { err422(error) })?;
     // Faz 0.1 — sertifika hükmü (Lab rozet eşikleriyle aynı kapılar; UI + LIVE
     // kapısı tek kaynaktan beslenir). funding kapısı yalnız vadeli türde uygulanır.
     let gate = certify_verdict(

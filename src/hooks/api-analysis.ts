@@ -103,6 +103,10 @@ export async function apiBacktestCert(
   return engineFetch("/api/backtest/cert", { ...engineJson("POST", req), signal });
 }
 
+export async function apiCancelBacktest(requestId: string): Promise<{ ok: boolean; cancelRequested: boolean }> {
+  return engineFetch(`/api/backtest/${encodeURIComponent(requestId)}/cancel`, engineJson("POST", {}));
+}
+
 /** Faz 24 (UI/UX Pro Max §3.1.1): portföy equity curve — motor
     equity_points birleşimi. */
 export async function apiEquity(days = 30, signal?: AbortSignal): Promise<{ days: number; points: { ts: number; equity: number }[]; total: number }> {

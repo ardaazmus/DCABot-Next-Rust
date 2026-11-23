@@ -24,7 +24,12 @@ export function WizardSection({
 }) {
   if (hidden) return null;
   return (
-    <section id={`wz-sec-${n}`} className="rounded-xl border border-border bg-base/60 p-4" aria-label={`${n}. ${title}`}>
+    <section
+      id={`wz-sec-${n}`}
+      tabIndex={-1}
+      className="scroll-mt-24 rounded-xl border border-border bg-base/60 p-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60"
+      aria-label={`${n}. ${title}`}
+    >
       <header className="mb-3 flex items-center gap-2">
         <span
           className={cn(

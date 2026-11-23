@@ -82,5 +82,11 @@ Sekme/validasyon mantığı ile sunum iç içe; hata gösterimi GateChip satırl
 ## 4. Doğrulanamayanlar (bilinçli sınırlar)
 - Gerçek cihazda 375px/landscape davranışı (kodda `md:` kırılımları var, gözle test edilmedi).
 - Ekran okuyucu turu (VoiceOver/TalkBack) yapılmadı.
-- Wizard submit-sonrası odak akışı (P9) — kodda iz bulunamadı, çalışır test gerekir.
+- Sihirbaz hata özeti ve submit sonrası hata odağı kaynakta eklendi; gerçek klavye/ekran okuyucu turunda odağın davranışı ayrıca doğrulanmalı.
 - Renk kontrastı hesapları hex matematiğine dayanır; `color-accessible-pairs` için araç ölçümü önerilir.
+
+## Uygulama takibi — 23 Kasım 2026
+
+Kaynakta doğrulananlar: P1 mobil alt gezinme 4 ana öğe + “Diğer” çekmecesine ayrıldı; P4 equity grafiği klavye ile gezinme ve veri tablosu aldı; P5 backtest/sertifika faz durumu ve skeleton akışına UUID tabanlı iptal eklendi. Sunucu bekleyen market-verisi isteklerini bırakıyor; backtest barları, sertifika trial'ları ve Monte Carlo yolları arasında iptal bayrağını kontrol ediyor. P6 `prefers-reduced-motion` uygulandı; P7 filo listesi tablo ve sıralama başlıkları kullanıyor; P8 API secret için göster/gizle düğmesi var. P9 için eksik bölüm bağlantıları, odaklanabilir section hedefleri ve launch hatasına odak taşıma eklendi.
+
+Açık kalanlar: P2 ham renklerin tüm bileşenlerde tasarım token'larına taşınması; P3 küçük metin ve kontrastın araçla ölçülüp 375px cihazlarda gözden geçirilmesi; P9 `wizard.tsx`/`studio.tsx` sorumluluklarının parçalanması. Gerçek cihaz ve ekran okuyucu turu yapılmadı; kaynak doğrulaması bu saha doğrulamasının yerine geçmez.

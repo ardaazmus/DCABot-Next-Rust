@@ -16,7 +16,7 @@ import {
 } from "@/components/ui/select";
 import { Panel } from "@/components/terminal/bits";
 import { BacktestResultView, defaultDcaConfig } from "@/components/terminal/backtest-panel";
-import { apiAiDiagnose, apiBacktest, apiBacktestCert, apiCalibration, apiFuturesState, apiMarkets, apiNews, apiOrderbook, apiRegime, useAiConfig, useBots } from "@/hooks/use-engine";
+import { apiAiDiagnose, apiBacktest, apiBacktestCert, apiCancelBacktest, apiCalibration, apiFuturesState, apiMarkets, apiNews, apiOrderbook, apiRegime, useAiConfig, useBots } from "@/hooks/use-engine";
 import { cn } from "@/lib/utils";
 import { DEFAULT_RISK_POLICY } from "@/lib/engine-types";
 import { saveCarriedConfig } from "@/lib/carry-config";
@@ -202,26 +202,45 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<BacktestResult | null>(null);
   /* P5 — faz çubuğu + iptal: tek uçuşan istek, istemci faz etiketleri (yüzde uydurulmaz). */
-  const [op, setOp] = useState<{ kind: "backtest" | "cert"; phase: string } | null>(null);
+  const [op, setOp] = useState<{ kind: "backtest" | "cert"; phase: string; requestId: string } | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const activeRequestIdRef = useRef<string | null>(null);
+  const cancelStatusRef = useRef<"idle" | "confirmed" | "finished" | "failed">("idle");
   const PHASES = ["Kline çekiliyor…", "Motor koşuyor (SAF-G2 + kapılar)…", "Skorlar hesaplanıyor…"];
   const startOp = (kind: "backtest" | "cert") => {
     abortRef.current?.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
+    const requestId = crypto.randomUUID();
+    activeRequestIdRef.current = requestId;
+    cancelStatusRef.current = "idle";
     let i = 0;
-    setOp({ kind, phase: PHASES[0] });
+    setOp({ kind, phase: PHASES[0], requestId });
     /* Not: `setInterval` adı periyot state'iyle gölgelenir — globale açıkça inilir. */
     const t = window.setInterval(() => {
       i = (i + 1) % PHASES.length;
       setOp((o) => (o && o.kind === kind ? { ...o, phase: PHASES[i] } : o));
     }, 5000);
-    return { ctrl, stop: () => window.clearInterval(t) };
+    return { ctrl, requestId, stop: () => window.clearInterval(t) };
   };
   const endOp = (ctrl: AbortController) => {
     if (abortRef.current === ctrl) {
       abortRef.current = null;
+      activeRequestIdRef.current = null;
       setOp(null);
+    }
+  };
+  const cancelOperation = async () => {
+    const ctrl = abortRef.current;
+    const requestId = activeRequestIdRef.current;
+    if (!ctrl || !requestId) return;
+    try {
+      const result = await apiCancelBacktest(requestId);
+      cancelStatusRef.current = result.cancelRequested ? "confirmed" : "finished";
+    } catch {
+      cancelStatusRef.current = "failed";
+    } finally {
+      ctrl.abort();
     }
   };
   const [certBusy, setCertBusy] = useState(false);
@@ -246,6 +265,8 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
   }, [resultInvalidator]);
   useEffect(
     () => () => {
+      const requestId = activeRequestIdRef.current;
+      if (requestId) void apiCancelBacktest(requestId).catch(() => {});
       abortRef.current?.abort();
     },
     [],
@@ -263,7 +284,7 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
   };
 
   const run = async () => {
-    const { ctrl, stop } = startOp("backtest");
+    const { ctrl, requestId, stop } = startOp("backtest");
     setBusy(true);
     setError(null);
     try {
@@ -277,13 +298,20 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
           start_cash: startCash || "100000",
           config,
           venue,
+          request_id: requestId,
         },
         ctrl.signal,
       );
       if (!ctrl.signal.aborted) setResult(r);
     } catch (e) {
       if (ctrl.signal.aborted) {
-        setError("Koşu iptal edildi — yarım sonuç diske yazılmadı.");
+        setError(cancelStatusRef.current === "confirmed"
+          ? "Motor iptal isteğini aldı; hesaplama durduruluyor."
+          : cancelStatusRef.current === "finished"
+            ? "Koşu iptal isteği ulaşmadan tamamlandı; sonuç alınmadı."
+            : cancelStatusRef.current === "failed"
+              ? "İstemci beklemeyi durdurdu; motordan iptal onayı alınamadı. Hesap sürüyor olabilir."
+              : "İstemci isteği durdurdu; motor iptal onayı alınamadı. Hesap sürüyor olabilir.");
       } else {
         setResult(null);
         setError(e instanceof Error ? e.message : "Bilinmeyen hata");
@@ -296,7 +324,7 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
   };
 
   const runCert = async () => {
-    const { ctrl, stop } = startOp("cert");
+    const { ctrl, requestId, stop } = startOp("cert");
     setCertBusy(true);
     setCertError(null);
     try {
@@ -312,13 +340,18 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
           mc_runs: 200,
           venue,
           attempts: certAttempts > 0 ? certAttempts : undefined,
+          request_id: requestId,
         },
         ctrl.signal,
       );
       if (!ctrl.signal.aborted) setCert(r);
     } catch (e) {
       if (ctrl.signal.aborted) {
-        setCertError("Sertifika koşusu iptal edildi.");
+        setCertError(cancelStatusRef.current === "confirmed"
+          ? "Motor iptal isteğini aldı; sertifikasyon hesaplaması durduruluyor."
+          : cancelStatusRef.current === "finished"
+            ? "Sertifikasyon iptal isteği ulaşmadan tamamlandı; sonuç alınmadı."
+            : "İstemci beklemeyi durdurdu; motor iptal onayı alınamadı. Hesap sürüyor olabilir.");
       } else {
         setCert(null);
         setCertError(e instanceof Error ? e.message : "Bilinmeyen hata");
@@ -704,7 +737,7 @@ export function BacktestLab({ onGoWizard }: { onGoWizard?: () => void } = {}) {
               <Button
                 type="button"
                 variant="outline"
-                onClick={() => abortRef.current?.abort()}
+                onClick={() => void cancelOperation()}
                 className="min-h-9 shrink-0 border-rose-500/50 px-3 text-xs text-rose-300 hover:bg-rose-500/10"
               >
                 <X className="h-3.5 w-3.5" aria-hidden />

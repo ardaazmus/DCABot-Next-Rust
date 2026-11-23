@@ -11,7 +11,9 @@ use dca_math::Instrument;
 use dca_strategy::{BotConfig, EngineTag, StrategyKind};
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use uuid::Uuid;
 use tokio::sync::{broadcast, Mutex};
 
 /// Insert into a time-bounded cache while enforcing a hard entry ceiling.
@@ -528,6 +530,9 @@ pub struct AppState {
     /// LIVE bot creation/start status transitions are serialized so one
     /// venue-wide position snapshot cannot be assigned to two bot runtimes.
     pub live_ownership_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Registered backtest/certification jobs; user cancellation is observed
+    /// inside the blocking bar/trial loops rather than only aborting HTTP.
+    pub backtest_jobs: Arc<std::sync::Mutex<HashMap<Uuid, Arc<AtomicBool>>>>,
     /// Faz 5 (H-8): son başarılı supervisor poll'u (ms) — readiness göstergesi.
     pub last_tick_at: std::sync::Mutex<i64>,
     /// M-3: instrument cache artık TTL'li — (cached_at_ms, liste). Tek bir ağ
@@ -615,6 +620,7 @@ impl AppState {
             started_at: now_ms(),
             poll_locks: Mutex::new(HashMap::new()),
             live_ownership_lock: Arc::new(tokio::sync::Mutex::new(())),
+            backtest_jobs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             last_tick_at: std::sync::Mutex::new(0),
             instruments_cache: Mutex::new(HashMap::new()),
             tickers_cache: Mutex::new(HashMap::new()),

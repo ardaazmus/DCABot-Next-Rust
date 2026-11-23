@@ -3,11 +3,12 @@
 //! circular block bootstrap. Reporting-boundary statistics (f64, display only);
 //! every equity path is produced by the exact-fraction kernel.
 
-use crate::backtest::run_backtest;
+use crate::backtest::run_backtest_with_mmr_cancellable;
 use crate::{BotConfig, StrategyKind};
 use dca_math::fraction::Fraction;
 use dca_math::Instrument;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Euler–Mascheroni sabiti std::f64::consts'ta YOK — değer referans kaynaklidir.
 #[allow(clippy::approx_constant)]
@@ -179,12 +180,22 @@ fn run_trial(
     start: &Fraction,
     session: dca_math::sessions::SessionType,
     funding: &[(i64, String)],
+    cancellation: Option<&AtomicBool>,
 ) -> Result<TrialSeries, String> {
     // Faz 18 (P0-10): ORTAK MALİYET TABANI — denemeler artık base koşuyla
     // AYNI funding takviminde koşar. Eski kod trials'ı funding'siz koşturuyor
     // (base funding'liydi): vadeli stratejilerde denemeler sistematik olarak
     // iyimser olur, WFE/DSR karşılaştırması aynı tabanda olmazdı.
-    let res = run_backtest(bars, inst, cfg, start.clone(), session, funding)?;
+    let res = run_backtest_with_mmr_cancellable(
+        bars,
+        inst,
+        cfg,
+        start.clone(),
+        session,
+        funding,
+        None,
+        cancellation,
+    )?;
     let curve = &res.equity_curve;
     let mut rets = Vec::with_capacity(curve.len());
     let mut prev: Option<f64> = None;
@@ -255,6 +266,25 @@ pub fn certify(
     funding: &[(i64, String)],
     attempts: usize,
 ) -> Result<CertifyOutput, String> {
+    certify_cancellable(bars, inst, cfg, start_cash, session, mc_runs, funding, attempts, None)
+}
+
+/// Certification variant that cooperatively stops between trial backtests,
+/// CSCV partitions, and Monte Carlo paths.
+pub fn certify_cancellable(
+    bars: &[dca_kernel::Bar],
+    inst: &Instrument,
+    cfg: &BotConfig,
+    start_cash: Fraction,
+    session: dca_math::sessions::SessionType,
+    mc_runs: usize,
+    funding: &[(i64, String)],
+    attempts: usize,
+    cancellation: Option<&AtomicBool>,
+) -> Result<CertifyOutput, String> {
+    if cancellation.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err("backtest cancelled".into());
+    }
     if bars.len() < 20 {
         return Err("certify: need at least 20 bars".into());
     }
@@ -263,8 +293,12 @@ pub fn certify(
     let configs = variant_configs(cfg);
     let mut trials: Vec<TrialSeries> = Vec::new();
     for (i, c) in configs.iter().enumerate() {
-        match run_trial(bars, inst, c, &start_cash, session, funding) {
+        if cancellation.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err("backtest cancelled".into());
+        }
+        match run_trial(bars, inst, c, &start_cash, session, funding, cancellation) {
             Ok(t) => trials.push(t),
+            Err(error) if error == "backtest cancelled" => return Err(error),
             Err(e) => warnings.push(format!("trial {i} skipped: {e}")),
         }
     }
@@ -298,6 +332,9 @@ pub fn certify(
             lens.iter().map(|l| { let st = acc; acc += l; st }).collect()
         };
         for is_set in &combos {
+            if cancellation.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Err("backtest cancelled".into());
+            }
             let mut trial_is_sr = Vec::with_capacity(trials.len());
             let mut trial_oos_sr = Vec::with_capacity(trials.len());
             let mut trial_is_tot = Vec::with_capacity(trials.len());
@@ -423,11 +460,17 @@ pub fn certify(
     let mut finals = Vec::with_capacity(mc_runs);
     let mut mdds = Vec::with_capacity(mc_runs);
     for _ in 0..mc_runs {
+        if cancellation.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err("backtest cancelled".into());
+        }
         let mut eq = 1.0f64;
         let mut peak = 1.0f64;
         let mut mdd = 0.0f64;
         let mut filled = 0usize;
         while filled < n {
+            if cancellation.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Err("backtest cancelled".into());
+            }
             let start_idx = rng.below(n as u64) as usize;
             for k in 0..blen {
                 if filled >= n {

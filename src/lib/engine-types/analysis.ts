@@ -267,6 +267,8 @@ export interface BacktestRequest {
   config: BotConfig;
   /** P4-3d: market verisi bu venue'den çekilir (verilmezse BYBIT). */
   venue?: string;
+  /** Cancellable server job identifier; omitted by compatibility callers. */
+  request_id?: string;
 }
 
 /** Backtest Certifier — WFE / DSR / PBO (CSCV) / Monte Carlo block bootstrap. */

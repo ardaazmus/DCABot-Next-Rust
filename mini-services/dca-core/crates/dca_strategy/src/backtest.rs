@@ -13,6 +13,7 @@ use dca_math::Instrument;
 use dca_signals::{BarData, SignalEngine, Timeframe};
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /* ------------------------------------------------------------------ */
 /* Composite signal helpers (3Commas-style entry conditions)           */
@@ -241,6 +242,24 @@ pub fn run_backtest_with_mmr(
     funding: &[(i64, String)],
     mmr_brackets: Option<&[dca_math::MmrBracket]>,
 ) -> Result<BacktestResult, String> {
+    run_backtest_with_mmr_cancellable(bars, inst, cfg, start_cash, session, funding, mmr_brackets, None)
+}
+
+/// Backtest variant that checks a cancellation flag between bars. Existing
+/// callers keep the non-cancellable API above; server jobs opt into this path.
+pub fn run_backtest_with_mmr_cancellable(
+    bars: &[Bar],
+    inst: &Instrument,
+    cfg: &BotConfig,
+    start_cash: Fraction,
+    session: dca_math::sessions::SessionType,
+    funding: &[(i64, String)],
+    mmr_brackets: Option<&[dca_math::MmrBracket]>,
+    cancellation: Option<&AtomicBool>,
+) -> Result<BacktestResult, String> {
+    if cancellation.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err("backtest cancelled".into());
+    }
     let margin_mode = !cfg.kind.is_futures(); // is_spot flag: futures kinds trade linear margin
     let stepper_lev = if margin_mode {
         Fraction::one()
@@ -365,6 +384,9 @@ pub fn run_backtest_with_mmr(
     let mut regime_closes: Vec<f64> = Vec::new();
 
     for (bar_i, bar) in bars.iter().enumerate() {
+        if cancellation.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err("backtest cancelled".into());
+        }
         let o = Fraction::from_decimal_str(&bar.o).map_err(|e| e.to_string())?;
         let h = Fraction::from_decimal_str(&bar.h).map_err(|e| e.to_string())?;
         let l = Fraction::from_decimal_str(&bar.l).map_err(|e| e.to_string())?;
