@@ -22,6 +22,35 @@ export function isUiPasswordConfigured(): boolean {
   return Boolean(process.env.DCA_UI_PASSWORD?.trim());
 }
 
+/**
+ * Logout is intentionally callable without a valid session, but only as a
+ * same-origin JSON mutation. This prevents cross-site forms from forcing a
+ * browser to discard its session cookie.
+ */
+export function isSameOriginJsonRequest(headers: Headers, requestUrl: string): boolean {
+  const contentType = headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+  if (contentType !== "application/json") return false;
+
+  const fetchSite = headers.get("sec-fetch-site")?.trim().toLowerCase();
+  if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") return false;
+
+  const origin = headers.get("origin");
+  if (!origin) return true;
+
+  try {
+    const request = new URL(requestUrl);
+    const parsedOrigin = new URL(origin);
+    const requestHost = headers.get("host")?.trim().toLowerCase() || request.host.toLowerCase();
+    if (parsedOrigin.host.toLowerCase() !== requestHost) return false;
+    // A browser's same-origin fetch metadata remains authoritative when a
+    // trusted reverse proxy terminates TLS before Next.js. Without that
+    // signal, also require the request URL scheme to match the Origin.
+    return fetchSite === "same-origin" || parsedOrigin.protocol === request.protocol;
+  } catch {
+    return false;
+  }
+}
+
 export function createSessionToken(): string {
   const secret = getSecret();
   if (!secret) {

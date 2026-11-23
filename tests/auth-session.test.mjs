@@ -86,6 +86,41 @@ test("production requires UI authentication even without an opt-in flag", () => 
   });
 });
 
+test("logout accepts same-origin JSON and originless JSON clients", () => {
+  const requestUrl = "https://bot.example.test/api/auth/logout";
+  assert.equal(authSession.isSameOriginJsonRequest(new Headers({
+    "content-type": "application/json; charset=utf-8",
+    origin: "https://bot.example.test",
+    host: "bot.example.test",
+    "sec-fetch-site": "same-origin",
+  }), requestUrl), true);
+  // Next may normalize the URL hostname while the inbound Host remains the
+  // browser's actual loopback alias (127.0.0.1 versus localhost).
+  assert.equal(authSession.isSameOriginJsonRequest(new Headers({
+    "content-type": "application/json",
+    origin: "http://127.0.0.1:3000",
+    host: "127.0.0.1:3000",
+    "sec-fetch-site": "same-origin",
+  }), "http://localhost:3000/api/auth/logout"), true);
+  assert.equal(authSession.isSameOriginJsonRequest(new Headers({
+    "content-type": "application/json",
+  }), requestUrl), true);
+});
+
+test("logout rejects cross-origin, malformed-origin, and form-encoded requests", () => {
+  const requestUrl = "https://bot.example.test/api/auth/logout";
+  for (const headers of [
+    new Headers({ "content-type": "application/json", origin: "https://attacker.example" }),
+    new Headers({ "content-type": "application/json", origin: "null" }),
+    new Headers({ "content-type": "application/json", origin: "http://bot.example.test", host: "bot.example.test" }),
+    new Headers({ "content-type": "application/x-www-form-urlencoded" }),
+    new Headers({ "content-type": "application/json", "sec-fetch-site": "cross-site" }),
+    new Headers({ "content-type": "application/json", "sec-fetch-site": "same-site" }),
+  ]) {
+    assert.equal(authSession.isSameOriginJsonRequest(headers, requestUrl), false);
+  }
+});
+
 test("the UI password cannot fall back to exchange or engine API keys", () => {
   withEnv({ DCA_API_KEY: "shared-api-key", ENGINE_API_KEY: "engine-key" }, () => {
     assert.equal(authSession.isUiPasswordConfigured(), false);

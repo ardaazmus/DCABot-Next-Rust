@@ -1220,7 +1220,9 @@ impl DcaEngine {
             acts.push(Action::Log {
                 level: "INFO",
                 message: format!(
-                    "deal closed gross={} fees={} funding={} net={} reason={} wins={} losses={}",
+                    "deal closed deal_no={} closed_ts={} gross={} fees={} funding={} net={} reason={} wins={} losses={}",
+                    self.deal_seq,
+                    fill.ts,
                     realized.to_half_even_display(8),
                     self.deal_fees.to_half_even_display(8),
                     self.funding_deal.to_half_even_display(8),

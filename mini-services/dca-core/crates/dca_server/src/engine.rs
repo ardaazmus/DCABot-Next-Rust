@@ -1782,12 +1782,20 @@ pub async fn dispatch_action(
                     Ok(c) => c,
                     Err(e) => return Err(e.to_string()),
                 };
-                let inserted = conn.execute(
-                    "INSERT OR IGNORE INTO deals(bot_id, deal_no, opened_ts, closed_ts, gross_pnl, fees, funding, net_pnl, safety_triggered, status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'CLOSED')",
-                    rusqlite::params![rt.bot_id, deal_no as i64, opened_ts, closed_ts, gross_pnl, fees, funding, net_pnl, safety_triggered as i64],
+                let inserted = crate::deals::insert_closed_deal_once(
+                    &conn,
+                    &rt.bot_id,
+                    deal_no as i64,
+                    opened_ts,
+                    closed_ts,
+                    &gross_pnl,
+                    &fees,
+                    &funding,
+                    &net_pnl,
+                    safety_triggered,
                 );
                 match inserted {
-                    Ok(n) if n > 0 => Some(("INFO", format!("deal #{} kalıcı deftere yazıldı (net {}, {})", deal_no, net_pnl, reason))),
+                    Ok(true) => Some(("INFO", format!("deal #{} kalıcı deftere yazıldı (net {}, {})", deal_no, net_pnl, reason))),
                     Ok(_) => None, // duplicate — idempotent yoksayma
                     Err(e) => Some(("CRITICAL", format!("deal defter yazımı başarısız (deal #{}): {e} — muhasebe mutabakatı gerekli", deal_no))),
                 }

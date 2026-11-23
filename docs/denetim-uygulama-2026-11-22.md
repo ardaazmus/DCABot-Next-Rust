@@ -107,4 +107,4 @@ Bu belge kaynak rapordaki maddelerin repo üzerindeki uygulama durumunu kaydeder
 
 Özel borsa hesabı endpoint'lerine veya ana ağa işlem isteği gönderilmedi. PAPER motoru kamuya açık piyasa verisi çekebilir; hiçbir canlı emir gönderilmedi. Docker kontrolleri izole sahte sırlarla yapıldı; kullanıcı volume'ları korunarak test volume'ları silindi. Bu doküman denetim notlarının tümünü tamamlanmış saymaz; yukarıdaki maddeler ayrı geliştirme işi olarak açık bırakılmıştır.
 
-22 Kasım tarihli doğrulama ve yeniden denetim raporu için güncel kod karşılaştırması ve bu turdaki Bybit pagination düzeltmesi [ikinci rapor uygulama durumunda](denetim-raporu-2-uygulama-durumu.md) tutuluyor.
+22 Kasım tarihli doğrulama ve yeniden denetim raporu için güncel kod karşılaştırması, Bybit pagination düzeltmesi ve 23 Kasım son takipteki çift muhasebe kaydı/logout iyileştirmeleri [ikinci rapor uygulama durumunda](denetim-raporu-2-uygulama-durumu.md) tutuluyor.

@@ -6,7 +6,7 @@
 
 **Raporun incelediği HEAD:** `18083ca`
 
-**Bu çalışma sırasında doğrulanan dal HEAD'i:** `a23a59b` (`codex/apply-audit-2026-11-22`)
+**İlk takip doğrulamasındaki dal HEAD'i:** `a23a59b` (`codex/apply-audit-2026-11-22`)
 
 Rapor daha eski bir commit'i denetliyor. Bu nedenle maddeler rapordaki eski satır durumuna göre değil, mevcut dalın koduna göre tekrar kontrol edildi.
 
@@ -37,6 +37,29 @@ Rapordaki **Bybit execution geçmişinin tek `limit=100` sayfasında kesilebilme
 - Yerel UI `http://127.0.0.1:3000` çalışıyor; engine `http://127.0.0.1:3002/api/health` ve DB health `ok`.
 - Yerel bot listesindeki 18 botun tamamı `PAPER / RUNNING`.
 - Son cursor-kodlama değişikliği sonrası tam Rust test workspace'i çalıştırılmadı. Gerçek borsa hesabı, özel endpoint veya emir kullanılmadı.
+
+## 23 Kasım ek takip: muhasebe tekilleştirme ve oturum kapatma
+
+`2ff94d1` tabanından sonra yerel PAPER panelinde kapalı işlem listesinde olay akışı ile kalıcı `deals` tablosunun aynı kapanışları iki kez gösterdiği doğrulandı. Tekrarlanan kayıtlar kâr/zarar toplamlarını ve işlem istatistiklerini şişirebiliyordu. Güncel kodda:
+
+- Yeni kapanış olayları kararlı `deal_no` ve gerçek `closed_ts` taşıyor; kalıcı defter yazımı aynı bot ve işlem numarası için tek SQL ifadesiyle idempotent hale getirildi.
+- Eski kayıtlarda kimlik bulunmadığında yalnız bot, brüt PnL, komisyon, funding ve net PnL eşleşmesi karşılıklı olarak tekilse ve zaman farkı altı saati aşmıyorsa bir kayıt tutuluyor. Eşleşme belirsizse işlem gizlenmiyor.
+- Yerel `GET /api/engine/api/deals` toplamı 155 çift kaynaklı satırdan 142 tekil kapanışa indi; 13 kopya özet dışı kaldı.
+- `POST /api/auth/logout` için same-origin JSON/Fetch Metadata kapısı eklendi. Daha önce route bulunmasına rağmen panelde oturum kapatma eylemi yoktu; kimlik doğrulama zorunluysa artık başlıkta erişilebilir bir **Çıkış** düğmesi var. Başarılı çıkış kök sayfayı yeniden yükleyerek bellekteki ekran durumunu da temizliyor.
+- Yerel entegrasyon kontrolü, Next'in `localhost` ve `127.0.0.1` adlarını normalize edebildiğini gösterdi. Kaynak kontrolü bu nedenle gerçek gelen `Host` değerini de karşılaştırıyor; aynı-origin loopback isteği `200`, cross-origin isteği `403` döndü.
+
+Bu takipte doğrulama:
+
+- `npm run test:auth`: 11 test geçti; logout kaynak kontrolleri ve red durumları test edildi.
+- Yerel logout route kontrolü: same-origin POST `200`, cross-origin POST `403`.
+- `npm test`: API sözleşme testlerinin 27'si geçti.
+- `npx tsc --noEmit` ve `npm run lint` geçti.
+- `cargo test --locked --offline -p dca_server -p dca_strategy`: sunucu 75, strateji 70 + 10 yeniden üretim + 5 finans testi geçti.
+- `cargo test --locked --offline --workspace` geçti.
+- Yerel UI `http://127.0.0.1:3000` ve engine `http://127.0.0.1:3002/api/health` yanıt verdi; `health=ok`, DB `ok`. 18/18 bot `PAPER / RUNNING`; kapalı işlem API'si 142 kayıt döndürdü.
+- Yerel arayüz gözle kontrol edildi. Bu doğrulama gerçek mobil cihaz/ekran okuyucu kabul testi değildir.
+- Gerçek borsa özel endpoint'i çağrılmadı ve emir gönderilmedi.
+- Codex Security Standard tarayıcısı 262 dosyalık envanterin keşif aşamasında 0/6 yüzeyde ilerledi ve rapor üretemedi; takılı kalan iki çalışma sonlandırıldı. Bu ek takip bulguları kaynak kodu incelemesi ve çalıştırılan testlere dayanır, tamamlanmış bağımsız tarama sertifikası değildir.
 
 ## Açık kalan işler
 

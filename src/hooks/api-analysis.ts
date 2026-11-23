@@ -115,6 +115,7 @@ export async function apiEquity(days = 30, signal?: AbortSignal): Promise<{ days
 
 export interface ClosedDeal {
   id: string;
+  dealNo?: number | null;
   botId: string;
   botName: string;
   symbol: string;

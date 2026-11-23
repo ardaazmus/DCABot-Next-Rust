@@ -8,6 +8,7 @@ import {
   Calculator,
   FlaskConical,
   LayoutDashboard,
+  LogOut,
   MoreHorizontal,
   RefreshCw,
   Settings,
@@ -108,6 +109,10 @@ export default function Page({ searchParams }: { searchParams: PageSearchParams 
   const [wizardExecutionEnvironment, setWizardExecutionEnvironment] = useState<ExecutionEnvironmentChoice>("INTERNAL_PAPER");
   const [wizardSession, setWizardSession] = useState(0);
   const [authLocked, setAuthLocked] = useState(false);
+  const [authRequired, setAuthRequired] = useState(false);
+  const [authenticated, setAuthenticated] = useState(false);
+  const [logoutPending, setLogoutPending] = useState(false);
+  const [logoutError, setLogoutError] = useState(false);
   /* P1 + P6 */
   const [moreOpen, setMoreOpen] = useState(false);
   const reduceMotion = useReducedMotion();
@@ -121,12 +126,32 @@ export default function Page({ searchParams }: { searchParams: PageSearchParams 
     fetch("/api/auth/check")
       .then((r) => r.json())
       .then((d) => {
+        setAuthRequired(Boolean(d.authRequired));
+        setAuthenticated(Boolean(d.authenticated));
         if (d.authRequired && !d.authenticated) {
           setAuthLocked(true);
         }
       })
       .catch(() => {});
   }, []);
+
+  const handleLogout = async () => {
+    setLogoutPending(true);
+    setLogoutError(false);
+    try {
+      const response = await fetch("/api/auth/logout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const result = await response.json().catch(() => null);
+      if (!response.ok || result?.ok !== true) throw new Error("Logout failed");
+      window.location.replace("/");
+    } catch {
+      setLogoutError(true);
+      setLogoutPending(false);
+    }
+  };
 
   // Faz 1.1 (P1): URL Senkronizasyonu & Tarayıcı Geri/İleri (popstate) Desteği
   useEffect(() => {
@@ -208,6 +233,25 @@ export default function Page({ searchParams }: { searchParams: PageSearchParams 
               {online ? `CORE v${health?.version ?? "—"}` : "CORE OFFLINE"}
             </span>
             <KillButton onStopAll={refetch} />
+            {authRequired && authenticated && (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="min-h-9 border-border-strong px-2.5 text-slate-300 hover:bg-surface-2"
+                onClick={handleLogout}
+                disabled={logoutPending}
+                aria-label={logoutPending ? "Oturum kapatılıyor" : "Oturumu kapat"}
+              >
+                <LogOut className="h-4 w-4" aria-hidden />
+                <span className="hidden sm:inline">{logoutPending ? "Çıkış…" : "Çıkış"}</span>
+              </Button>
+            )}
+            {logoutError && (
+              <span role="alert" className="max-w-20 truncate text-[10px] text-rose-400 sm:max-w-none sm:text-xs">
+                Çıkış başarısız
+              </span>
+            )}
           </div>
         </div>
       </header>
@@ -409,6 +453,7 @@ export default function Page({ searchParams }: { searchParams: PageSearchParams 
         <AuthDialog
           onAuthenticated={() => {
             setAuthLocked(false);
+            setAuthenticated(true);
             refetch();
           }}
         />

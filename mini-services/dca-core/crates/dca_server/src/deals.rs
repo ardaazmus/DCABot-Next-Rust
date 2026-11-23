@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::state::{now_ms, AppState};
@@ -19,6 +19,7 @@ use crate::state::{now_ms, AppState};
 #[serde(rename_all = "camelCase")]
 pub struct ClosedDeal {
     pub id: String,
+    pub deal_no: Option<i64>,
     pub bot_id: String,
     pub bot_name: String,
     pub symbol: String,
@@ -59,10 +60,14 @@ fn parse_closed_deal_message(
     let mut losses = 0u32;
     let mut has_net = false;
     let mut has_gross = false;
+    let mut deal_no = None;
+    let mut closed_ts = None;
 
     for token in msg.split_whitespace() {
         if let Some((k, v)) = token.split_once('=') {
             match k {
+                "deal_no" => deal_no = v.parse::<i64>().ok().filter(|value| *value > 0),
+                "closed_ts" => closed_ts = v.parse::<i64>().ok().filter(|value| *value > 0),
                 "net" => {
                     if let Some(val) = v.parse::<f64>().ok().filter(|val| val.is_finite()) {
                         net = val;
@@ -120,7 +125,8 @@ fn parse_closed_deal_message(
     let venue = meta.map(|m| m.venue.clone()).unwrap_or_else(|| "BYBIT".to_string());
     let kind = meta.map(|m| m.kind.clone()).unwrap_or_else(|| "DCA".to_string());
 
-    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ts)
+    let closed_ts = closed_ts.unwrap_or(ts);
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(closed_ts)
         .unwrap_or_else(chrono::Utc::now);
     let date = dt.format("%Y-%m-%d").to_string();
     let time = dt.format("%H:%M:%S").to_string();
@@ -135,12 +141,13 @@ fn parse_closed_deal_message(
 
     ClosedDeal {
         id: format!("deal-{id}"),
+        deal_no,
         bot_id: bot_id.to_string(),
         bot_name,
         symbol,
         venue,
         kind,
-        closed_ts: ts,
+        closed_ts,
         date,
         time,
         gross_pnl: (gross * 100_000_000.0).round() / 100_000_000.0,
@@ -186,33 +193,33 @@ pub fn fetch_all_closed_deals(conn: &rusqlite::Connection) -> Result<Vec<ClosedD
         ))
     })?;
 
-    let mut deals = Vec::new();
+    let mut event_deals = Vec::new();
     for row in ev_rows.flatten() {
         let (id, bot_id, msg, ts) = row;
-        deals.push(parse_closed_deal_message(id, &bot_id, &msg, ts, &bot_map));
+        event_deals.push(parse_closed_deal_message(id, &bot_id, &msg, ts, &bot_map));
     }
 
-    // 3. Check deals table if populated
+    // 3. Load the durable ledger. It is authoritative when it carries the
+    // same bot/deal number as an event; the event remains a fallback for old
+    // databases written before the deals table was introduced.
+    let mut table_deals = Vec::new();
     if let Ok(mut d_stmt) = conn.prepare(
-        "SELECT id, bot_id, gross_pnl, fees, funding, closed_ts FROM deals WHERE closed_ts > 0 ORDER BY closed_ts DESC",
+        "SELECT id, bot_id, deal_no, gross_pnl, fees, funding, closed_ts FROM deals WHERE closed_ts > 0 ORDER BY closed_ts DESC",
     ) {
         let d_rows = d_stmt.query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                r.get::<_, Option<i64>>(2)?,
                 r.get::<_, Option<String>>(3)?.unwrap_or_default(),
                 r.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                r.get::<_, i64>(5)?,
+                r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                r.get::<_, i64>(6)?,
             ))
         });
         if let Ok(rows) = d_rows {
             for row in rows.flatten() {
-                let (id, bot_id, gross_str, fees_str, funding_str, ts) = row;
-                // Avoid duplicates if ts matches an existing deal
-                if deals.iter().any(|d| d.bot_id == bot_id && d.closed_ts.abs_diff(ts) < 1000) {
-                    continue;
-                }
+                let (id, bot_id, deal_no, gross_str, fees_str, funding_str, ts) = row;
                 let gross = gross_str.parse::<f64>().ok().filter(|v| v.is_finite()).unwrap_or(0.0);
                 let fees = fees_str.parse::<f64>().ok().filter(|v| v.is_finite()).unwrap_or(0.0);
                 let funding = funding_str.parse::<f64>().ok().filter(|v| v.is_finite()).unwrap_or(0.0);
@@ -220,8 +227,9 @@ pub fn fetch_all_closed_deals(conn: &rusqlite::Connection) -> Result<Vec<ClosedD
                 let meta = bot_map.get(&bot_id);
                 let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ts)
                     .unwrap_or_else(chrono::Utc::now);
-                deals.push(ClosedDeal {
+                table_deals.push(ClosedDeal {
                     id: format!("deal-tbl-{id}"),
+                    deal_no,
                     bot_name: meta.map(|m| m.name.clone()).unwrap_or_else(|| bot_id.clone()),
                     symbol: meta.map(|m| m.symbol.clone()).unwrap_or_else(|| "BTCUSDT".to_string()),
                     venue: meta.map(|m| m.venue.clone()).unwrap_or_else(|| "BYBIT".to_string()),
@@ -243,9 +251,106 @@ pub fn fetch_all_closed_deals(conn: &rusqlite::Connection) -> Result<Vec<ClosedD
         }
     }
 
+    let table_deal_keys: HashSet<(String, i64)> = table_deals
+        .iter()
+        .filter_map(|deal| deal.deal_no.map(|number| (deal.bot_id.clone(), number)))
+        .collect();
+    let mut deals = Vec::with_capacity(event_deals.len() + table_deals.len());
+    for (event_index, event) in event_deals.iter().enumerate() {
+        if event
+            .deal_no
+            .is_some_and(|number| table_deal_keys.contains(&(event.bot_id.clone(), number)))
+        {
+            continue;
+        }
+        if event.deal_no.is_none()
+            && is_unambiguous_legacy_duplicate(event_index, &event_deals, &table_deals)
+        {
+            continue;
+        }
+        deals.push(event.clone());
+    }
+    deals.extend(table_deals);
+
     // Sort by closed_ts descending
     deals.sort_by(|a, b| b.closed_ts.cmp(&a.closed_ts));
     Ok(deals)
+}
+
+/// Persist each bot-local deal identity at most once. A single SQLite
+/// statement makes the existence check and insert atomic for concurrent
+/// engine processes that share the same database file.
+pub(crate) fn insert_closed_deal_once(
+    conn: &rusqlite::Connection,
+    bot_id: &str,
+    deal_no: i64,
+    opened_ts: i64,
+    closed_ts: i64,
+    gross_pnl: &str,
+    fees: &str,
+    funding: &str,
+    net_pnl: &str,
+    safety_triggered: usize,
+) -> Result<bool, rusqlite::Error> {
+    let inserted = conn.execute(
+        "INSERT INTO deals(bot_id, deal_no, opened_ts, closed_ts, gross_pnl, fees, funding, net_pnl, safety_triggered, status)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'CLOSED'
+         WHERE NOT EXISTS (SELECT 1 FROM deals WHERE bot_id=?1 AND deal_no=?2)",
+        rusqlite::params![
+            bot_id,
+            deal_no,
+            opened_ts,
+            closed_ts,
+            gross_pnl,
+            fees,
+            funding,
+            net_pnl,
+            safety_triggered as i64
+        ],
+    )?;
+    Ok(inserted > 0)
+}
+
+const LEGACY_DEAL_TIMESTAMP_SKEW_MS: u64 = 6 * 60 * 60 * 1000;
+
+fn same_financial_deal(left: &ClosedDeal, right: &ClosedDeal) -> bool {
+    let same_amount = |a: f64, b: f64| (a - b).abs() <= 0.00000001;
+    left.bot_id == right.bot_id
+        && same_amount(left.gross_pnl, right.gross_pnl)
+        && same_amount(left.fees, right.fees)
+        && same_amount(left.funding, right.funding)
+        && same_amount(left.net_pnl, right.net_pnl)
+        && left.closed_ts.abs_diff(right.closed_ts) <= LEGACY_DEAL_TIMESTAMP_SKEW_MS
+}
+
+/// Old close events lack the durable deal number. Merge one only when both
+/// sides have a unique exact financial match within the observed event-time
+/// skew; ambiguous matches stay visible so a real trade is never discarded.
+fn is_unambiguous_legacy_duplicate(
+    event_index: usize,
+    events: &[ClosedDeal],
+    table_deals: &[ClosedDeal],
+) -> bool {
+    let mut table_match = None;
+    for table_deal in table_deals {
+        if same_financial_deal(&events[event_index], table_deal) {
+            if table_match.is_some() {
+                return false;
+            }
+            table_match = Some(table_deal);
+        }
+    }
+    let Some(table_deal) = table_match else {
+        return false;
+    };
+
+    let reciprocal_match_count = events
+        .iter()
+        .filter(|candidate| {
+            candidate.deal_no.is_none() && same_financial_deal(candidate, table_deal)
+        })
+        .count();
+    reciprocal_match_count == 1
 }
 
 /// Profit factor over individual trade net results: positive net sum divided
@@ -646,6 +751,95 @@ mod tests {
         );
         assert!(deal.net_pnl.is_finite());
         assert_eq!(deal.net_pnl, 1.0);
+    }
+
+    fn ledger_test_connection() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE bots(id TEXT PRIMARY KEY, name TEXT, symbol TEXT, venue TEXT, kind TEXT);
+             CREATE TABLE events(id INTEGER PRIMARY KEY, bot_id TEXT, message TEXT, ts INTEGER);
+             CREATE TABLE deals(id INTEGER PRIMARY KEY, bot_id TEXT, deal_no INTEGER, opened_ts INTEGER, gross_pnl TEXT, fees TEXT, funding TEXT, net_pnl TEXT, safety_triggered INTEGER, status TEXT, closed_ts INTEGER);
+             INSERT INTO bots(id, name, symbol, venue, kind) VALUES('bot-1', 'Paper bot', 'BTCUSDT', 'BYBIT', 'DCA');",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn stable_deal_number_merges_event_and_table_even_when_event_logged_late() {
+        let conn = ledger_test_connection();
+        conn.execute(
+            "INSERT INTO events(id, bot_id, message, ts) VALUES(1, 'bot-1', ?1, 9999999)",
+            ["deal closed deal_no=7 closed_ts=1000 gross=1 fees=0.1 funding=0 net=0.9 reason=TP wins=1 losses=0"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO deals(id, bot_id, deal_no, opened_ts, gross_pnl, fees, funding, net_pnl, safety_triggered, status, closed_ts) VALUES(1, 'bot-1', 7, 0, '1', '0.1', '0', '0.9', 0, 'CLOSED', 1000)",
+            [],
+        )
+        .unwrap();
+
+        let deals = fetch_all_closed_deals(&conn).unwrap();
+        assert_eq!(deals.len(), 1);
+        assert_eq!(deals[0].id, "deal-tbl-1");
+        assert_eq!(deals[0].deal_no, Some(7));
+        assert_eq!(deals[0].closed_ts, 1000);
+    }
+
+    #[test]
+    fn unique_legacy_event_table_pair_is_merged_within_time_skew() {
+        let conn = ledger_test_connection();
+        conn.execute(
+            "INSERT INTO events(id, bot_id, message, ts) VALUES(1, 'bot-1', ?1, 120000)",
+            ["deal closed gross=1 fees=0.1 funding=0 net=0.9 reason=TP wins=1 losses=0"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO deals(id, bot_id, deal_no, opened_ts, gross_pnl, fees, funding, net_pnl, safety_triggered, status, closed_ts) VALUES(1, 'bot-1', 7, 0, '1', '0.1', '0', '0.9', 0, 'CLOSED', 1000)",
+            [],
+        )
+        .unwrap();
+
+        let deals = fetch_all_closed_deals(&conn).unwrap();
+        assert_eq!(deals.len(), 1);
+        assert_eq!(deals[0].id, "deal-tbl-1");
+    }
+
+    #[test]
+    fn ambiguous_legacy_matches_are_preserved() {
+        let conn = ledger_test_connection();
+        conn.execute(
+            "INSERT INTO events(id, bot_id, message, ts) VALUES(1, 'bot-1', ?1, 1500)",
+            ["deal closed gross=1 fees=0.1 funding=0 net=0.9 reason=TP wins=1 losses=0"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO deals(id, bot_id, deal_no, opened_ts, gross_pnl, fees, funding, net_pnl, safety_triggered, status, closed_ts) VALUES(1, 'bot-1', 7, 0, '1', '0.1', '0', '0.9', 0, 'CLOSED', 1000), (2, 'bot-1', 8, 0, '1', '0.1', '0', '0.9', 0, 'CLOSED', 2000)",
+            [],
+        )
+        .unwrap();
+
+        let deals = fetch_all_closed_deals(&conn).unwrap();
+        assert_eq!(deals.len(), 3);
+    }
+
+    #[test]
+    fn durable_deal_insert_is_idempotent_by_bot_and_deal_number() {
+        let conn = ledger_test_connection();
+        let inserted = insert_closed_deal_once(
+            &conn, "bot-1", 7, 900, 1000, "1", "0.1", "0", "0.9", 0,
+        )
+        .unwrap();
+        let duplicate = insert_closed_deal_once(
+            &conn, "bot-1", 7, 900, 1000, "1", "0.1", "0", "0.9", 0,
+        )
+        .unwrap();
+        assert!(inserted);
+        assert!(!duplicate);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM deals WHERE bot_id='bot-1' AND deal_no=7", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
