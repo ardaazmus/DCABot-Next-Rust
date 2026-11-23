@@ -219,7 +219,7 @@ export interface ReconcileResult {
   supported: boolean;
   reason?: string;
   match?: boolean;
-  local?: { side: string; qty: string };
+  local?: { side: string; qty: string; avgPrice?: string | null };
   exchange?: { side: string; size: string; avgPrice: string }[];
   actionRequired?: boolean;
   note?: string;

@@ -115,6 +115,7 @@ Canary yalnız önceki katmanların tamamı geçtikten sonra, operatörün onay�
 | Key/endpoint | Etkin adapter hedefini kullan; çekim/transfer yok, gerekli market trade scope’u var; mainnet key’i IP kısıtlı |
 | Self-check | 15 dakikalık tazelik penceresi; eski/başarısız check ile başlatma reddedilir |
 | Restart | Önceden RUNNING LIVE bot PAUSED restore edilir; credential yoksa LIVE kimliği korunur |
+| Pozisyon/emir sahipliği | Futures pozisyon yönü, miktarı ve ortalama giriş fiyatı restore, START/UNFREEZE ve her poll'da yerel defterle karşılaştırılır; farkta FROZEN/fail-closed. Aynı sembolde yabancı açık emir sahiplenilmez. Doğrulanmamış venue-flat durumunda sentetik LIQ fill üretilmez. |
 | Alternatif emir yolu | LIVE ADD_FUNDS, bot durumu, sertifika, self-check, key ve ortak wallet/min-notional kapısını kullanır |
 | Canlı config | TP/SL/trailing patch sertifika kapısını geçersiz kılabileceğinden LIVE’da reddedilir |
 | UI | Dashboard, Studio ve Fleet PAPER, Demo/Testnet ve Mainnet’i ayrı etiketler/filtreler; bot oluşturma üç seçenek sunar |
@@ -127,12 +128,14 @@ Canary yalnız önceki katmanların tamamı geçtikten sonra, operatörün onay�
 - Son exact-endpoint değişikliği `cargo build --manifest-path mini-services/dca-core/Cargo.toml -p dca_server` ile derlendi ve yerel motor yeniden başlatıldı: `127.0.0.1:3002/api/health` **ok**, etkin ortamlar Bybit Demo, Binance Testnet, OKX Demo ve iç PAPER; UI `127.0.0.1:3000` **HTTP 200**.
 - Yerel veritabanında 18 botun tamamı `PAPER / RUNNING`; vault anahtarı yok. Bu doğrulamada gerçek veya borsa Demo/Testnet emri gönderilmedi.
 - Bu son değişiklikte Rust/TypeScript test takımları yeniden çalıştırılmadı; önceki hardening revizyonunda çalıştırılmış sonuçlar bu patch için geçerli test kanıtı sayılmaz.
+- 23 Kasım pozisyon/emir sahipliği takip yamasında `cargo check --manifest-path mini-services/dca-core/Cargo.toml -p dca_server` ve `npx tsc --noEmit` geçti; bu takip yaması için test takımları veya borsa emirleri çalıştırılmadı.
 - `npm audit --omit=dev`: **0 bilinen production dependency açığı** (npm advisory verisine göre, tarama tarihi 23.11.2026).
 - Gerçek borsa emirleri, Demo/Testnet emirleri veya mevcut bot verisi üzerinde işlem testi yapılmadı. Finansal etkili testi ancak ayrı test hesabında ve ayrıca planlanmış canary sırasında çalıştırın.
 - Rust için bu çalışmada otomatik dependency advisory taraması yok. Kod içinde review ve testler yapıldı; managed Codex Security Deep Scan bu Windows çalışma alanında gerekli yönetilen filesystem izin profilini alamadığı için başlamadı. Bu sonuç “bulgu yok” anlamına gelmez.
 - `live_certified=0` göç varsayılanı nedeniyle daha önce oluşturulmuş LIVE botlar yeniden START edemez. Eski sertifika olayları geçmişte kullanıcı istisnasıyla da `GECTI` kaydı üretebildiğinden güvenli backfill yapılmadı; yeniden sertifikalandırılmış yeni bot oluşturulmalı.
 - Eski vault anahtarları ortam bilinmediği için `UNVERIFIED` olarak göç eder. Önceki sürümün genel `SANDBOX` etiketli anahtarları da endpoint ayrımını kanıtlayamadığından `UNVERIFIED` durumuna alınır. Ayarlar ekranında motorun etkin endpoint’inde yeniden doğrulanınca tam endpoint adına atanır. Endpoint ortamı bir venue için uygulama konfigürasyonundan geldiğinden aynı süreçte o venue’nün Demo/Testnet ve Mainnet botları birlikte koşturulamaz.
 - 500 barlık sertifika tek başına istatistiksel yeterlilik değildir. Walk-forward/OOS doğrulaması, testnet soak, kesinti ve restart fault injection, alarm/notification, gerçek bakiye mutabakatı ve operasyon/runbook kanıtı tamamlanmadan sistem üretim LIVE hazır sayılmamalı.
+- Pozisyon karşılaştırması hesap-geneli snapshot'ı kullanır; netting hesapta aynı yön/miktar/ortalama fiyata sahip manuel pozisyon ile bot pozisyonunu kesin ayıramaz. Spot coin envanteri mevcut `PositionSnapshot` sözleşmesinde yoktur. LIVE için botlara ayrılmış hesap/alt hesap, spot bakiye mutabakatı ve borsa sandbox kabul akışı gerekir. Pozisyon endpoint'i her LIVE futures poll'unda çağrıldığı için private API rate limit/çoklu bot ölçeği ayrıca sınanmalıdır.
 - Bybit bölgesel REST endpoint listesi eklendi; farklı region hesaplarında key, demo/testnet erişimi ve websocket adresleri ayrıca doğrulanmalı.
 - Daybreak Markets kaydı yalnız bilgi bağlamında tutulur; salt-okunur araştırma ürünü olduğu için emir/anahtar entegrasyonu veya DCA yürütme ortamı olarak kullanılmaz.
 

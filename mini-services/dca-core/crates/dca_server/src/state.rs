@@ -3,7 +3,7 @@
 use crate::store::{Db, Vault};
 use dca_exchange::{
     binance::BinanceAdapter, bybit::BybitAdapter, okx::OkxAdapter, paper::PaperVenue, VenueAdapter,
-    VenueCreds,
+    PositionSnapshot, VenueCreds,
 };
 use dca_kernel::{SimulationStepper, StepperConfig};
 use dca_math::fraction::Fraction;
@@ -60,6 +60,9 @@ pub struct BotRuntime {
     pub breaker_tripped: bool,
     /// Task 18 Ş1: bilinmeyen venue için tek seferlik WARN (poll döngüsü spam etmesin).
     pub venue_warned: bool,
+    /// LIVE futures position snapshot is temporarily unavailable. Suppresses
+    /// repeated warning events while the risk-increasing strategy path fails closed.
+    pub venue_position_check_warned: bool,
     /// Faz 4.5 (C-5): Bybit pozisyon-modu denetimi — DCA ailesi one-way
     /// (positionIdx=0) ile çalışır; hesap hedge-mode'daysa venue emirleri
     /// reddeder. blocked=true iken LIVE Add emirleri gönderilmez.
@@ -100,6 +103,75 @@ pub struct BotRuntime {
     pub mmr_brackets_at: i64,
     /// Faz 0.2/0.3 — global şalter WARN'i tek seferlik (poll spam'i yok).
     pub halt_warned: bool,
+}
+
+/// Compare the venue's current futures positions with this bot's persisted
+/// main/hedge ledgers. Account-wide venue positions cannot identify their
+/// owner, so a mismatch must stop the bot instead of being adopted silently.
+/// Spot adapters do not expose owned coin inventory through this contract.
+pub fn venue_positions_match_runtime(rt: &BotRuntime, positions: &[PositionSnapshot]) -> bool {
+    if !rt.cfg.kind.is_futures() {
+        return true;
+    }
+
+    let mut expected: Vec<(String, Fraction, Fraction, Fraction)> = Vec::new();
+    for stepper in std::iter::once(&rt.stepper).chain(rt.hedge_stepper.iter()) {
+        let position = &stepper.position;
+        if position.qty.is_zero() {
+            continue;
+        }
+        let Some(avg_price) = position.avg_price.clone() else {
+            return false;
+        };
+        expected.push((
+            if position.direction == 1 {
+                "Buy"
+            } else {
+                "Sell"
+            }
+            .into(),
+            position.qty.clone(),
+            avg_price,
+            stepper.instrument.tick_size.clone(),
+        ));
+    }
+
+    let actual: Vec<&PositionSnapshot> = positions
+        .iter()
+        .filter(|position| !position.size.is_zero())
+        .collect();
+    if actual.len() != expected.len()
+        || actual
+            .iter()
+            .any(|position| !position.symbol.eq_ignore_ascii_case(&rt.cfg.symbol))
+    {
+        return false;
+    }
+
+    let mut used = vec![false; actual.len()];
+    for (side, qty, avg_price, tick_size) in expected {
+        let matched = actual.iter().enumerate().position(|(index, position)| {
+            if used[index] || !position.side.eq_ignore_ascii_case(&side) || position.size != qty {
+                return false;
+            }
+            let Ok(delta) = position
+                .avg_price
+                .sub(&avg_price)
+                .and_then(|value| value.abs())
+            else {
+                return false;
+            };
+            delta
+                .sub(&tick_size)
+                .map(|beyond_tick| !beyond_tick.is_positive())
+                .unwrap_or(false)
+        });
+        let Some(index) = matched else {
+            return false;
+        };
+        used[index] = true;
+    }
+    true
 }
 
 /// Faz 0.2/0.3 — yürütme hattı şalteri (v3 `lib/engine/killswitch.ts` karşılığı).
@@ -1131,6 +1203,7 @@ pub async fn create_runtime(
         breaker_day_start_eq: None,
         breaker_tripped: false,
         venue_warned: false,
+        venue_position_check_warned: false,
         halt_warned: false,
         pos_mode_checked: false,
         pos_mode_blocked: false,

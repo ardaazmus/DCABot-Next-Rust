@@ -47,6 +47,16 @@ Bu belge kaynak rapordaki maddelerin repo üzerindeki uygulama durumunu kaydeder
 - SSE `KILL_SWITCH`/`FREEZE` olayları veri yenilemeyi tetikliyor. Sunucu akışı `CLOSED` durumuna geçerse istemci sınırlı artan bekleme ile yeniden bağlanıyor.
 - Doğrudan `?view=` yüklemesinde sunucu/istemci başlangıç görünümü eşleştirildi; Backtest'te eski piyasa verisinin yeni kategoriyle gösterilmesi engellendi.
 
+### 23 Kasım takip denetimi: LIVE uzlaştırma ve sahiplik
+
+- LIVE futures pozisyonları restart'ta, START/UNFREEZE öncesinde ve çalışan poll'larda (ayrıca açık yerel maruziyeti olan durmuş botlarda) kalıcı ana/hedge defteriyle karşılaştırılıyor. Boş ve durdurulmuş botlar gereksiz private API çağrısı yapmıyor. Yön, miktar ve ortalama giriş fiyatı (en fazla bir enstrüman tick'i fark) eşleşmezse borsa pozisyonu yerel bota mal edilmiyor; bot `FROZEN` oluyor ve yeni risk kesiliyor. Pozisyon endpoint'i hata verirse o poll'da yeni risk açılmıyor.
+- Aynı sembolde bota ait olmayan açık venue emirleri restore/START/UNFREEZE aşamasında sahiplenilmiyor; bot donduruluyor veya başlatma reddediliyor.
+- Pozisyonun venue'da kaybolması artık tahmini fiyatla sentetik `LIQ` fill üretmiyor. Doğrulanmış execution/close kanıtı yoksa yerel defter korunup bot manuel uzlaştırma için donduruluyor.
+- Fill uzlaştırma kilidi yalnız henüz yerel deftere işlenmemiş execution/cumulative miktarı için devrede; daha önce kaydedilmiş kısmi fill açık emir bitene kadar stratejiyi durdurmuyor.
+- LIVE fill sorgusu ve venue-flat iptal sorguları kısa runtime snapshot kilidi bırakıldıktan sonra, strateji uygulama kilidi alınmadan önce yürütülüyor; bu nedenle eski rapordaki “REST çağrısı global runtime kilidi altında” bulgusu güncel kodda kapanmıştır.
+- `/api/live/reconcile` miktarı tam kesirle ve ortalama fiyatı bir tick toleransıyla karşılaştırıyor; SHORT yerel `Short` yönü venue `Sell` yönüne eşleniyor.
+- Bu, mutlak hesap sahipliği kanıtı değildir: net pozisyon endpoint'i aynı yön/miktar/fiyatla oluşmuş manuel pozisyonu ayırt edemez. Spot envanteri de mevcut adapter sözleşmesinde bot bazında ölçülmüyor. Güvenli LIVE kullanımı için bot başına ayrılmış alt hesap/alt hesap benzeri izolasyon ve spot envanter mutabakatı hâlâ gereklidir. Pozisyon kontrolü çalışan LIVE futures botları için poll başına private API çağrısı ekler; bu yük borsa rate limit planına dahil edilmelidir.
+
 ## Doğrulama
 
 - `cargo test --locked --offline --workspace --quiet`: geçti (361 test).
@@ -56,15 +66,16 @@ Bu belge kaynak rapordaki maddelerin repo üzerindeki uygulama durumunu kaydeder
 - Güncel motor ve UI yerelde PAPER kipinde çalışıyor: `http://127.0.0.1:3000/` HTTP 200, `http://127.0.0.1:3002/api/health` `ok`, API bot listesi 18 botun tamamını `PAPER` gösteriyor; 3000/3002 portları dinliyor.
 - İzole Docker image/container denemeleri geçti: Compose config ve Docker build, shell syntax, health/login, `*_FILE` sırları, eski sır geçişi, sırların loglanmaması ve graceful stop kontrol edildi. Test container'ları ve yalnız bu teste ait volume'lar temizlendi; proje volume'larına dokunulmadı.
 - Son kodla yerel engine yeniden derlenip aynı PAPER DB ile başlatıldı: UI HTTP 200, engine health `ok`, 18 botun tamamı `PAPER` ve RUNNING. Yeniden başlatma öncesi DB `VACUUM INTO` ile tutarlı anlık görüntü olarak yedeklendi; UI süreci çalışır kaldı.
-- `npm run lint`: hâlâ 23 `react-hooks/set-state-in-effect` hatası veriyor. Bunlar Calculator, Forensics, Kill Switch, Settings, Signal Builder, Studio, TV Chart, Wizard, Carousel ve `use-mobile` dosyalarında; tümüne tek tek state/effect tasarım işi gerekiyor.
+- 23 Kasım takip yamasında `cargo check --manifest-path mini-services/dca-core/Cargo.toml -p dca_server` ve `npx tsc --noEmit` başarılıdır. Bu takip yamasında test takımları çalıştırılmadı ve gerçek borsa hesabı/emri kullanılmadı.
+- Güncel yamayla `npm run local:start` başarıyla tamamlandı: UI `http://127.0.0.1:3000/` HTTP 200, engine `http://127.0.0.1:3002/api/health` `ok`; API 18 botun tamamını `PAPER / RUNNING` gösterdi. Etkin venue ortamları Bybit Demo, Binance Testnet, OKX Demo ve iç PAPER; hiçbir LIVE emir gönderilmedi.
+- `npm run lint`: hâlâ 23 `react-hooks/set-state-in-effect` hatası veriyor. Bunlar Calculator, Config Tab, Forensics, Kill Switch, Settings, Signal Builder, Studio, TV Chart, Wizard, Carousel ve `use-mobile` dosyalarında; tümüne tek tek state/effect tasarım işi gerekiyor.
 - Tam Rust workspace, gerçek borsa anahtarları veya LIVE emirleriyle denenmedi. Yerel kontrol PAPER modundadır; bu LIVE/mainnet işlem onayı değildir.
 
 ## Açık kalan öncelikli işler
 
-1. **P1 — Kilit altında kalan LIVE uzlaştırma çağrıları:** `poll_inner` içindeki `live_fill_sweep` ve venue-flat emir iptalleri `app.runtimes` kilidi tutulurken ağ çağrısı yapıyor. Yavaş/yanıt vermeyen venue diğer botların state erişimini geciktirebilir. Bu fazın doğru çözümü, venue yanıtlarını kilit dışında toplayıp emir kimliği/runtime sürümüyle yeniden doğrulayarak kısa kilitte uygulamak; bu değişiklikte yapılmadı.
-2. **P1 — Hesap-geneli pozisyonun dış sahipliği:** Aynı botların aynı LIVE venue/sembolü paylaşması engellendi ve eski çakışmalar donduruluyor. Bununla birlikte tek botun yanında manuel işlem veya bu motor dışındaki başka bir uygulama pozisyon açmışsa borsanın net pozisyon endpoint'i bot sahipliğini kanıtlamaz; LIVE uzlaştırmada bu dış pozisyon için güvenilir attribution kuralı hâlâ yok.
-3. **P1 — Backtest/PAPER/LIVE parity:** Kaynak rapordaki hedge funding ve funding imleci, hedge likidasyonu, grid bootstrap referansı, bar içi işlem sırası, gerçek MMR kademeleri ve birleşik hedge equity/fee eşlemesi ayrı tasarım ve parity testleri gerektiriyor.
-4. **P2 — UI lint ve mimari:** 23 `react-hooks/set-state-in-effect` hatası, tek-route ekran yapısı, büyük `wizard.tsx`/`studio.tsx`, kullanılmayan npm bağımlılıkları, erişilebilirlik ve mobil drawer yol haritası sürüyor.
-5. **P2 — Daha geniş dosya/işlem güvenliği:** SQLite writer actor/yedek, limit emir fiyat-adım hassasiyeti, sayaç/harita büyüme sınırları ve gerçek borsa sandbox kabul testleri eklenmeli.
+1. **P1 — Hesap-geneli pozisyonun kesin sahipliği:** Mismatch durumunda artık fail-closed koruma var; ancak borsa net pozisyonu aynı yön/miktar/fiyatla oluşmuş manuel pozisyondan ayıramaz. Spot envanteri için de bot bazlı sahiplik sözleşmesi yok. Ayrılmış hesap/alt hesap ve spot mutabakatı gerekir.
+2. **P1 — Backtest/PAPER/LIVE parity:** Kaynak rapordaki hedge funding ve funding imleci, hedge likidasyonu, grid bootstrap referansı, bar içi işlem sırası, gerçek MMR kademeleri ve birleşik hedge equity/fee eşlemesi ayrı tasarım ve parity testleri gerektiriyor.
+3. **P2 — UI lint ve mimari:** 23 `react-hooks/set-state-in-effect` hatası (Calculator, Config Tab, Forensics, Kill Switch, Settings, Signal Builder, Studio, TV Chart, Wizard, Carousel ve `use-mobile`), tek-route ekran yapısı, büyük `wizard.tsx`/`studio.tsx`, kullanılmayan npm bağımlılıkları, erişilebilirlik ve mobil drawer yol haritası sürüyor.
+4. **P2 — Daha geniş dosya/işlem güvenliği:** SQLite writer actor/yedek, limit emir fiyat-adım hassasiyeti, sayaç/harita büyüme sınırları ve gerçek borsa sandbox kabul testleri eklenmeli.
 
 Özel borsa hesabı endpoint'lerine veya ana ağa işlem isteği gönderilmedi. PAPER motoru kamuya açık piyasa verisi çekebilir; hiçbir canlı emir gönderilmedi. Docker kontrolleri izole sahte sırlarla yapıldı; kullanıcı volume'ları korunarak test volume'ları silindi. Bu doküman denetim notlarının tümünü tamamlanmış saymaz; yukarıdaki maddeler ayrı geliştirme işi olarak açık bırakılmıştır.

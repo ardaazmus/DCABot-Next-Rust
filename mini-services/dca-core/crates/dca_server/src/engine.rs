@@ -4,7 +4,7 @@
 
 use crate::state::SseEvent;
 use crate::state::{AppState, BotRuntime};
-use dca_exchange::{ExecutionRecord, Kline, VenueAdapter, VenueOrderState};
+use dca_exchange::{ExecutionRecord, Kline, PositionSnapshot, VenueAdapter, VenueOrderState};
 use dca_kernel::{Bar, FillRecord, OrderIntent, OrderKind};
 use dca_math::fraction::Fraction;
 use dca_math::m02::Direction;
@@ -2238,8 +2238,7 @@ struct PollCtx {
     need_mmr: bool,
     need_pos_mode: bool,
     need_venue_pos_check: bool,
-    venue_close_ref: Option<String>,
-    venue_avg_ref: Option<String>,
+    local_position_exposure: bool,
     /// H-1 adim 2: sinyal/pine kararları kilitsiz Faz 2'de hesaplanır.
     entry_signal: Option<dca_signals::SignalConfig>,
     pine_script: Option<String>,
@@ -2309,6 +2308,11 @@ async fn poll_inner(
             .await;
         }
         let is_fut = rt.cfg.kind.is_futures();
+        let local_position_exposure = !rt.stepper.position.qty.is_zero()
+            || rt
+                .hedge_stepper
+                .as_ref()
+                .is_some_and(|hs| !hs.position.qty.is_zero());
         let halted = rt.mode == "LIVE" && app.live_halted().await;
         const SWEEP_MAX_ORDERS: usize = 20;
         let live_sweep_orders =
@@ -2344,27 +2348,8 @@ async fn poll_inner(
             need_pos_mode: rt.mode == "LIVE" && is_fut && !rt.pos_mode_checked,
             need_venue_pos_check: rt.mode == "LIVE"
                 && is_fut
-                && (!rt.stepper.position.qty.is_zero()
-                    || rt
-                        .hedge_stepper
-                        .as_ref()
-                        .is_some_and(|hs| !hs.position.qty.is_zero())),
-            venue_close_ref: rt.stepper.last_close.clone().or_else(|| {
-                rt.hedge_stepper
-                    .as_ref()
-                    .and_then(|hs| hs.last_close.clone())
-            }),
-            venue_avg_ref: rt
-                .stepper
-                .position
-                .avg_price
-                .as_ref()
-                .map(|a| a.to_string())
-                .or_else(|| {
-                    rt.hedge_stepper
-                        .as_ref()
-                        .and_then(|hs| hs.position.avg_price.as_ref().map(ToString::to_string))
-                }),
+                && (rt.status == "RUNNING" || local_position_exposure),
+            local_position_exposure,
             entry_signal: rt.cfg.entry_signal.clone(),
             pine_script: rt.cfg.pine_script.clone(),
             pine_inputs: rt.cfg.pine_inputs.clone(),
@@ -2466,14 +2451,20 @@ async fn poll_inner(
             pos_mode_result = Some(m);
         }
     }
-    let mut venue_flat: Option<bool> = None;
+    let mut venue_positions: Option<Vec<PositionSnapshot>> = None;
+    let mut venue_position_error: Option<String> = None;
     if ctx.need_venue_pos_check {
-        if let Some(creds) = &ctx.creds {
-            if let Ok(pos) = adapter.positions(creds, &ctx.symbol).await {
-                venue_flat = Some(pos.iter().all(|p| p.size.is_zero()));
-            }
+        match ctx.creds.as_ref() {
+            Some(creds) => match adapter.positions(creds, &ctx.symbol).await {
+                Ok(positions) => venue_positions = Some(positions),
+                Err(error) => venue_position_error = Some(error),
+            },
+            None => venue_position_error = Some("LIVE futures credentials missing".into()),
         }
     }
+    let venue_flat = venue_positions
+        .as_ref()
+        .map(|positions| positions.iter().all(|position| position.size.is_zero()));
 
     // H-1 adim 2: sinyal/pine kararları — kilitsiz, poll başına BİR kez.
     // (Eski davranışta her bar için yeniden çekiliyordu; fetch'ler 'en son
@@ -2574,7 +2565,8 @@ async fn poll_inner(
 
     // LIVE cancel/query calls use the snapshot collected in Phase 1 and run
     // before the global runtime map is locked for strategy application.
-    let venue_flat_sync = ctx.mode == "LIVE" && venue_flat == Some(true);
+    let venue_flat_sync =
+        ctx.mode == "LIVE" && ctx.local_position_exposure && venue_flat == Some(true);
     let mut venue_flat_cancel_errors = Vec::new();
     let live_sweep_results = if ctx.mode == "LIVE" {
         if let Some(creds) = &ctx.creds {
@@ -2612,10 +2604,46 @@ async fn poll_inner(
         )
         .await;
     }
+    let sweep_has_fill = live_sweep_has_unsettled_fill(app, bot_id, &live_sweep_results).await;
 
     // ---------------- H-1 FAZ 3: kilitli uygulama ----------------
     let mut rts = app.runtimes.lock().await;
     let rt = rts.get_mut(bot_id).ok_or("runtime not found")?;
+    let position_check_failed = ctx.need_venue_pos_check && venue_positions.is_none();
+    let position_check_unsettled = ctx.need_venue_pos_check && sweep_has_fill;
+    let position_mismatch = venue_positions
+        .as_deref()
+        .is_some_and(|positions| !crate::state::venue_positions_match_runtime(rt, positions));
+    if position_check_failed {
+        if !rt.venue_position_check_warned {
+            rt.venue_position_check_warned = true;
+            crate::state::persist_event(
+                app,
+                bot_id,
+                "CRITICAL",
+                "LIVE_POSITION_CHECK",
+                &format!(
+                    "borsa futures pozisyonu doğrulanamadı; bu poll'da yeni risk açılmayacak: {}",
+                    venue_position_error.as_deref().unwrap_or("unknown error")
+                ),
+            )
+            .await;
+        }
+    } else {
+        rt.venue_position_check_warned = false;
+    }
+    if position_mismatch && !sweep_has_fill && rt.status != "FROZEN" {
+        rt.status = "FROZEN".into();
+        crate::state::persist_status(app, bot_id, "FROZEN");
+        crate::state::persist_event(
+            app,
+            bot_id,
+            "CRITICAL",
+            "LIVE_POSITION_OWNERSHIP",
+            "borsa futures pozisyonu botun kalıcı ana/hedge defteriyle uyuşmuyor; hesap-geneli pozisyon sahiplenilmedi ve yeni risk durduruldu",
+        )
+        .await;
+    }
     let live_halted = ctx.halted;
     if live_halted && !rt.halt_warned {
         rt.halt_warned = true;
@@ -2708,7 +2736,9 @@ async fn poll_inner(
     // açabilir.
     let strategy_blocked = matches!(rt.status.as_str(), "FROZEN" | "PAUSED" | "STOPPED")
         || live_halted
-        || venue_flat_sync;
+        || venue_flat_sync
+        || position_check_failed
+        || position_check_unsettled;
     if strategy_blocked {
         for b in &bars {
             if b.t > rt.last_bar_ts && b.t + interval_ms <= now {
@@ -2772,28 +2802,18 @@ async fn poll_inner(
                 .as_ref()
                 .is_some_and(|stepper| !stepper.position.qty.is_zero());
         if has_local_exposure {
-            let px = ctx
-                .venue_close_ref
-                .as_deref()
-                .and_then(|c| Fraction::from_any_str(c).ok())
-                .or_else(|| {
-                    ctx.venue_avg_ref
-                        .as_deref()
-                        .and_then(|a| Fraction::from_any_str(a).ok())
-                })
-                .unwrap_or_else(Fraction::zero);
-            let ts = crate::state::now_ms();
-            close_position_as_venue_liquidated(app, rt, &px, ts, sse).await?;
-            rt.status = "FROZEN".into();
-            crate::state::persist_status(app, bot_id, "FROZEN");
-            crate::state::persist_event(
-                app,
-                bot_id,
-                "CRITICAL",
-                "VENUE_FLAT",
-                "venue pozisyonu düz, yerel pozisyon uzlaştırıldı; bot FROZEN durumuna alındı ve manuel inceleme bekliyor",
-            )
-            .await;
+            if rt.status != "FROZEN" {
+                rt.status = "FROZEN".into();
+                crate::state::persist_status(app, bot_id, "FROZEN");
+                crate::state::persist_event(
+                    app,
+                    bot_id,
+                    "CRITICAL",
+                    "VENUE_POSITION_UNATTRIBUTED",
+                    "borsa pozisyonu düz ancak doğrulanmış liquidation/close execution kaydı yok; yerel muhasebe değiştirilmedi, bot manuel uzlaştırma için FROZEN yapıldı",
+                )
+                .await;
+            }
         }
     }
     // Snapshot ve UI önbelleği uzlaştırma sonrasında yazılır; restart/UI son
@@ -2808,108 +2828,6 @@ async fn poll_inner(
     drop(rts);
     run_intent_cascade(app, bot_id, sse).await?;
     Ok(processed)
-}
-
-/// Faz 4 (H-5): venue kanıtlı tasfiye kapanışı — yerelde pozisyon var ama
-/// venue'da yok olduğu durumda yerel aynayı dürüstçe kapatır (venue bilgisidir;
-/// fiyat son mark/avg yaklaşık şeyidir ve raporda "tahmini" etiketlenir).
-async fn close_position_as_venue_liquidated(
-    app: &AppState,
-    rt: &mut BotRuntime,
-    px: &Fraction,
-    ts: i64,
-    sse: &broadcast::Sender<SseEvent>,
-) -> Result<(), String> {
-    let mut cancelled = rt.stepper.cancel_pending();
-    if let Some(hs) = rt.hedge_stepper.as_mut() {
-        cancelled += hs.cancel_pending();
-    }
-    let bot_id = rt.bot_id.clone();
-    if px.is_zero() {
-        // Fiyat referansı bile yoksa aynayı sıfırlamadan bırakma — WARN ile
-        // operatöre bırak (kapanış fiyatı olmadan muhasebe uydurulmaz).
-        crate::state::persist_event(
-            app,
-            &bot_id,
-            "CRITICAL",
-            "LIQUIDATION",
-            "venue pozisyonu yok oldu ama kapanış fiyatı referansı yok — manuel uzlaştırma gerekli",
-        )
-        .await;
-        return Ok(());
-    }
-    let mut closed_qty = Fraction::zero();
-    let mut main_closed = false;
-    let mut hedge_closed = false;
-    let mut pending_actions = Vec::new();
-    // Ana ve hedge bacakları bağımsızdır; hedge-only açık pozisyonu da
-    // motor aynasına ve UI olay akışına ayrıca işlenmelidir.
-    if let Some(hs) = rt.hedge_stepper.as_mut() {
-        if !hs.position.qty.is_zero() {
-            if let Some(mut hfill) = hs.force_close(px, ts, "LIQ").map_err(|e| e.to_string())? {
-                hfill.order_id = format!("{bot_id}-hedge-LIQ-{ts}");
-                pending_actions.extend(rt.engine_kind.on_fill(&hfill));
-                closed_qty = closed_qty
-                    .add(&hfill.qty)
-                    .unwrap_or_else(|_| closed_qty.clone());
-                persist_fill(app, &bot_id, &hfill).await?;
-                hedge_closed = true;
-            }
-        }
-    }
-    if let Some(fill) = rt
-        .stepper
-        .force_close(px, ts, "LIQ")
-        .map_err(|e| e.to_string())?
-    {
-        pending_actions.extend(rt.engine_kind.on_fill(&fill));
-        closed_qty = closed_qty
-            .add(&fill.qty)
-            .unwrap_or_else(|_| closed_qty.clone());
-        persist_fill(app, &bot_id, &fill).await?;
-        main_closed = true;
-    }
-    if main_closed || hedge_closed {
-        match &mut rt.engine_kind {
-            dca_strategy::EngineTag::Dca(e) if main_closed => e.force_liquidate(),
-            dca_strategy::EngineTag::Hedge(h) => {
-                if main_closed {
-                    h.main.force_liquidate();
-                }
-                if hedge_closed {
-                    if let Some(hg) = &mut h.hedge {
-                        hg.force_liquidate();
-                    }
-                }
-            }
-            _ => {}
-        }
-        let _ = sse.send(SseEvent {
-            event: "LIQUIDATION".into(),
-            data: json!({
-                "botId": bot_id,
-                "liqPrice": px.to_string(),
-                "qty": closed_qty.to_string(),
-                "cancelledOrders": cancelled,
-                "venueConfirmed": true,
-                "priceApprox": true,
-                "ts": ts,
-            })
-            .to_string(),
-        });
-        crate::state::persist_event(
-            app,
-            &bot_id,
-            "CRITICAL",
-            "LIQUIDATION",
-            "venue pozisyonu yok oldu — yerel aynalar venue bilgisiyle kapatıldı (kapanış fiyatı son mark/avg yaklaşığı)",
-        )
-        .await;
-        for action in pending_actions {
-            Box::pin(dispatch_action(app, rt, action, ts, sse)).await?;
-        }
-    }
-    Ok(())
 }
 
 /// Faz 3 (C-3) — execution-kaynaklı LIVE fill uzlaştırması.
@@ -2930,6 +2848,37 @@ struct LiveSweepResult {
     order: crate::state::LiveTrackedOrder,
     executions: Result<Vec<ExecutionRecord>, String>,
     state: Result<Option<VenueOrderState>, String>,
+}
+
+async fn live_sweep_has_unsettled_fill(
+    app: &AppState,
+    bot_id: &str,
+    results: &[LiveSweepResult],
+) -> bool {
+    for result in results {
+        if let Ok(executions) = &result.executions {
+            for execution in executions.iter().filter(|execution| !execution.exec_qty.is_zero()) {
+                let fill_key = format!("{}-{}", execution.order_link_id, execution.exec_id);
+                if !fill_exists(app, bot_id, &fill_key).await.unwrap_or(false) {
+                    return true;
+                }
+            }
+        }
+
+        if let Ok(Some(order_state)) = &result.state {
+            if !order_state.cum_exec_qty.is_zero() {
+                let ingested_qty = match filled_qty_for_order(app, bot_id, &result.order.id).await {
+                    Ok(qty) => qty,
+                    Err(_) => return true,
+                };
+                match order_state.cum_exec_qty.sub(&ingested_qty) {
+                    Ok(remaining) if remaining.is_zero() => {}
+                    Ok(_) | Err(_) => return true,
+                }
+            }
+        }
+    }
+    false
 }
 
 async fn fetch_live_sweep_results(

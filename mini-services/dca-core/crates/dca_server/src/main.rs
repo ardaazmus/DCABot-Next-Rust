@@ -1560,38 +1560,45 @@ async fn reconcile_restored_bots(
             continue;
         };
         let category = if is_futures { "linear" } else { "spot" };
-        // Açık pozisyonu geri yükle.
+        // Account-wide venue positions do not prove which process opened a
+        // position. Preserve the durable bot ledger and freeze on any mismatch
+        // instead of silently adopting an external/manual position.
         match adapter.positions(&creds, &symbol).await {
             Ok(positions) => {
-                if let Some(pos) = positions.iter().find(|p| !p.size.is_zero()) {
-                    let qty = pos.size.clone();
-                    let avg = pos.avg_price.clone();
-                    // Stepper pozisyonunu senkronize et.
-                    {
-                        let mut rts = app.runtimes.lock().await;
-                        if let Some(rt_mut) = rts.get_mut(&id) {
-                            rt_mut.stepper.position.qty = qty.clone();
-                            rt_mut.stepper.position.avg_price = Some(avg.clone());
-                            rt_mut.stepper.position.cost =
-                                qty.mul(&avg).unwrap_or_else(|_| Fraction::zero());
-                            rt_mut.stepper.position.direction =
-                                if pos.side.eq_ignore_ascii_case("Sell") {
-                                    -1
-                                } else {
-                                    1
-                                };
-                        }
+                let matches_local = {
+                    let mut rts = app.runtimes.lock().await;
+                    let Some(rt) = rts.get_mut(&id) else {
+                        continue;
+                    };
+                    let matches = state::venue_positions_match_runtime(rt, &positions);
+                    if !matches {
+                        rt.status = "FROZEN".into();
                     }
+                    matches
+                };
+                if !matches_local {
+                    state::persist_status(app, &id, "FROZEN");
+                    if let Some(rt) = app.runtimes.lock().await.get(&id) {
+                        app.ui_cache
+                            .lock()
+                            .await
+                            .insert(id.clone(), rt.snapshot_json());
+                    }
+                    state::persist_event(
+                        app,
+                        &id,
+                        "CRITICAL",
+                        "LIVE_POSITION_OWNERSHIP",
+                        "borsa futures pozisyonları kalıcı bot defteriyle eşleşmiyor; hesap-geneli pozisyon bot tarafından sahiplenilmedi ve bot FROZEN açıldı",
+                    )
+                    .await;
+                } else {
                     state::persist_event(
                         app,
                         &id,
                         "INFO",
                         "RESTORE",
-                        &format!(
-                            "açık pozisyon geri yüklendi: {} @ {}",
-                            qty.to_half_even_display(8),
-                            avg.to_half_even_display(8)
-                        ),
+                        "borsa futures pozisyonları kalıcı bot defteriyle eşleşti; yerel muhasebe korunarak bot PAUSED açıldı",
                     )
                     .await;
                 }
@@ -1626,6 +1633,42 @@ async fn reconcile_restored_bots(
         // DB'den yüklenmişlerle çakışmayı önlemek için id ile kontrol edilir.
         match adapter.open_orders(&creds, &category, &symbol).await {
             Ok(open_orders) => {
+                let own_prefix = format!("{id}-");
+                let unowned_orders: Vec<&str> = open_orders
+                    .iter()
+                    .filter(|order| {
+                        (order.symbol.is_empty() || order.symbol.eq_ignore_ascii_case(&symbol))
+                            && !order.order_link_id.starts_with(&own_prefix)
+                    })
+                    .map(|order| order.order_link_id.as_str())
+                    .collect();
+                if !unowned_orders.is_empty() {
+                    {
+                        let mut rts = app.runtimes.lock().await;
+                        if let Some(rt) = rts.get_mut(&id) {
+                            rt.status = "FROZEN".into();
+                        }
+                    }
+                    state::persist_status(app, &id, "FROZEN");
+                    let snapshot = {
+                        let rts = app.runtimes.lock().await;
+                        rts.get(&id).map(|rt| rt.snapshot_json())
+                    };
+                    if let Some(snapshot) = snapshot {
+                        app.ui_cache.lock().await.insert(id.clone(), snapshot);
+                    }
+                    state::persist_event(
+                        app,
+                        &id,
+                        "CRITICAL",
+                        "LIVE_ORDER_OWNERSHIP",
+                        &format!(
+                            "aynı sembolde bu bota ait olmayan {} açık borsa emri var; emirler sahiplenilmedi ve bot FROZEN yapıldı",
+                            unowned_orders.len()
+                        ),
+                    )
+                    .await;
+                }
                 let mut added = 0usize;
                 for o in &open_orders {
                     // open_orders is account-wide on several venues. Never
@@ -3480,27 +3523,36 @@ async fn bot_actions(
             let rts = app.runtimes.lock().await;
             rts.get(&id)
                 .filter(|rt| rt.mode.eq_ignore_ascii_case("LIVE"))
-                .map(|rt| (
-                    rt.venue.to_uppercase(),
-                    rt.cfg.kind.is_futures(),
-                    rt.execution_environment.clone(),
-                ))
+                .map(|rt| {
+                    (
+                        rt.venue.to_uppercase(),
+                        rt.cfg.kind.is_futures(),
+                        rt.execution_environment.clone(),
+                        rt.cfg.symbol.clone(),
+                    )
+                })
         };
-        if let Some((venue, is_futures, execution_environment)) = live_context {
+        if let Some((venue, is_futures, execution_environment, symbol)) = live_context {
             let guard = acquire_bot_poll_guard(&app, &id).await;
             if !live_certification_is_current(&app, &id).map_err(err422)? {
                 return Err(err422("LIVE bot için geçerli sunucu sertifikası yok; eski botu yeniden sertifikalandırmak için yeni LIVE yapılandırması oluşturun"));
             }
             let key_environment = key_environment_for_execution_environment(&execution_environment)
-                .ok_or_else(|| err422("LIVE botun çalışma ortamı doğrulanamadı; yeniden oluşturun"))?;
+                .ok_or_else(|| {
+                    err422("LIVE botun çalışma ortamı doğrulanamadı; yeniden oluşturun")
+                })?;
             let credentials = store::load_active_key_for_environment(
                 &app.db,
                 &app.vault,
                 &venue,
                 key_environment,
             )
-                .map_err(err422)?
-                .ok_or_else(|| err422(format!("LIVE bot başlatılamadı: {key_environment} kasa anahtarı bulunamadı")))?;
+            .map_err(err422)?
+            .ok_or_else(|| {
+                err422(format!(
+                    "LIVE bot başlatılamadı: {key_environment} kasa anahtarı bulunamadı"
+                ))
+            })?;
             validate_live_preflight(
                 &app,
                 &venue,
@@ -3509,8 +3561,58 @@ async fn bot_actions(
                 true,
                 &execution_environment,
             )
+            .await
+            .map_err(|e| err422(format!("LIVE başlatma ön kontrolü başarısız: {e}")))?;
+            let adapter = app
+                .adapter(&venue)
+                .ok_or_else(|| err422("LIVE borsa adapter'i bulunamadı"))?;
+            let category = if is_futures { "linear" } else { "spot" };
+            if is_futures {
+                let positions = adapter
+                    .positions(&credentials, &symbol)
+                    .await
+                    .map_err(|e| err422(format!("LIVE pozisyon sahipliği doğrulanamadı: {e}")))?;
+                let positions_match = {
+                    let runtimes = app.runtimes.lock().await;
+                    runtimes
+                        .get(&id)
+                        .is_some_and(|rt| state::venue_positions_match_runtime(rt, &positions))
+                };
+                if !positions_match {
+                    state::persist_event(
+                        &app,
+                        &id,
+                        "CRITICAL",
+                        "LIVE_POSITION_OWNERSHIP",
+                        "START/UNFREEZE reddedildi: borsadaki futures pozisyonu yerel bot defteriyle birebir uzlaştırılamadı",
+                    )
+                    .await;
+                    return Err(err422(
+                        "LIVE başlatılamadı: borsa pozisyonu yerel bot defteriyle eşleşmiyor; manuel işlem veya başka bir bot olabilir",
+                    ));
+                }
+            }
+            let open_orders = adapter
+                .open_orders(&credentials, category, &symbol)
                 .await
-                .map_err(|e| err422(format!("LIVE başlatma ön kontrolü başarısız: {e}")))?;
+                .map_err(|e| err422(format!("LIVE açık emir sahipliği doğrulanamadı: {e}")))?;
+            let own_prefix = format!("{id}-");
+            if open_orders.iter().any(|order| {
+                (order.symbol.is_empty() || order.symbol.eq_ignore_ascii_case(&symbol))
+                    && !order.order_link_id.starts_with(&own_prefix)
+            }) {
+                state::persist_event(
+                    &app,
+                    &id,
+                    "CRITICAL",
+                    "LIVE_ORDER_OWNERSHIP",
+                    "START/UNFREEZE reddedildi: aynı sembolde bu bota ait olmayan açık borsa emri var",
+                )
+                .await;
+                return Err(err422(
+                    "LIVE başlatılamadı: aynı sembolde bota ait olmayan açık borsa emri var; hesap-geneli emir sahipliği belirsiz",
+                ));
+            }
             (Some(guard), Some(credentials))
         } else {
             (None, None)
@@ -4400,13 +4502,13 @@ struct ParityReq {
     interval: Option<String>,
 }
 
-fn frac_match_pct(a: &Fraction, b: &Fraction) -> f64 {
-    let denom = a
-        .to_f64_display()
-        .abs()
-        .max(b.to_f64_display().abs())
-        .max(1e-12);
-    (1.0 - (a.to_f64_display() - b.to_f64_display()).abs() / denom).max(0.0)
+fn fraction_within_tolerance(actual: &Fraction, expected: &Fraction, tolerance: &Fraction) -> bool {
+    actual
+        .sub(expected)
+        .and_then(|delta| delta.abs())
+        .and_then(|delta| delta.sub(tolerance))
+        .map(|beyond| !beyond.is_positive())
+        .unwrap_or(false)
 }
 
 async fn parity(
@@ -4555,8 +4657,8 @@ async fn parity(
 }
 
 // ---------------- Reconcile: borsa ↔ yerel mutabakat (raporlama) ---------
-// v3 /api/live/reconcile karşılığı — farkla: otomatik durdurma YOK (bilinçli).
-// Tutarsızlık raporlanır; durdurma tek tıkla kullanıcıda (bot_actions PAUSE).
+// v3 /api/live/reconcile karşılığı. Bu GET endpoint yalnız rapor üretir;
+// LIVE poll/START guard'ları bağımsız olarak uyuşmazlıkta yeni riski keser.
 #[derive(Deserialize)]
 struct ReconcileQuery {
     bot_id: String,
@@ -4566,17 +4668,22 @@ async fn reconcile(
     State(app): State<Arc<AppState>>,
     Query(q): Query<ReconcileQuery>,
 ) -> Result<Json<Value>, axum::response::Response> {
-    let (mode, venue, execution_environment, symbol, local_side, local_qty) = {
+    let (mode, venue, execution_environment, symbol, local_side, local_qty, local_avg, tick_size) = {
         let rts = app.runtimes.lock().await;
         let rt = rts.get(&q.bot_id).ok_or_else(|| err422("bot not found"))?;
-        let (local_side, local_qty) = match &rt.engine_kind {
+        let (local_side, local_qty, local_avg, tick_size) = match &rt.engine_kind {
             dca_strategy::EngineTag::Dca(e) => {
                 let snap = e.snapshot();
                 let side = match e.cfg.kind {
                     StrategyKind::DcaShort => "Short",
                     _ => "Long",
                 };
-                (side.to_string(), snap.position_qty)
+                (
+                    side.to_string(),
+                    snap.position_qty,
+                    snap.avg_price,
+                    rt.stepper.instrument.tick_size.clone(),
+                )
             }
             _ => {
                 return Ok(Json(json!({
@@ -4592,6 +4699,8 @@ async fn reconcile(
             rt.cfg.symbol.clone(),
             local_side,
             local_qty,
+            local_avg,
+            tick_size,
         )
     };
     if mode == "PAPER" {
@@ -4605,46 +4714,54 @@ async fn reconcile(
     if app.execution_environment(&venue, "LIVE") != execution_environment {
         return Err(err422("bot ortamı ile etkin borsa endpoint'i uyuşmuyor"));
     }
-    let local_zero = local_qty == "0" || local_qty == "0.00000000";
-    let creds = store::load_active_key_for_environment(&app.db, &app.vault, &venue, key_environment)
-        .map_err(err422)?
-        .ok_or_else(|| err422("bu venue için aktif vault anahtarı yok"))?;
+    let local_qty_value = Fraction::from_any_str(&local_qty).ok();
+    let local_zero = local_qty_value.as_ref().is_some_and(Fraction::is_zero);
+    let creds =
+        store::load_active_key_for_environment(&app.db, &app.vault, &venue, key_environment)
+            .map_err(err422)?
+            .ok_or_else(|| err422("bu venue için aktif vault anahtarı yok"))?;
     let adapter = app
         .adapter(&venue)
         .ok_or_else(|| err422("venue desteklenmiyor"))?;
     let positions = adapter.positions(&creds, &symbol).await.map_err(err422)?;
-    let open: Vec<Value> = positions
+    let open_positions: Vec<_> = positions.iter().filter(|p| !p.size.is_zero()).collect();
+    let open: Vec<Value> = open_positions
         .iter()
-        .filter(|p| !p.size.is_zero())
         .map(|p| json!({"side": p.side, "size": p.size.to_half_even_display(8), "avgPrice": p.avg_price.to_half_even_display(8)}))
         .collect();
-    // Eşleşme: yerel sıfırsa borsada da sıfır olmalı; yerel açıksa borsada aynı
-    // yönde tek pozisyon ve miktar %0.1 toleransta denk olmalı.
-    let matched = if local_zero {
-        open.is_empty()
+    // A matching side/quantity alone can hide manual account activity. Require
+    // exact quantity and average cost within one instrument tick.
+    let expected_exchange_side = if local_side.eq_ignore_ascii_case("Short") {
+        "Sell"
     } else {
-        open.len() == 1
-            && open[0]["side"]
-                .as_str()
-                .map(|s| s.eq_ignore_ascii_case(&local_side))
-                .unwrap_or(false)
-            && open[0]["size"]
-                .as_str()
-                .and_then(|s| Fraction::from_any_str(s).ok())
-                .and_then(|ex| Fraction::from_any_str(&local_qty).ok().map(|lq| (ex, lq)))
-                .map(|(ex, lq)| frac_match_pct(&ex, &lq) >= 0.999)
-                .unwrap_or(false)
+        "Buy"
+    };
+    let matched = if local_zero {
+        open_positions.is_empty()
+    } else {
+        open_positions.len() == 1
+            && local_qty_value.as_ref().is_some_and(|qty| {
+                let actual = open_positions[0];
+                actual.side.eq_ignore_ascii_case(expected_exchange_side)
+                    && actual.size == *qty
+                    && local_avg
+                        .as_deref()
+                        .and_then(|value| Fraction::from_any_str(value).ok())
+                        .is_some_and(|avg| {
+                            fraction_within_tolerance(&actual.avg_price, &avg, &tick_size)
+                        })
+            })
     };
     Ok(Json(json!({
         "supported": true,
         "match": matched,
-        "local": {"side": local_side, "qty": local_qty},
+        "local": {"side": local_side, "qty": local_qty, "avgPrice": local_avg},
         "exchange": open,
         "actionRequired": !matched,
         "note": if matched {
             "Yerel ayna ile borsa pozisyonu denk."
         } else {
-            "TUTARSIZLIK — otomatik durdurma yok; Bot Filosu'ndan duraklatın ve fill'leri inceleyin."
+            "TUTARSIZLIK — bu rapor endpoint'i durumu değiştirmez; LIVE poll yeni riski keser ve botu FROZEN yapar. Fill kayıtlarını inceleyin."
         },
     })))
 }
@@ -4662,9 +4779,8 @@ struct SelfCheckReq {
 }
 
 fn active_keypair(app: &Arc<AppState>, venue: &str) -> Option<VenueCreds> {
-    let environment = key_environment_for_execution_environment(
-        app.execution_environment(venue, "LIVE"),
-    )?;
+    let environment =
+        key_environment_for_execution_environment(app.execution_environment(venue, "LIVE"))?;
     store::load_active_key_for_environment(&app.db, &app.vault, venue, environment)
         .ok()
         .flatten()
