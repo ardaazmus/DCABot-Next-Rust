@@ -61,6 +61,17 @@ Bu takipte doğrulama:
 - Gerçek borsa özel endpoint'i çağrılmadı ve emir gönderilmedi.
 - Codex Security Standard tarayıcısı 262 dosyalık envanterin keşif aşamasında 0/6 yüzeyde ilerledi ve rapor üretemedi; takılı kalan iki çalışma sonlandırıldı. Bu ek takip bulguları kaynak kodu incelemesi ve çalıştırılan testlere dayanır, tamamlanmış bağımsız tarama sertifikası değildir.
 
+## 23 Kasım ek takip: TradingView grafik periyotları
+
+Paylaşılan `TvChart` bileşenine kompakt, klavyeyle kullanılabilen periyot seçicisi eklendi. Studio, sihirbaz ve Backtest grafiklerinde şu değerler görünür: `1m`, `3m`, `5m`, `15m`, mevcut aralıklarla uyum için `30m`, `1h`, `2h`, `4h`, `1d`, ayrıca istenen `1w` ve `1M`. Periyotlar ayrı bir grafik görünümüdür; botun strateji aralığını değiştirmez.
+
+- Motorun piyasa grafiği route'u haftayı Bybit `W`, ayı `M` token'ına çevirir. Bybit belgeleri iki aralığı desteklenen Kline değerleri olarak listeler ([Bybit Kline API](https://bybit-exchange.github.io/docs/api-explorer/v5/market/kline)).
+- Binance uyarlayıcısı `1w`/`1M`, OKX uyarlayıcısı UTC hizalı `1Wutc`/`1Mutc` değerlerini kullanır ([Binance Kline API](https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/rest-api/market), [OKX Candlesticks API](https://my.okx.com/docs-v5/en/)).
+- Backtest grafiğinde seçilen periyot çalıştırılan test periyodundan farklıysa, grafik piyasa Kline verisine geçer ve o test penceresine bağlı Pine/fill çizimlerini kaldırır; araç çubuğu bu durumu **Piyasa verisi** olarak gösterir.
+- `npm run lint`, `npx tsc --noEmit`, `npm test` (27 API sözleşme kontrolü) ve `cargo test --locked --offline -p dca_server -p dca_exchange` geçti. Son Rust test koşusu 40 exchange + 76 server testi içerdi.
+- Yerel UI/engine/DB `ok`; 18/18 bot `PAPER / RUNNING`. Yerel Kline API smoke kontrolü dokuz istenen aralığın her birinde 2 bar döndürdü; Studio grafiğinde `1w` ve `1M` seçimi, yüklenen mum ve son fiyatla doğrulandı.
+- Özel borsa hesabı endpoint'i çağrılmadı; grafikler borsanın public market data uçlarını kullanır.
+
 ## Açık kalan işler
 
 1. **Canlı hesapta kabul / parity:** Backtest–Paper–Demo/Testnet senaryoları, özel WS akışı, gecikme/bağlantı kesintisi ve uzun süreli uzlaştırma testi ayrı demo/testnet hesapları gerektiriyor. Bu turda gerçek hesap kullanılmadı.

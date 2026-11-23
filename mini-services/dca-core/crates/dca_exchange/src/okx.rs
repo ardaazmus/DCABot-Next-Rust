@@ -254,6 +254,8 @@ pub fn okx_bar(interval: &str) -> Result<&'static str, String> {
         "120" => Ok("2H"),
         "240" => Ok("4H"),
         "D" => Ok("1D"),
+        "W" => Ok("1Wutc"),
+        "M" => Ok("1Mutc"),
         other => Err(format!("okx: desteklenmeyen aralık: {other}")),
     }
 }
@@ -1286,6 +1288,8 @@ mod okx_tests {
     fn bar_mapping_matches_engine_tokens() {
         assert_eq!(okx_bar("60").unwrap(), "1H");
         assert_eq!(okx_bar("D").unwrap(), "1D");
+        assert_eq!(okx_bar("W").unwrap(), "1Wutc");
+        assert_eq!(okx_bar("M").unwrap(), "1Mutc");
         assert!(okx_bar("999").is_err());
     }
 

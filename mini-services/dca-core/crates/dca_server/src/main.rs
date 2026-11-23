@@ -4551,6 +4551,16 @@ struct KlinesQuery {
     limit: Option<usize>,
 }
 
+/// Market-chart periods include weekly and monthly candles. Keep these out of
+/// the bot strategy interval validator; they are display-only timeframes.
+fn chart_interval_token(interval: &str) -> Result<String, String> {
+    match interval {
+        "1w" => Ok("W".into()),
+        "1M" => Ok("M".into()),
+        _ => engine::bybit_interval(interval),
+    }
+}
+
 /// P2-1 — 24h istatistik listesi (sembol tarayıcı beslemesi). 30 sn TTL cache;
 /// PAPER boş liste döner (yerel venue'de 24s akışı yok — dürüst boş, hata değil).
 async fn tickers(State(app): State<Arc<AppState>>, Query(q): Query<MarketsQuery>) -> Json<Value> {
@@ -4584,7 +4594,7 @@ async fn tickers(State(app): State<Arc<AppState>>, Query(q): Query<MarketsQuery>
 
 async fn klines(State(app): State<Arc<AppState>>, Query(q): Query<KlinesQuery>) -> Json<Value> {
     let category = q.category.unwrap_or_else(|| "spot".into());
-    let iv = match engine::bybit_interval(q.interval.as_deref().unwrap_or("1h")) {
+    let iv = match chart_interval_token(q.interval.as_deref().unwrap_or("1h")) {
         Ok(iv) => iv,
         Err(e) => return Json(json!({"error": e, "bars": []})),
     };
@@ -7375,6 +7385,15 @@ mod rate_limit_tests {
 
         assert!(!limiter.check("one-more-peer"));
         assert_eq!(limiter.buckets.len(), RATE_LIMIT_MAX_BUCKETS);
+    }
+
+    #[test]
+    fn chart_only_week_and_month_periods_do_not_expand_bot_intervals() {
+        assert_eq!(chart_interval_token("1w").unwrap(), "W");
+        assert_eq!(chart_interval_token("1M").unwrap(), "M");
+        assert_eq!(chart_interval_token("1h").unwrap(), "60");
+        assert!(engine::validate_interval("1w").is_err());
+        assert!(engine::validate_interval("1M").is_err());
     }
 
     #[test]

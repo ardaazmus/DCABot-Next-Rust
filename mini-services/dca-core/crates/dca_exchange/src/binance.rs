@@ -123,6 +123,19 @@ pub fn sign_query(params: &str, secret: &str, ts: u128) -> String {
     format!("{payload}&signature={sig}")
 }
 
+fn binance_kline_interval(interval: &str) -> Result<String, String> {
+    match interval {
+        "1" | "3" | "5" | "15" | "30" => Ok(format!("{interval}m")),
+        "60" => Ok("1h".into()),
+        "120" => Ok("2h".into()),
+        "240" => Ok("4h".into()),
+        "D" => Ok("1d".into()),
+        "W" => Ok("1w".into()),
+        "M" => Ok("1M".into()),
+        _ => Err(format!("binance: unsupported kline interval: {interval}")),
+    }
+}
+
 impl Default for BinanceAdapter {
     fn default() -> Self {
         Self::new()
@@ -255,14 +268,7 @@ impl VenueAdapter for BinanceAdapter {
         interval: &str,
         limit: usize,
     ) -> Result<Vec<Kline>, String> {
-        let iv = match interval {
-            "1" | "3" | "5" | "15" | "30" => format!("{}m", interval),
-            "60" => "1h".into(),
-            "120" => "2h".into(),
-            "240" => "4h".into(),
-            "D" => "1d".into(),
-            _ => "1h".into(),
-        };
+        let iv = binance_kline_interval(interval)?;
         let query = format!("symbol={symbol}&interval={iv}&limit={}", limit.min(1000));
         let v = self.public_get("/api/v3/klines", &query).await?;
         let mut out = Vec::new();
@@ -705,6 +711,18 @@ impl VenueAdapter for BinanceAdapter {
             asks: side("asks"),
             ts: v.get("lastUpdateId").and_then(|x| x.as_i64()).unwrap_or(0),
         })
+    }
+}
+
+#[cfg(test)]
+mod kline_interval_tests {
+    use super::binance_kline_interval;
+
+    #[test]
+    fn weekly_and_monthly_chart_intervals_use_binance_tokens() {
+        assert_eq!(binance_kline_interval("W").unwrap(), "1w");
+        assert_eq!(binance_kline_interval("M").unwrap(), "1M");
+        assert!(binance_kline_interval("unsupported").is_err());
     }
 }
 
