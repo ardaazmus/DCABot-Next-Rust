@@ -2,7 +2,7 @@
 # Dis acilis Cloudflare Tunnel uzerinden olacak; Caddy LAN proxy'si gereksiz
 # olan yuzeyi kaldirir. Tunnel dogrudan 3000/3002'ye baglanabilir.
 {
-	admin localhost:2019
+	admin off
 }
 
 http://localhost:81 {

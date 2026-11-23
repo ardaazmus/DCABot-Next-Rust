@@ -67,6 +67,13 @@ Bu belge kaynak rapordaki maddelerin repo üzerindeki uygulama durumunu kaydeder
 - UI'da 23 `react-hooks/set-state-in-effect` lint hatası kapatıldı. Hesaplayıcı çapa state'i kontrollü hale getirildi; eski hesap/fiyat yanıtlarının yeni seçimi ezmesi engellendi. Sihirbaz kasa sonuçlarını ortam anahtarıyla eşler, risk kademe sınırını aynı kullanıcı eyleminde günceller. Studio config, forensics, settings, kill switch, chart, signal builder, carousel ve mobil breakpoint state'i effect kaynaklı senkron reset yerine uygun store/ilk render/async yanıt akışına taşındı.
 - Backtest paneli funding ve MMR fallback uyarılarını artık kullanıcıya gösterir.
 
+### 23 Kasım ek güvenlik sertleştirmesi
+
+- `NOTIFY_WEBHOOK_URL` için ayrı bir outbound istemci oluşturuluyor. Hedef yalnız public HTTPS/443 olmalı; DNS yanıtlarının tamamı public IP olmalı ve istemci bu adreslere sabitleniyor. Proxy ve HTTP yönlendirmeleri kapalı; DNS kontrolü beş saniyede tamamlanmaz veya hedef reddedilirse webhook kanalı açılmıyor.
+- Telegram bildirim istemcisi bot token'ını içeren URL'yi başka host'a taşıyabilecek yönlendirmeleri ve ortam proxy'lerini kullanmıyor. Telegram/webhook başarısızlıkları tam URL/token yerine yalnız hata türünü veya HTTP durumunu kaydediyor.
+- UI giriş sınırlaması güvenilir ingress başlığı açıkça yapılandırıldığında istemci IP'sine göre ayrılıyor. Başlık yoksa/geçersizse tek-kullanıcı kovası korunuyor; `X-Forwarded-For` kendiliğinden güvenilir sayılmıyor. Kapasite sınırında paylaşılan kovayı bir kullanıcının başarılı girişi temizleyemiyor. Bu sınırlayıcı süreç içidir; birden çok UI instance'ında ortak ingress sınırı gerekir.
+- `DCA_EXTRA_ORIGINS` artık yalnız HTTP(S) origin biçimindeki, kimlik bilgisi/yol/sorgu/fragment içermeyen değerleri CORS listesine alıyor; geçersiz girdiler reddediliyor. UI health proxy hata gövdesinden upstream exception ayrıntısı çıkarıldı. Caddy yönetim API'si kapatıldı (`admin off`).
+
 ## Doğrulama
 
 - `cargo test --locked --offline --workspace --quiet`: geçti (361 test).
@@ -79,6 +86,8 @@ Bu belge kaynak rapordaki maddelerin repo üzerindeki uygulama durumunu kaydeder
 - 23 Kasım takip yamasında `cargo check --manifest-path mini-services/dca-core/Cargo.toml -p dca_server` ve `npx tsc --noEmit` başarılıdır. Bu takip yamasında test takımları çalıştırılmadı ve gerçek borsa hesabı/emri kullanılmadı.
 - 23 Kasım son yamaları: `cargo check --locked --offline -p dca_server`, `npx tsc --noEmit`, `npm run lint` ve `node --check scripts/backup-db.mjs` başarılıdır. Tam test takımı bu yamada çalıştırılmadı.
 - Son motor yeniden başlatmasından sonra yerel UI HTTP 200, motor health `ok`; API'de 18 botun tümü `PAPER / RUNNING`. Yerel PAPER veritabanı korundu. Bu turda özel borsa hesabı veya emir endpoint'i kullanılmadı.
+- 23 Kasım ek güvenlik yamaları için `cargo check --locked --offline --manifest-path mini-services/dca-core/Cargo.toml -p dca_server`, `npx tsc --noEmit`, `npm run lint` ve `git diff --check` başarılıdır. Bu turda test takımı çalıştırılmadı.
+- Son Rust değişikliğinden sonra `npm run local:start` motoru yeniden derleyip Paper ortamını açtı. UI HTTP 200, motor health `ok`; API listesinde 18 botun tamamı `PAPER / RUNNING`. `.local-runtime/paper.sqlite3` korunarak restart öncesi `VACUUM INTO`/`quick_check=ok` yedeği `.local-runtime/restart-backup-20261123-security-followup/` altına alındı.
 - Tam Rust test workspace'i, gerçek borsa anahtarları ve LIVE emir akışı bu yamada denenmedi. Yerel doğrulama PAPER kipindedir; bu LIVE/mainnet işlem onayı değildir.
 
 ## Açık kalan öncelikli işler

@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { isIP } from "node:net";
 
 const SESSION_COOKIE_NAME = "dca_session";
 
@@ -97,48 +98,113 @@ export function verifyPassword(password: string): boolean {
 const LOGIN_WINDOW_MS = 60_000;
 const LOGIN_MAX_FAILURES = 5;
 const LOGIN_MAX_BACKOFF_MS = 15 * 60_000;
-let loginWindowStartedAt = 0;
-let loginFailures = 0;
-let loginBlockedUntil = 0;
-let loginBackoffMs = 60_000;
+const LOGIN_STATE_RETENTION_MS = LOGIN_MAX_BACKOFF_MS + LOGIN_WINDOW_MS;
+const MAX_LOGIN_CLIENTS = 4096;
+const OVERFLOW_LOGIN_CLIENT = "__capacity__";
 
-/** Process-wide limiter for this single-owner local UI. It deliberately
- * ignores spoofable forwarding headers; a multi-instance deployment should
- * place a shared limiter at its trusted edge. Returns the remaining delay. */
-export function loginRateLimitDelay(now = Date.now()): number {
-  if (now < loginBlockedUntil) return loginBlockedUntil - now;
-  if (loginBlockedUntil > 0) {
-    loginBlockedUntil = 0;
-    loginWindowStartedAt = now;
-    loginFailures = 0;
+type LoginAttemptState = {
+  windowStartedAt: number;
+  failures: number;
+  blockedUntil: number;
+  backoffMs: number;
+  lastSeenAt: number;
+};
+
+const loginAttempts = new Map<string, LoginAttemptState>();
+
+/**
+ * Return a rate-limit identity only from an explicitly configured trusted
+ * ingress header. Forwarding headers are otherwise attacker-controlled.
+ */
+export function loginClientKey(headers: Headers): string {
+  const headerName = process.env.DCA_TRUSTED_CLIENT_IP_HEADER?.trim().toLowerCase();
+  if (!headerName || !/^[a-z0-9-]{1,128}$/.test(headerName)) return "single-owner";
+
+  const raw = headers.get(headerName)?.trim();
+  if (!raw || raw.length > 64 || raw.includes(",")) return "single-owner";
+  const version = isIP(raw);
+  if (version === 0) return "single-owner";
+
+  if (version === 4) return `ip:${raw}`;
+  try {
+    // WHATWG URL canonicalizes equivalent IPv6 spellings into one bucket.
+    const normalized = new URL(`http://[${raw}]/`).hostname.toLowerCase();
+    return `ip:${normalized}`;
+  } catch {
+    return "single-owner";
   }
-  if (loginWindowStartedAt > 0 && now - loginWindowStartedAt >= LOGIN_WINDOW_MS) {
-    loginWindowStartedAt = now;
-    loginFailures = 0;
+}
+
+function getLoginAttemptState(clientKey: string, now: number): LoginAttemptState {
+  let state = loginAttempts.get(clientKey);
+  if (!state && loginAttempts.size >= MAX_LOGIN_CLIENTS - 1) {
+    for (const [key, candidate] of loginAttempts) {
+      if (
+        now >= candidate.blockedUntil
+        && now - candidate.lastSeenAt >= LOGIN_STATE_RETENTION_MS
+      ) {
+        loginAttempts.delete(key);
+      }
+    }
+  }
+
+  let bucketKey = clientKey;
+  if (!state && loginAttempts.size >= MAX_LOGIN_CLIENTS) bucketKey = OVERFLOW_LOGIN_CLIENT;
+  state = loginAttempts.get(bucketKey);
+  if (!state) {
+    state = {
+      windowStartedAt: 0,
+      failures: 0,
+      blockedUntil: 0,
+      backoffMs: 60_000,
+      lastSeenAt: now,
+    };
+    loginAttempts.set(bucketKey, state);
+  }
+  state.lastSeenAt = now;
+  return state;
+}
+
+/** Process-local per-client limiter. Returns the remaining delay. */
+export function loginRateLimitDelay(now = Date.now(), clientKey = "single-owner"): number {
+  const state = getLoginAttemptState(clientKey, now);
+  if (now < state.blockedUntil) return state.blockedUntil - now;
+  if (state.blockedUntil > 0) {
+    state.blockedUntil = 0;
+    state.windowStartedAt = now;
+    state.failures = 0;
+  }
+  if (state.windowStartedAt > 0 && now - state.windowStartedAt >= LOGIN_WINDOW_MS) {
+    state.windowStartedAt = now;
+    state.failures = 0;
   }
   return 0;
 }
 
-export function recordLoginFailure(now = Date.now()): number {
-  const blocked = loginRateLimitDelay(now);
+export function recordLoginFailure(now = Date.now(), clientKey = "single-owner"): number {
+  const blocked = loginRateLimitDelay(now, clientKey);
   if (blocked > 0) return blocked;
-  if (loginWindowStartedAt === 0) loginWindowStartedAt = now;
-  loginFailures += 1;
-  if (loginFailures < LOGIN_MAX_FAILURES) return 0;
+  const state = getLoginAttemptState(clientKey, now);
+  if (state.windowStartedAt === 0) state.windowStartedAt = now;
+  state.failures += 1;
+  if (state.failures < LOGIN_MAX_FAILURES) return 0;
 
-  loginBlockedUntil = now + loginBackoffMs;
-  const delay = loginBackoffMs;
-  loginBackoffMs = Math.min(loginBackoffMs * 2, LOGIN_MAX_BACKOFF_MS);
-  loginFailures = 0;
-  loginWindowStartedAt = now;
+  state.blockedUntil = now + state.backoffMs;
+  const delay = state.backoffMs;
+  state.backoffMs = Math.min(state.backoffMs * 2, LOGIN_MAX_BACKOFF_MS);
+  state.failures = 0;
+  state.windowStartedAt = now;
   return delay;
 }
 
-export function clearLoginFailures(): void {
-  loginWindowStartedAt = 0;
-  loginFailures = 0;
-  loginBlockedUntil = 0;
-  loginBackoffMs = 60_000;
+export function clearLoginFailures(clientKey?: string): void {
+  if (clientKey === undefined) {
+    loginAttempts.clear();
+    return;
+  }
+  // Do not clear the shared capacity bucket when an overflow client succeeds:
+  // that would let any one client erase the throttling shared by other clients.
+  loginAttempts.delete(clientKey);
 }
 
 export { SESSION_COOKIE_NAME };

@@ -38,6 +38,9 @@ services:
       - DCA_VAULT_KEY=${DCA_VAULT_KEY:-}
       # UI oturumu: auth varsayılan AÇIK; parola ve imza anahtarı kalıcı güvenli volume'da üretilir.
       - DCA_REQUIRE_AUTH=1
+      # The container port is loopback-only and intended to sit behind
+      # Cloudflare Tunnel. Leave blank unless the ingress overwrites this header.
+      - DCA_TRUSTED_CLIENT_IP_HEADER=${DCA_TRUSTED_CLIENT_IP_HEADER-cf-connecting-ip}
       - DCA_UI_PASSWORD=${DCA_UI_PASSWORD:-}
       - DCA_SESSION_SECRET=${DCA_SESSION_SECRET:-}
       - DCA_API_KEY_FILE=${DCA_API_KEY_FILE:-}

@@ -53,6 +53,25 @@ use std::time::Instant;
 use store::{Db, Vault};
 use tokio::sync::Mutex as AsyncMutex;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+
+fn parse_extra_origin(raw: &str) -> Option<axum::http::HeaderValue> {
+    let url = reqwest::Url::parse(raw.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        return None;
+    }
+    let host = url.host_str()?;
+    let origin = match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    };
+    axum::http::HeaderValue::from_str(&origin).ok()
+}
 use uuid::Uuid;
 
 // -----------------------------------------------------------------------
@@ -495,7 +514,7 @@ async fn main() {
         state::AppState::rehydrate_halts(&st).await;
         restore_bots(&st).await;
         seed_pine_library(&st).await;
-        spawn_notifiers(&st);
+        spawn_notifiers(&st).await;
     }
 
     let sse_state = app_state.clone();
@@ -717,9 +736,11 @@ async fn main() {
                             .unwrap(),
                     ];
                     if let Ok(extra) = std::env::var("DCA_EXTRA_ORIGINS") {
-                        for o in extra.split(',').map(str::trim).filter(|o| !o.is_empty()) {
-                            if let Ok(hv) = o.parse::<axum::http::HeaderValue>() {
-                                origins.push(hv);
+                        for raw in extra.split(',').map(str::trim).filter(|o| !o.is_empty()) {
+                            if let Some(origin) = parse_extra_origin(raw) {
+                                origins.push(origin);
+                            } else {
+                                tracing::warn!("invalid DCA_EXTRA_ORIGINS entry ignored");
                             }
                         }
                     }
@@ -1049,11 +1070,54 @@ fn notify_cfg() -> Option<NotifyCfg> {
     })
 }
 
-fn spawn_notifiers(app: &Arc<AppState>) {
+async fn spawn_notifiers(app: &Arc<AppState>) {
     let Some(cfg) = notify_cfg() else { return };
+
+    // Telegram embeds its bot token in the URL path. Keep that request pinned
+    // to the configured API host by disabling both redirects and environment
+    // proxies, which could otherwise receive the token-bearing request.
+    let telegram_http = if cfg.telegram.is_some() {
+        match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(8))
+            .user_agent("dcabot-notify/1.0 (+internal)")
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+        {
+            Ok(client) => Some(client),
+            Err(error) => {
+                tracing::error!("telegram notifier disabled: HTTP client initialization failed ({})", error.without_url());
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let webhook = if let Some(url) = cfg.webhook.as_deref() {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ai::checked_external_https_client(url),
+        )
+        .await
+        {
+            Ok(Ok(client)) => Some((url.to_string(), client)),
+            Ok(Err(_)) => {
+                tracing::error!("webhook notifier disabled: destination rejected by SSRF policy");
+                None
+            }
+            Err(_) => {
+                tracing::error!("webhook notifier disabled: public destination DNS validation timed out");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let channels: Vec<&str> = [
-        cfg.telegram.as_ref().map(|_| "telegram"),
-        cfg.webhook.as_ref().map(|_| "webhook"),
+        telegram_http.as_ref().map(|_| "telegram"),
+        webhook.as_ref().map(|_| "webhook"),
         cfg.smtp.as_ref().map(|_| "smtp"),
     ]
     .into_iter()
@@ -1061,7 +1125,6 @@ fn spawn_notifiers(app: &Arc<AppState>) {
     .collect();
     tracing::info!("notifier aktif: {}", channels.join("+"));
     let mut rx = app.sse.subscribe();
-    let http = app.news_http.clone();
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
@@ -1070,7 +1133,9 @@ fn spawn_notifiers(app: &Arc<AppState>) {
                         continue;
                     }
                     let payload = serde_json::json!({ "event": ev.event, "data": ev.data, "ts": state::now_ms() });
-                    if let Some((token, chat)) = &cfg.telegram {
+                    if let (Some((token, chat)), Some(telegram_http)) =
+                        (&cfg.telegram, &telegram_http)
+                    {
                         let text = format!(
                             "*DCABOT {}*\n{}",
                             ev.event,
@@ -1083,13 +1148,25 @@ fn spawn_notifiers(app: &Arc<AppState>) {
                             "parse_mode": "Markdown",
                             "disable_notification": ev.event == "BOT_STATE",
                         });
-                        if let Err(e) = http.post(&url).json(&body).send().await {
-                            tracing::warn!("telegram gönderim hatası: {e}");
+                        match telegram_http.post(&url).json(&body).send().await {
+                            Ok(response) if !response.status().is_success() => {
+                                tracing::warn!("telegram bildirimi HTTP {} döndürdü", response.status());
+                            }
+                            Err(error) => {
+                                tracing::warn!("telegram gönderim bağlantı hatası: {}", error.without_url());
+                            }
+                            _ => {}
                         }
                     }
-                    if let Some(url) = &cfg.webhook {
-                        if let Err(e) = http.post(url).json(&payload).send().await {
-                            tracing::warn!("webhook bildirim hatası: {e}");
+                    if let Some((url, webhook_http)) = &webhook {
+                        match webhook_http.post(url).json(&payload).send().await {
+                            Ok(response) if !response.status().is_success() => {
+                                tracing::warn!("webhook bildirimi HTTP {} döndürdü", response.status());
+                            }
+                            Err(error) => {
+                                tracing::warn!("webhook bildirim bağlantı hatası: {}", error.without_url());
+                            }
+                            _ => {}
                         }
                     }
                     if let Some(sm) = &cfg.smtp {

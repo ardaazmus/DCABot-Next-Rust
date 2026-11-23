@@ -4,6 +4,7 @@ import {
   createSessionToken,
   isSessionSecretConfigured,
   isUiPasswordConfigured,
+  loginClientKey,
   loginRateLimitDelay,
   recordLoginFailure,
   verifyPassword,
@@ -47,13 +48,14 @@ async function readBoundedJson(req: NextRequest): Promise<{ ok: true; value: unk
 
 export async function POST(req: NextRequest) {
   // Require a non-simple browser request. Cross-origin HTML forms cannot
-  // submit this media type, so they cannot consume the single-owner lockout.
+  // submit this media type, so they cannot consume the client's lockout.
   const contentType = req.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
   if (contentType !== "application/json") {
     return NextResponse.json({ ok: false, error: "application/json gerekli" }, { status: 415 });
   }
 
-  const blockedFor = loginRateLimitDelay();
+  const limiterKey = loginClientKey(req.headers);
+  const blockedFor = loginRateLimitDelay(Date.now(), limiterKey);
   if (blockedFor > 0) {
     return NextResponse.json(
       { ok: false, error: "Çok fazla başarısız giriş denemesi; daha sonra tekrar deneyin" },
@@ -84,7 +86,7 @@ export async function POST(req: NextRequest) {
   }
 
   if (!verifyPassword(password)) {
-    const delay = recordLoginFailure();
+    const delay = recordLoginFailure(Date.now(), limiterKey);
     return NextResponse.json(
       { ok: false, error: "Geçersiz erişim parolası" },
       delay > 0
@@ -93,7 +95,7 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  clearLoginFailures();
+  clearLoginFailures(limiterKey);
   const token = createSessionToken();
   const res = NextResponse.json({ ok: true, message: "Oturum açıldı" });
   res.cookies.set(SESSION_COOKIE_NAME, token, {

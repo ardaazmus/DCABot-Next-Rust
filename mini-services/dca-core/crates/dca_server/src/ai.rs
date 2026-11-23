@@ -442,6 +442,15 @@ async fn checked_ai_client(base_url: &str, provider_id: &str) -> Result<reqwest:
     builder.build().map_err(|_| "güvenli AI HTTP istemcisi oluşturulamadı".into())
 }
 
+/// Build a pinned, public HTTPS client for operator-configured outbound
+/// notification webhooks. This shares the AI SSRF policy without permitting
+/// the loopback-only Ollama exception.
+pub(crate) async fn checked_external_https_client(
+    url: &str,
+) -> Result<reqwest::Client, String> {
+    checked_ai_client(url, "external-webhook").await
+}
+
 pub(crate) fn resolve_call(cfg: Option<&AiCallConfig>) -> Result<ResolvedCall, String> {
     let provider = resolve_provider(cfg.and_then(|c| c.provider.as_deref()));
     let model = cfg

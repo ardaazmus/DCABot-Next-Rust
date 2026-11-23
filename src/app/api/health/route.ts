@@ -33,9 +33,9 @@ export async function GET() {
       status: upstream.status,
       headers: { "Content-Type": "application/json" },
     });
-  } catch (err) {
+  } catch {
     return new Response(
-      JSON.stringify({ status: "error", error: "engine unreachable", details: String(err) }),
+      JSON.stringify({ status: "error", error: "engine unreachable" }),
       {
         status: 502,
         headers: { "Content-Type": "application/json" },
